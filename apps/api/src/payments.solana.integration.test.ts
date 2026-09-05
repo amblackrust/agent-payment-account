@@ -18,18 +18,42 @@ import { describe, expect, it } from 'vitest'
 import { createMoney } from '@agent-payment/core'
 import { createDatabaseClient, type AuthenticatedAccount } from '@agent-payment/db'
 import {
+  AgentPaymentAccount,
+  ConflictError as SdkConflictError,
+} from '@agent-payment/sdk'
+import {
   createSolanaIncomingReader,
   createSolanaPaymentRailWithRpc,
   createSolanaRailWithRpc,
 } from '@agent-payment/solana-rail'
 import { hashApiKey } from './auth.js'
+import { AccountService } from './accounts.js'
+import { buildApp } from './app.js'
 import { WalletSecretCipher } from './custody.js'
 import { PaymentService } from './payments.js'
 import { IncomingReconciliationService } from './incoming.js'
+import { ReceiveService } from './receives.js'
+import { RecipientService } from './recipients.js'
 import { TransactionService } from './transactions.js'
+import type { AppConfig } from './config.js'
 
 const databaseUrl = process.env.DATABASE_URL?.trim()
 const masterKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+
+const testConfig: AppConfig = {
+  databaseUrl:
+    databaseUrl ??
+    'postgresql://postgres:postgres@127.0.0.1:5432/agent_payment_account',
+  port: 0,
+  nodeEnv: 'test',
+  adminApiKey: 'test-admin-key',
+  solanaRpcUrl: 'http://surfpool.local',
+  solanaCluster: 'localnet',
+  solanaSettlementMint: 'test-mint',
+  solanaFeePayerSecret: 'test-fee-payer-secret',
+  walletMasterKey: masterKey,
+  allowMainnet: false,
+}
 
 function id(prefix: string): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`
@@ -42,6 +66,30 @@ async function exportSecret(signer: KeyPairSigner): Promise<Uint8Array> {
   secret.set(new Uint8Array(privateKey).slice(16))
   secret.set(new Uint8Array(publicKey), 32)
   return secret
+}
+
+async function appFetch(
+  app: ReturnType<typeof buildApp>,
+  input: URL | RequestInfo,
+  init?: RequestInit,
+): Promise<Response> {
+  const headers = new Headers(init?.headers)
+  const inputUrl =
+    typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input.url
+  const response = await app.inject({
+    method: (init?.method ?? 'GET') as 'GET' | 'POST',
+    url: new URL(inputUrl).pathname,
+    headers: Object.fromEntries(headers.entries()),
+    ...(init?.body === undefined ? {} : { payload: JSON.parse(String(init.body)) }),
+  })
+  return new Response(response.body, {
+    status: response.statusCode,
+    headers: { 'content-type': 'application/json' },
+  })
 }
 
 describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
@@ -200,6 +248,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       const payerId = id('acct')
       const recipientId = id('acct')
       const receiveReference = id('receive-reference')
+      let app: ReturnType<typeof buildApp> | undefined
 
       try {
         await client.surfnet.fundSol(feePayer.address, 2_000_000_000)
@@ -295,21 +344,37 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
             })
           },
         )
-        await database.createReceiveRequest({
-          id: id('recv'),
-          accountId: recipientId,
-          amountAtomic: 125n,
-          currency: 'USD',
+        app = buildApp({
+          config: testConfig,
+          readinessDependency: database,
+          accountRepository: database,
+          accountService: new AccountService(database, cipher, readRail),
+          solanaRail: readRail,
+          recipientService: new RecipientService(database),
+          paymentService: service,
+          reservationRepository: database,
+          receiveService: new ReceiveService(database, readRail),
+          transactionService: new TransactionService(database),
+        })
+        const payerSdk = new AgentPaymentAccount({
+          baseUrl: 'http://surfpool.local',
+          apiKey: payerKey,
+          fetch: appFetch.bind(undefined, app),
+        })
+        const recipientSdk = new AgentPaymentAccount({
+          baseUrl: 'http://surfpool.local',
+          apiKey: recipientKey,
+          fetch: appFetch.bind(undefined, app),
+        })
+        const receiveRequest = await recipientSdk.receive({
+          amount: '1.25',
           reference: receiveReference,
         })
-        const original = await service.createPayment(
-          payerAccount as AuthenticatedAccount,
-          'PAY',
+        const original = await payerSdk.pay(
           {
             recipientId: recipientRecord.id,
             amount: '1.25',
-            currency: 'USD',
-            externalReference: receiveReference,
+            externalReference: receiveRequest.reference,
           },
           id('idem'),
         )
@@ -348,7 +413,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         })
         await reconciler.runOnce()
         const incoming = await database.listIncomingPayments(recipientId)
-        expect(original.payment.status).toBe('CONFIRMED')
+        expect(original.status).toBe('CONFIRMED')
         expect(incoming).toHaveLength(1)
         expect(incoming[0]?.amountAtomic).toBe(125n)
         const matched = await database.findReceiveRequestForOwner(
@@ -366,12 +431,11 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await restartedReconciler.runOnce()
         expect(await database.listIncomingPayments(recipientId)).toHaveLength(1)
 
-        const refund = await service.createRefund(
-          recipientAccount as AuthenticatedAccount,
-          { originalPaymentId: original.payment.id, amount: '1.25', currency: 'USD' },
+        const refund = await recipientSdk.refund(
+          { originalPaymentId: original.id, amount: '1.25' },
           id('refund'),
         )
-        expect(refund.payment.status).toBe('CONFIRMED')
+        expect(refund.status).toBe('CONFIRMED')
         const [payerAta] = await findAssociatedTokenPda({
           owner: payer.address,
           tokenProgram: TOKEN_PROGRAM_ADDRESS,
@@ -398,7 +462,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           database,
         ).listTransactions(recipientId)
         const refundHistory = recipientHistory.find(
-          (transaction) => transaction.id === refund.payment.id,
+          (transaction) => transaction.id === refund.id,
         )
         expect(refundHistory).toMatchObject({
           direction: 'OUTGOING',
@@ -410,15 +474,15 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           },
         })
         await expect(
-          service.createRefund(
-            recipientAccount as AuthenticatedAccount,
-            { originalPaymentId: original.payment.id, amount: '0.01', currency: 'USD' },
+          recipientSdk.refund(
+            { originalPaymentId: original.id, amount: '0.01' },
             id('over-refund'),
           ),
-        ).rejects.toThrow('Refund amount exceeds the original payment amount')
+        ).rejects.toBeInstanceOf(SdkConflictError)
       } finally {
         payerSecret.fill(0)
         recipientSecret.fill(0)
+        await app?.close()
         client.surfnet.stop()
         await database.disconnect()
       }
