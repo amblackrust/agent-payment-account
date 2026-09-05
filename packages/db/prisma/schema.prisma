@@ -125,7 +125,7 @@ model Payment {
   id                        String               @id @db.VarChar(64)
   payerAccountId            String               @map("payer_account_id") @db.VarChar(64)
   payerPublicKey            String?              @map("payer_public_key") @db.VarChar(64)
-  recipientId               String               @map("recipient_id") @db.VarChar(64)
+  recipientId               String?              @map("recipient_id") @db.VarChar(64)
   kind                      PaymentKind
   amountAtomic              BigInt               @map("amount_atomic")
   currency                  String               @db.VarChar(3)
@@ -144,8 +144,10 @@ model Payment {
   destinationReference      String?              @map("destination_reference") @db.VarChar(255)
   recipientManagedAccountId String?              @map("recipient_managed_account_id") @db.VarChar(64)
   originalPaymentId         String?              @map("original_payment_id") @db.VarChar(64)
+  counterpartyAccountId     String?              @map("counterparty_account_id") @db.VarChar(64)
+  counterpartyAddress       String?              @map("counterparty_address") @db.VarChar(128)
   payerAccount              AgentAccount         @relation("PayerPayments", fields: [payerAccountId], references: [id], onDelete: Restrict)
-  recipient                 Recipient            @relation(fields: [recipientId], references: [id], onDelete: Restrict)
+  recipient                 Recipient?           @relation(fields: [recipientId], references: [id], onDelete: Restrict)
   originalPayment           Payment?             @relation("PaymentRefunds", fields: [originalPaymentId], references: [id], onDelete: Restrict)
   refunds                   Payment[]            @relation("PaymentRefunds")
   attempts                  PaymentAttempt[]

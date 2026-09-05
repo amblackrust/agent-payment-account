@@ -131,6 +131,10 @@ export class PaymentService {
       ...(recipient.managedAccountId === null
         ? {}
         : { recipientManagedAccountId: recipient.managedAccountId }),
+      counterpartyAddress: routed.request.destination.reference,
+      ...(recipient.managedAccountId === null
+        ? {}
+        : { counterpartyAccountId: recipient.managedAccountId }),
       settledAtomic: balance.settled.atomicUnits,
     })
     if (!persisted.created) {
@@ -147,7 +151,11 @@ export class PaymentService {
 
   public async createRefund(
     account: AuthenticatedAccount,
-    input: { readonly originalPaymentId: string; readonly amount: string; readonly currency: string },
+    input: {
+      readonly originalPaymentId: string
+      readonly amount: string
+      readonly currency: string
+    },
     idempotencyKey: string,
   ): Promise<PaymentResult> {
     const money = createPositiveMoney(input.amount, input.currency)
@@ -176,8 +184,13 @@ export class PaymentService {
     if (original === null || original.payerPublicKey === null) {
       throw new RefundNotSupportedError()
     }
-    if (original.status !== 'CONFIRMED' || original.recipientManagedAccountId !== account.account.id) {
-      throw new RefundNotSupportedError('This account does not control the original recipient')
+    if (
+      original.status !== 'CONFIRMED' ||
+      original.recipientManagedAccountId !== account.account.id
+    ) {
+      throw new RefundNotSupportedError(
+        'This account does not control the original recipient',
+      )
     }
     if (original.destinationRail === null || original.destinationType === null) {
       throw new RefundNotSupportedError()
@@ -187,7 +200,7 @@ export class PaymentService {
       currency: money.currency,
       amount: money,
       payerAccountId: account.account.id,
-      recipientId: original.recipientId,
+      recipientId: original.recipientId ?? original.id,
       destination: {
         rail: original.destinationRail,
         type: original.destinationType,
@@ -197,7 +210,9 @@ export class PaymentService {
     }
     const rail = selectPaymentRail(request, this.rails)
     rail.validateDestination?.(request)
-    const balance = await this.balanceReader.getSettlementBalance(account.account.solanaPublicKey)
+    const balance = await this.balanceReader.getSettlementBalance(
+      account.account.solanaPublicKey,
+    )
     const persisted = await this.repository.createRefundWithReservation({
       paymentId: createPaymentId(),
       reservationId: createPrefixedId('resv'),
@@ -208,7 +223,7 @@ export class PaymentService {
       requestHash,
       payerAccountId: account.account.id,
       payerPublicKey: account.account.solanaPublicKey,
-      recipientId: original.recipientId,
+      recipientId: null,
       amountAtomic: money.atomicUnits,
       currency: money.currency,
       route: rail.name,
@@ -217,6 +232,10 @@ export class PaymentService {
       destinationReference: request.destination.reference,
       recipientManagedAccountId: original.payerAccountId,
       originalPaymentId: original.id,
+      counterpartyAccountId: original.payerAccountId,
+      ...(original.payerPublicKey === null
+        ? {}
+        : { counterpartyAddress: original.payerPublicKey }),
       refundInitiatorAccountId: account.account.id,
       settledAtomic: balance.settled.atomicUnits,
     })
@@ -444,7 +463,7 @@ export class PaymentService {
       currency: amount.currency,
       amount,
       payerAccountId: payment.payerAccountId,
-      recipientId: payment.recipientId,
+      recipientId: payment.recipientId ?? payment.counterpartyAccountId ?? payment.id,
       destination: {
         rail: payment.destinationRail,
         type: payment.destinationType,

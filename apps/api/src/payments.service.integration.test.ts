@@ -11,6 +11,7 @@ import {
 } from '@agent-payment/core'
 import { createDatabaseClient, type AuthenticatedAccount } from '@agent-payment/db'
 import { PaymentService } from './payments.js'
+import { TransactionService } from './transactions.js'
 
 const databaseUrl = process.env.DATABASE_URL?.trim()
 
@@ -524,7 +525,11 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         )
         const replay = await new PaymentService(
           database,
-          { getSettlementBalance: async () => { throw new Error('replay must not read balance') } },
+          {
+            getSettlementBalance: async () => {
+              throw new Error('replay must not read balance')
+            },
+          },
           [],
         ).createRefund(
           recipientAccount,
@@ -534,8 +539,32 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
 
         expect(refund.payment.kind).toBe('REFUND')
         expect(refund.payment.status).toBe('CONFIRMED')
+        expect(refund.payment.recipientId).toBeNull()
+        expect(refund.payment.counterpartyAccountId).toBe(payer.account.id)
+        expect(refund.payment.counterpartyAddress).toBe(payer.account.solanaPublicKey)
         expect(replay.created).toBe(false)
         expect(replay.payment.id).toBe(refund.payment.id)
+        const recipientHistory = await new TransactionService(
+          database,
+        ).listTransactions(recipientAccount.account.id)
+        const refundHistory = recipientHistory.find(
+          (transaction) => transaction.id === refund.payment.id,
+        )
+        expect(refundHistory?.counterparty).toMatchObject({
+          recipient_id: null,
+          account_id: payer.account.id,
+          address: payer.account.solanaPublicKey,
+        })
+        const payerHistory = await new TransactionService(database).listTransactions(
+          payer.account.id,
+        )
+        const originalHistory = payerHistory.find(
+          (transaction) => transaction.id === original.payment.id,
+        )
+        expect(originalHistory?.counterparty).toMatchObject({
+          account_id: recipientAccount.account.id,
+          address: recipientAccount.account.solanaPublicKey,
+        })
         await expect(
           service.createRefund(
             recipientAccount,

@@ -15,7 +15,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:solana": "vitest run packages/solana-rail/src/surfpool.integration.test.ts apps/api/src/payments.solana.integration.test.ts",
+    "test:solana": "test -n \"$DATABASE_URL\" || { echo 'DATABASE_URL is required for Task 05 Solana E2E' >&2; exit 1; }; vitest run packages/solana-rail/src/surfpool.integration.test.ts apps/api/src/payments.solana.integration.test.ts",
     "test:watch": "vitest",
     "typecheck": "pnpm --recursive --if-present typecheck",
     "db:generate": "pnpm --filter @agent-payment/db generate",

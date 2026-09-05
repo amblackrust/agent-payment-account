@@ -30,7 +30,11 @@ export interface UpdateRecipientRequest {
 }
 
 export class RecipientService {
-  public constructor(private readonly repository: RecipientRepository) {}
+  public constructor(
+    private readonly repository: RecipientRepository & {
+      readonly findAccountPublicKey: (accountId: string) => Promise<string | null>
+    },
+  ) {}
 
   public async createRecipient(
     ownerAccountId: string,
@@ -47,6 +51,19 @@ export class RecipientService {
       throw new ValidationError('Only SOLANA_SPL recipient destinations are supported')
     }
 
+    const managedAccountId =
+      input.managedAccountId === undefined
+        ? undefined
+        : validateText(input.managedAccountId, 'Managed account id', 64)
+    const managedPublicKey =
+      managedAccountId === undefined
+        ? undefined
+        : await this.resolveManagedPublicKey(managedAccountId)
+    if (managedPublicKey !== undefined && walletAddress !== managedPublicKey) {
+      throw new ValidationError(
+        'Managed recipient wallet does not match the managed account',
+      )
+    }
     const destination = {
       id: `dest_${createRecipientId().slice('rcpt_'.length)}`,
       rail: SOLANA_SPL_DESTINATION,
@@ -58,9 +75,7 @@ export class RecipientService {
       ownerAccountId,
       displayName,
       type,
-      ...(input.managedAccountId === undefined
-        ? {}
-        : { managedAccountId: validateText(input.managedAccountId, 'Managed account id', 64) }),
+      ...(managedAccountId === undefined ? {} : { managedAccountId }),
       destination,
     }
     return this.repository.createRecipient(createInput)
@@ -71,6 +86,28 @@ export class RecipientService {
     recipientId: string,
     input: UpdateRecipientRequest,
   ): Promise<RecipientRecord> {
+    const current = await this.repository.findRecipientForOwner(
+      ownerAccountId,
+      recipientId,
+    )
+    if (current === null) {
+      throw new ErrorWithStatus('Recipient not found', 404)
+    }
+    const managedAccountId =
+      input.managedAccountId === undefined
+        ? current.managedAccountId
+        : input.managedAccountId
+    const currentDestination = current.destinations[0]
+    const walletAddress =
+      input.destination?.walletAddress ?? currentDestination?.walletAddress
+    if (managedAccountId !== null && managedAccountId !== undefined) {
+      const managedPublicKey = await this.resolveManagedPublicKey(managedAccountId)
+      if (walletAddress !== managedPublicKey) {
+        throw new ValidationError(
+          'Managed recipient wallet does not match the managed account',
+        )
+      }
+    }
     const updateInput: UpdateRecipientInput = {
       id: recipientId,
       ownerAccountId,
@@ -95,7 +132,7 @@ export class RecipientService {
                 128,
               ),
             },
-        }),
+          }),
       ...(input.managedAccountId === undefined
         ? {}
         : {
@@ -116,6 +153,14 @@ export class RecipientService {
       throw new ErrorWithStatus('Recipient not found', 404)
     }
     return recipient
+  }
+
+  private async resolveManagedPublicKey(accountId: string): Promise<string> {
+    const publicKey = await this.repository.findAccountPublicKey(accountId)
+    if (publicKey === null) {
+      throw new ValidationError('Managed account was not found or is disabled')
+    }
+    return publicKey
   }
 
   public async getRecipient(

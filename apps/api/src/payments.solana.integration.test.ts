@@ -26,6 +26,7 @@ import { hashApiKey } from './auth.js'
 import { WalletSecretCipher } from './custody.js'
 import { PaymentService } from './payments.js'
 import { IncomingReconciliationService } from './incoming.js'
+import { TransactionService } from './transactions.js'
 
 const databaseUrl = process.env.DATABASE_URL?.trim()
 const masterKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
@@ -205,19 +206,23 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await client.cheatcodes
           .setAccount(mint.address, {
             data: getBase16Decoder().decode(
-              new Uint8Array(getMintEncoder().encode({
-                mintAuthority: { __option: 'Some', value: client.payer.address },
-                supply: 2_000_000_000n,
-                decimals: 6,
-                isInitialized: true,
-                freezeAuthority: null,
-              })),
+              new Uint8Array(
+                getMintEncoder().encode({
+                  mintAuthority: { __option: 'Some', value: client.payer.address },
+                  supply: 2_000_000_000n,
+                  decimals: 6,
+                  isInitialized: true,
+                  freezeAuthority: null,
+                }),
+              ),
             ),
             lamports: 1_000_000,
             owner: TOKEN_PROGRAM_ADDRESS,
           })
           .send()
-        await client.cheatcodes.setTokenAccount(payer.address, mint.address, { amount: 2_000_000n }).send()
+        await client.cheatcodes
+          .setTokenAccount(payer.address, mint.address, { amount: 2_000_000n })
+          .send()
 
         await database.createAgentAccount({
           id: payerId,
@@ -241,8 +246,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           keyHash: hashApiKey(recipientKey),
           keyPrefix: 'apa_integration',
         })
-        const payerAccount = await database.findAccountByCredentialHash(hashApiKey(payerKey))
-        const recipientAccount = await database.findAccountByCredentialHash(hashApiKey(recipientKey))
+        const payerAccount = await database.findAccountByCredentialHash(
+          hashApiKey(payerKey),
+        )
+        const recipientAccount = await database.findAccountByCredentialHash(
+          hashApiKey(recipientKey),
+        )
         if (payerAccount === null || recipientAccount === null) {
           throw new Error('Surfpool accounts were not created')
         }
@@ -331,7 +340,9 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         if (observedIncomingTransaction === null) {
           throw new Error('Surfpool did not return the recipient transaction')
         }
-        expect(observedIncomingTransaction.meta?.postTokenBalances?.length).toBeGreaterThan(0)
+        expect(
+          observedIncomingTransaction.meta?.postTokenBalances?.length,
+        ).toBeGreaterThan(0)
         const reconciler = new IncomingReconciliationService(database, incomingReader, {
           error: () => undefined,
         })
@@ -340,9 +351,19 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(original.payment.status).toBe('CONFIRMED')
         expect(incoming).toHaveLength(1)
         expect(incoming[0]?.amountAtomic).toBe(125n)
-        const matched = await database.findReceiveRequestForOwner(recipientId, incoming[0]?.receiveRequestId ?? '')
+        const matched = await database.findReceiveRequestForOwner(
+          recipientId,
+          incoming[0]?.receiveRequestId ?? '',
+        )
         expect(matched?.status).toBe('PAID')
-        await reconciler.runOnce()
+        const restartedReconciler = new IncomingReconciliationService(
+          database,
+          incomingReader,
+          {
+            error: () => undefined,
+          },
+        )
+        await restartedReconciler.runOnce()
         expect(await database.listIncomingPayments(recipientId)).toHaveLength(1)
 
         const refund = await service.createRefund(
@@ -351,13 +372,50 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           id('refund'),
         )
         expect(refund.payment.status).toBe('CONFIRMED')
-        const [payerAta] = await findAssociatedTokenPda({ owner: payer.address, tokenProgram: TOKEN_PROGRAM_ADDRESS, mint: mint.address })
-        const [recipientAta] = await findAssociatedTokenPda({ owner: recipient.address, tokenProgram: TOKEN_PROGRAM_ADDRESS, mint: mint.address })
+        const [payerAta] = await findAssociatedTokenPda({
+          owner: payer.address,
+          tokenProgram: TOKEN_PROGRAM_ADDRESS,
+          mint: mint.address,
+        })
+        const [recipientAta] = await findAssociatedTokenPda({
+          owner: recipient.address,
+          tokenProgram: TOKEN_PROGRAM_ADDRESS,
+          mint: mint.address,
+        })
         const payerTokenAfterRefund = await fetchMaybeToken(client.rpc, payerAta)
-        const recipientTokenAfterRefund = await fetchMaybeToken(client.rpc, recipientAta)
-        expect(payerTokenAfterRefund.exists && payerTokenAfterRefund.data.amount).toBe(2_000_000n)
-        expect(recipientTokenAfterRefund.exists && recipientTokenAfterRefund.data.amount).toBe(0n)
+        const recipientTokenAfterRefund = await fetchMaybeToken(
+          client.rpc,
+          recipientAta,
+        )
+        expect(payerTokenAfterRefund.exists && payerTokenAfterRefund.data.amount).toBe(
+          2_000_000n,
+        )
+        expect(
+          recipientTokenAfterRefund.exists && recipientTokenAfterRefund.data.amount,
+        ).toBe(0n)
         expect(await database.listIncomingPayments(recipientId)).toHaveLength(1)
+        const recipientHistory = await new TransactionService(
+          database,
+        ).listTransactions(recipientId)
+        const refundHistory = recipientHistory.find(
+          (transaction) => transaction.id === refund.payment.id,
+        )
+        expect(refundHistory).toMatchObject({
+          direction: 'OUTGOING',
+          kind: 'REFUND',
+          counterparty: {
+            account_id: payerId,
+            address: payer.address,
+            recipient_id: null,
+          },
+        })
+        await expect(
+          service.createRefund(
+            recipientAccount as AuthenticatedAccount,
+            { originalPaymentId: original.payment.id, amount: '0.01', currency: 'USD' },
+            id('over-refund'),
+          ),
+        ).rejects.toThrow('Refund amount exceeds the original payment amount')
       } finally {
         payerSecret.fill(0)
         recipientSecret.fill(0)
