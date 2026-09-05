@@ -168,8 +168,12 @@ const sent = await account.send(
 ```
 
 Both operations use the same reservation, durable attempt, signed-payload,
-confirmation, and recovery pipeline. A successful response means the chain
-transaction reached the configured confirmation level.
+confirmation, and recovery pipeline. Always inspect the returned `status`
+alongside the HTTP status: `CONFIRMED` means that the chain transaction reached
+the configured confirmation level, while `RECONCILING` means that the outcome
+is not known yet. An HTTP `200` or `201` alone must never be interpreted as
+proof of blockchain success. Poll `getPayment()` or retry with the same
+idempotency key while the payment remains recoverable.
 
 ## Receive and refund
 

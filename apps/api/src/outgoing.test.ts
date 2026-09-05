@@ -69,4 +69,28 @@ describe('outgoing payment reconciliation worker', () => {
     await worker.runOnce()
     expect(recovered).toEqual(['pay_1', 'pay_2'])
   })
+
+  it('returns the tracked rejection and allows a later run after a database failure', async () => {
+    const databaseFailure = new Error('database temporarily unavailable')
+    let listCalls = 0
+    const worker = new OutgoingPaymentReconciliationService(
+      {
+        listRecoverablePayments: async () => {
+          listCalls += 1
+          if (listCalls === 1) throw databaseFailure
+          return []
+        },
+      } as never,
+      { recoverPersistedPayment: async () => undefined } as never,
+      { info: () => undefined },
+    )
+
+    const rejectedRun = worker.runOnce()
+    await expect(rejectedRun).rejects.toBe(databaseFailure)
+
+    const followingRun = worker.runOnce()
+    expect(followingRun).not.toBe(rejectedRun)
+    await expect(followingRun).resolves.toBeUndefined()
+    expect(listCalls).toBe(2)
+  })
 })

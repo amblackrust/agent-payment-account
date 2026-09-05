@@ -23,7 +23,7 @@ export class OutgoingPaymentReconciliationService {
       if (this.currentRun === trackedRun) this.currentRun = undefined
     })
     this.currentRun = trackedRun
-    return run
+    return trackedRun
   }
 
   public stop(): void {
