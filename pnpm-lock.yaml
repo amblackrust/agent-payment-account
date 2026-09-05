@@ -35,9 +35,15 @@ importers:
 
   apps/api:
     dependencies:
+      '@agent-payment/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@agent-payment/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@agent-payment/solana-rail':
+        specifier: workspace:*
+        version: link:../../packages/solana-rail
       dotenv:
         specifier: 17.4.2
         version: 17.4.2
@@ -80,6 +86,9 @@ importers:
 
   packages/solana-rail:
     dependencies:
+      '@agent-payment/core':
+        specifier: workspace:*
+        version: link:../core
       '@solana-program/memo':
         specifier: 0.13.1
         version: 0.13.1(@solana/kit@8.2.0(typescript@5.9.3))

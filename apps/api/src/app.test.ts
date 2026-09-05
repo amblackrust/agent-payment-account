@@ -12,7 +12,7 @@ const testConfig: AppConfig = {
   solanaCluster: 'localnet',
   solanaSettlementMint: 'test-mint',
   solanaFeePayerSecret: 'test-fee-payer-secret',
-  walletMasterKey: 'test-wallet-master-key',
+  walletMasterKey: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   allowMainnet: false,
 }
 

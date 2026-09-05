@@ -30,11 +30,13 @@ export type { AtomicUnits, Currency, Money } from './money.js'
 
 export {
   createAccountId,
+  createCredentialId,
   createPaymentAttemptId,
   createPaymentId,
   createRecipientId,
   createReceiveId,
   parseAccountId,
+  parseCredentialId,
   parsePaymentAttemptId,
   parsePaymentId,
   parseRecipientId,
@@ -42,6 +44,7 @@ export {
 } from './ids.js'
 export type {
   AccountId,
+  CredentialId,
   OpaqueId,
   PaymentAttemptId,
   PaymentId,

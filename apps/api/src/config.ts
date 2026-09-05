@@ -11,7 +11,12 @@ const configSchema = z.object({
     .default('localnet'),
   SOLANA_SETTLEMENT_MINT: z.string().min(1, 'SOLANA_SETTLEMENT_MINT is required'),
   SOLANA_FEE_PAYER_SECRET: z.string().min(1, 'SOLANA_FEE_PAYER_SECRET is required'),
-  WALLET_MASTER_KEY: z.string().min(1, 'WALLET_MASTER_KEY is required'),
+  WALLET_MASTER_KEY: z
+    .string()
+    .regex(
+      /^[0-9a-fA-F]{64}$/,
+      'WALLET_MASTER_KEY must be 32 bytes encoded as 64 hexadecimal characters',
+    ),
   ALLOW_MAINNET: z.preprocess((value: unknown) => {
     if (value === undefined) {
       return false

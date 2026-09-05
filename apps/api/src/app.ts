@@ -1,6 +1,12 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { AuthenticationError, ValidationError } from '@agent-payment/core'
+import type { AccountRepository } from '@agent-payment/db'
+import type { SolanaRail } from '@agent-payment/solana-rail'
 
 import type { AppConfig } from './config.js'
+import { serializeAccountCreation, serializeReceiveDestination } from './accounts.js'
+import type { AccountService } from './accounts.js'
+import { assertAdminApiKey, authenticateAgent } from './auth.js'
 
 export interface ReadinessDependency {
   checkReadiness(): Promise<void>
@@ -9,6 +15,9 @@ export interface ReadinessDependency {
 export interface BuildAppOptions {
   readonly config: AppConfig
   readonly readinessDependency: ReadinessDependency
+  readonly accountRepository?: AccountRepository
+  readonly accountService?: AccountService
+  readonly solanaRail?: SolanaRail
 }
 
 interface ErrorWithCode {
@@ -65,8 +74,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       redact: [
         'req.headers.authorization',
         'req.headers.x-api-key',
+        'req.headers.x-admin-api-key',
         'headers.authorization',
         'headers.x-api-key',
+        'headers.x-admin-api-key',
       ],
     },
   })
@@ -78,6 +89,111 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       status: 'ok',
     }),
   )
+
+  if (
+    options.accountRepository !== undefined &&
+    options.accountService !== undefined &&
+    options.solanaRail !== undefined
+  ) {
+    const { accountRepository, accountService, solanaRail } = options
+    app.decorateRequest('agentAccount', null)
+
+    app.post<{ Body: { name: string } }>(
+      '/v1/accounts',
+      {
+        schema: {
+          body: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { name: { type: 'string', minLength: 1, maxLength: 120 } },
+            required: ['name'],
+          },
+        },
+      },
+      async (request) => {
+        assertAdminApiKey(request, options.config.adminApiKey)
+        return serializeAccountCreation(
+          await accountService.createAccount(request.body.name),
+        )
+      },
+    )
+
+    app.post<{ Params: { accountId: string; credentialId: string } }>(
+      '/v1/accounts/:accountId/credentials/:credentialId/revoke',
+      {
+        schema: {
+          params: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              accountId: { type: 'string', minLength: 1 },
+              credentialId: { type: 'string', minLength: 1 },
+            },
+            required: ['accountId', 'credentialId'],
+          },
+        },
+      },
+      async (request, reply) => {
+        assertAdminApiKey(request, options.config.adminApiKey)
+        const revoked = await accountRepository.revokeCredential(
+          request.params.accountId,
+          request.params.credentialId,
+        )
+        if (!revoked) {
+          throw new ValidationError('Credential was not found or already revoked')
+        }
+        return reply.send({ status: 'REVOKED' })
+      },
+    )
+
+    app.get(
+      '/v1/balance',
+      { preHandler: async (request) => authenticateAgent(request, accountRepository) },
+      async (request) => {
+        const account = request.agentAccount
+        if (account === null) {
+          throw new AuthenticationError()
+        }
+        const balance = await solanaRail.getSettlementBalance(
+          account.account.solanaPublicKey,
+        )
+        return {
+          currency: balance.currency,
+          settled: balance.settled,
+          pending_outgoing: '0.00',
+          available: balance.settled,
+        }
+      },
+    )
+
+    app.post<{ Body: { currency: 'USD' } }>(
+      '/v1/receives',
+      {
+        preHandler: async (request) => authenticateAgent(request, accountRepository),
+        schema: {
+          body: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { currency: { type: 'string', const: 'USD' } },
+            required: ['currency'],
+          },
+        },
+      },
+      async (request) => {
+        if (request.body.currency !== 'USD') {
+          throw new ValidationError('Only USD receive instructions are supported')
+        }
+        const account = request.agentAccount
+        if (account === null) {
+          throw new AuthenticationError()
+        }
+        return serializeReceiveDestination(
+          await solanaRail.getReceiveDestination(account.account.solanaPublicKey),
+          account.account.id,
+        )
+      },
+    )
+  }
 
   app.get(
     '/ready',

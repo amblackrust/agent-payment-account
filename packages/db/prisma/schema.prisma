@@ -7,6 +7,40 @@ datasource db {
   provider = "postgresql"
 }
 
+enum AgentAccountStatus {
+  ACTIVE
+  DISABLED
+}
+
+model AgentAccount {
+  id                    String            @id @db.VarChar(64)
+  name                  String            @db.VarChar(120)
+  status                AgentAccountStatus @default(ACTIVE)
+  solanaPublicKey       String            @unique @map("solana_public_key") @db.VarChar(64)
+  encryptedSolanaSecret String            @map("encrypted_solana_secret") @db.Text
+  encryptionNonce       String            @map("encryption_nonce") @db.VarChar(32)
+  encryptionAuthTag     String            @map("encryption_auth_tag") @db.VarChar(32)
+  createdAt             DateTime          @default(now()) @map("created_at")
+  updatedAt             DateTime          @updatedAt @map("updated_at")
+  credentials           ApiCredential[]
+
+  @@map("agent_accounts")
+}
+
+model ApiCredential {
+  id         String       @id @db.VarChar(64)
+  accountId  String       @map("account_id") @db.VarChar(64)
+  keyHash    String       @unique @map("key_hash") @db.VarChar(128)
+  keyPrefix  String       @map("key_prefix") @db.VarChar(32)
+  createdAt  DateTime     @default(now()) @map("created_at")
+  revokedAt  DateTime?    @map("revoked_at")
+  lastUsedAt DateTime?    @map("last_used_at")
+  account    AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@index([accountId])
+  @@map("api_credentials")
+}
+
 model RuntimeMetadata {
   key       String   @id
   value     String

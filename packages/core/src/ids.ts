@@ -11,6 +11,7 @@ export type RecipientId = OpaqueId<'rcpt'>
 export type PaymentId = OpaqueId<'pay'>
 export type PaymentAttemptId = OpaqueId<'att'>
 export type ReceiveId = OpaqueId<'recv'>
+export type CredentialId = OpaqueId<'cred'>
 
 function createOpaqueId<Prefix extends string>(prefix: Prefix): OpaqueId<Prefix> {
   return `${prefix}_${randomUUID().replaceAll('-', '')}` as OpaqueId<Prefix>
@@ -36,6 +37,7 @@ export const createRecipientId = (): RecipientId => createOpaqueId('rcpt')
 export const createPaymentId = (): PaymentId => createOpaqueId('pay')
 export const createPaymentAttemptId = (): PaymentAttemptId => createOpaqueId('att')
 export const createReceiveId = (): ReceiveId => createOpaqueId('recv')
+export const createCredentialId = (): CredentialId => createOpaqueId('cred')
 
 export const parseAccountId = (value: string): AccountId => parseOpaqueId(value, 'acct')
 export const parseRecipientId = (value: string): RecipientId =>
@@ -44,3 +46,5 @@ export const parsePaymentId = (value: string): PaymentId => parseOpaqueId(value,
 export const parsePaymentAttemptId = (value: string): PaymentAttemptId =>
   parseOpaqueId(value, 'att')
 export const parseReceiveId = (value: string): ReceiveId => parseOpaqueId(value, 'recv')
+export const parseCredentialId = (value: string): CredentialId =>
+  parseOpaqueId(value, 'cred')
