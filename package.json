@@ -1,0 +1,34 @@
+{
+  "name": "agent-payment-account",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=11.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --recursive --if-present build",
+    "dev": "pnpm --filter @agent-payment/api dev",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "pnpm --recursive --if-present typecheck",
+    "db:generate": "pnpm --filter @agent-payment/db generate",
+    "db:migrate": "pnpm --filter @agent-payment/db migrate:dev",
+    "db:validate": "pnpm --filter @agent-payment/db prisma:validate"
+  },
+  "devDependencies": {
+    "@types/node": "26.4.1",
+    "@typescript-eslint/eslint-plugin": "8.69.0",
+    "@typescript-eslint/parser": "8.69.0",
+    "eslint": "10.10.0",
+    "eslint-config-prettier": "10.1.8",
+    "prettier": "3.9.6",
+    "typescript": "5.9.3",
+    "vitest": "5.0.0"
+  }
+}

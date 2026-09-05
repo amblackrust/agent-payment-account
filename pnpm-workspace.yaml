@@ -1,0 +1,9 @@
+packages:
+  - apps/*
+  - packages/*
+  - tests/*
+allowBuilds:
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true
+storeDir: /tmp/agent-payment-account-pnpm-store

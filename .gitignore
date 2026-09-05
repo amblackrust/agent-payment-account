@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.agents/
+node_modules/
+**/dist/
+**/generated/
+coverage/
+.turbo/
+*.log
+docker-data/
