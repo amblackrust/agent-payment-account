@@ -82,6 +82,4 @@ export interface PaymentRail {
   readonly getStatus?: (railTransactionId: string) => Promise<RailStatusResult>
 }
 
-export interface RailRecoveryResult extends RailExecutionResult {
-  readonly replacement?: RailPreparedPayment
-}
+export type RailRecoveryResult = RailExecutionResult

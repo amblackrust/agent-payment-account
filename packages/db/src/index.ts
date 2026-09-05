@@ -355,16 +355,6 @@ export interface PaymentRepository {
   createPaymentWithReservation(
     input: CreatePaymentWithReservationInput,
   ): Promise<CreatePaymentWithReservationResult>
-  createReplacementPaymentAttempt(input: {
-    readonly attemptId: string
-    readonly paymentId: string
-    readonly previousAttemptId: string
-    readonly rail: string
-    readonly durablePayload: string
-    readonly expectedExternalId: string
-    readonly recoveryMetadata: string
-    readonly serializedPayloadSafe?: string
-  }): Promise<{ readonly attempt: PaymentAttemptRecord; readonly created: boolean }>
   finalizeConfirmedPayment(input: {
     readonly paymentId: string
     readonly expectedPaymentStatus: PaymentStatus
@@ -1011,39 +1001,6 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           },
         })
         return { attempt: toPaymentAttemptRecord(attempt), created: true }
-      })
-    },
-    async createReplacementPaymentAttempt(input) {
-      return prisma.$transaction(async (transaction) => {
-        await transaction.$queryRaw`
-          SELECT id FROM "payments" WHERE id = ${input.paymentId} FOR UPDATE
-        `
-        const latest = await transaction.paymentAttempt.findFirst({
-          where: { paymentId: input.paymentId },
-          orderBy: { attemptNumber: 'desc' },
-        })
-        if (latest === null || latest.id !== input.previousAttemptId) {
-          if (latest === null) {
-            throw new ConflictError('Payment attempt history is unavailable')
-          }
-          return { attempt: toPaymentAttemptRecord(latest), created: false }
-        }
-        const replacement = await transaction.paymentAttempt.create({
-          data: {
-            id: input.attemptId,
-            paymentId: input.paymentId,
-            attemptNumber: latest.attemptNumber + 1,
-            rail: input.rail,
-            status: 'PREPARED',
-            ...(input.serializedPayloadSafe === undefined
-              ? {}
-              : { serializedPayloadSafe: input.serializedPayloadSafe }),
-            durablePayload: input.durablePayload,
-            expectedExternalId: input.expectedExternalId,
-            recoveryMetadata: input.recoveryMetadata,
-          },
-        })
-        return { attempt: toPaymentAttemptRecord(replacement), created: true }
       })
     },
     async finalizeConfirmedPayment(input): Promise<PaymentRecord> {

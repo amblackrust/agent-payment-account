@@ -374,35 +374,6 @@ export class PaymentService {
         )) ?? payment
       )
     }
-    if (recovery.replacement !== undefined) {
-      const replacement = await this.repository.createReplacementPaymentAttempt({
-        attemptId: createPaymentAttemptId(),
-        paymentId: payment.id,
-        previousAttemptId: attempt.id,
-        rail: rail.name,
-        durablePayload: recovery.replacement.durableExecution?.serializedPayload ?? '',
-        expectedExternalId:
-          recovery.replacement.durableExecution?.expectedExternalId ?? '',
-        recoveryMetadata: recovery.replacement.durableExecution?.recoveryMetadata ?? '',
-        ...(recovery.replacement.payloadSafe === undefined
-          ? {}
-          : { serializedPayloadSafe: recovery.replacement.payloadSafe }),
-      })
-      attempt = replacement.attempt
-      if (replacement.created) {
-        return this.executeRecoveredAttempt(
-          payment,
-          attempt,
-          recovery.replacement,
-          rail,
-        )
-      }
-      const existingPrepared = this.preparedPaymentFromAttempt(attempt)
-      if (existingPrepared === undefined) {
-        return payment
-      }
-      return this.executeRecoveredAttempt(payment, attempt, existingPrepared, rail)
-    }
     return this.finalizeRecoveredResult(payment, attempt, recovery)
   }
 

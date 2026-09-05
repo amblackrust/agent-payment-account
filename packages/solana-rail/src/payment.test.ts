@@ -7,7 +7,7 @@ import {
 } from '@solana-program/token'
 import { describe, expect, it } from 'vitest'
 
-import { createPositiveMoney } from '@agent-payment/core'
+import { createPositiveMoney, ExternalRailError } from '@agent-payment/core'
 import {
   createSolanaPaymentPreparationRail,
   createSolanaPaymentRailWithRpc,
@@ -39,7 +39,7 @@ function encodeAccount(owner: string, data: Uint8Array): RpcAccount {
 function createMockRpc(
   accounts: Map<string, RpcAccount>,
   feePayerBalance = 1_000_000_000n,
-  onSend?: (transaction: string) => string,
+  onSend?: (transaction: string) => string | PromiseLike<string>,
   onSignatureStatus?: () => unknown,
   rpcOptions: { readonly blockHeight?: bigint; readonly latestBlockhash?: string } = {},
 ) {
@@ -197,12 +197,10 @@ async function createPreparedRail(
     },
   )
   signatureValue = prepared.durableExecution?.expectedExternalId ?? ''
-  const recoverySecret = await exportSecret(payer)
   return {
     rail,
     prepared,
     payerSecret,
-    recoverySecret,
     payerAddress: payer.address,
     getSent: () => sentTransaction,
   }
@@ -266,24 +264,44 @@ describe('Solana payment rail', () => {
     expect(fixture.getSent()).toBe(firstBytes)
   })
 
-  it('creates a replacement only after the original blockhash is proven expired', async () => {
+  it('keeps an expired unknown transaction reconciling without replacement', async () => {
     const fixture = await createPreparedRail({
       statusSequence: [{ value: [null] }, { value: [null] }],
       blockHeight: 101n,
-      latestBlockhash: '11111111111111111111111111111112',
     })
-    const recovery = await fixture.rail.recover?.(fixture.prepared, {
-      paymentId: 'pay_transfer',
-      payerAccountId: 'acct_payer',
-      payerPublicKey: fixture.payerAddress,
-      getPayerSecretKey: async () => fixture.recoverySecret,
-    })
+    const expectedExternalId = fixture.prepared.durableExecution?.expectedExternalId
+    const recovery = await fixture.rail.recover?.(fixture.prepared)
 
     expect(recovery?.status).toBe('RECONCILING')
-    expect(recovery?.replacement?.durableExecution?.expectedExternalId).toBeTruthy()
-    expect(recovery?.replacement?.durableExecution?.expectedExternalId).not.toBe(
-      fixture.prepared.durableExecution?.expectedExternalId,
-    )
+    expect(recovery?.railTransactionId).toBe(expectedExternalId)
+    expect(fixture.getSent()).toBe('')
+  })
+
+  it('classifies deterministic preflight rejection as failed execution', async () => {
+    const fixture = await createPreparedRail()
+    const rejectedRail = createSolanaPaymentRailWithRpc({
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
+        1_000_000_000n,
+        () => {
+          throw new ExternalRailError(
+            'Solana transaction was rejected during preflight',
+            undefined,
+            'DETERMINISTIC',
+          )
+        },
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+      feePayerSecret: JSON.stringify(Array.from(new Uint8Array(64).fill(1))),
+    })
+
+    await expect(rejectedRail.execute?.(fixture.prepared)).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
+      kind: 'DETERMINISTIC',
+    })
+    expect(fixture.getSent()).toBe('')
   })
 
   it('reports rejected signatures as deterministic failed execution', async () => {
@@ -354,6 +372,27 @@ describe('Solana payment rail', () => {
       rpcTimeoutMs: 5,
       confirmationTimeoutMs: 25,
       pollIntervalMs: 0,
+    })
+
+    await expect(ambiguousRail.execute?.(fixture.prepared)).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
+      kind: 'AMBIGUOUS',
+    })
+  })
+
+  it('classifies a submission transport timeout as ambiguous', async () => {
+    const fixture = await createPreparedRail()
+    const ambiguousRail = createSolanaPaymentRailWithRpc({
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
+        1_000_000_000n,
+        () => new Promise<never>(() => undefined),
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+      feePayerSecret: JSON.stringify(Array.from(new Uint8Array(64).fill(1))),
+      rpcTimeoutMs: 5,
     })
 
     await expect(ambiguousRail.execute?.(fixture.prepared)).rejects.toMatchObject({
