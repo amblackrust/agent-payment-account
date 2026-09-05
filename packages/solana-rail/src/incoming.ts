@@ -25,7 +25,13 @@ export interface SolanaIncomingReader {
   ) => Promise<{
     readonly transfers: readonly IncomingTransfer[]
     readonly nextCursor: string | null
+    readonly unresolved?: readonly UnresolvedIncomingSignature[]
   }>
+}
+
+export interface UnresolvedIncomingSignature {
+  readonly signature: string
+  readonly reason: 'UNCLASSIFIED_TRANSFER'
 }
 
 interface SignatureInfo {
@@ -153,6 +159,7 @@ export function createSolanaIncomingReader(
         withRpcTimeout,
       )
       const transfers: IncomingTransfer[] = []
+      const unresolved: UnresolvedIncomingSignature[] = []
       let blockedByUnclassifiedSignature = false
       for (const item of [...history.signatures].reverse()) {
         if (item.err !== null) {
@@ -176,8 +183,11 @@ export function createSolanaIncomingReader(
           continue
         }
         if (transfer.kind === 'UNCLASSIFIED') {
-          blockedByUnclassifiedSignature = true
-          break
+          unresolved.push({
+            signature: item.signature,
+            reason: 'UNCLASSIFIED_TRANSFER',
+          })
+          continue
         }
         if (transaction.blockTime === null) {
           blockedByUnclassifiedSignature = true
@@ -203,6 +213,7 @@ export function createSolanaIncomingReader(
       }
       return {
         transfers,
+        unresolved,
         nextCursor: blockedByUnclassifiedSignature
           ? cursorSignature
           : history.nextCursor,
@@ -315,7 +326,9 @@ function getExternalIncomingTransfer(
     readonly amount: bigint
     readonly sourceAddress: string
   }[] = []
+  let unknownSourceAmount = 0n
   let selfTransferAmount = 0n
+  let targetTransferAmount = 0n
   let hasUnclassifiedTransfer = false
   let hasKnownNonTransferMutation = false
   for (const instruction of instructions) {
@@ -325,25 +338,20 @@ function getExternalIncomingTransfer(
       continue
     }
     if (parsed.destination !== tokenAccount) continue
+    if (parsed.mint !== undefined && parsed.mint !== mint) continue
+    if (parsed.amount === undefined || parsed.amount <= 0n) {
+      hasUnclassifiedTransfer = true
+      continue
+    }
+    targetTransferAmount += parsed.amount
     const sourceIndex = findAccountIndex(transaction, parsed.source)
     if (sourceIndex === undefined) {
-      hasUnclassifiedTransfer = true
+      unknownSourceAmount += parsed.amount
       continue
     }
     const sourceBalance = preBalances.get(sourceIndex)
     if (sourceBalance?.owner === undefined) {
-      hasUnclassifiedTransfer = true
-      continue
-    }
-    const sourceAfter =
-      getBalance(transaction.meta?.postTokenBalances, sourceIndex) ?? 0n
-    const sourceBefore = BigInt(sourceBalance.uiTokenAmount.amount)
-    if (
-      sourceBefore <= sourceAfter ||
-      parsed.amount === undefined ||
-      sourceBefore - sourceAfter !== parsed.amount
-    ) {
-      hasUnclassifiedTransfer = true
+      unknownSourceAmount += parsed.amount
       continue
     }
     if (sourceBalance.owner === owner) {
@@ -355,25 +363,28 @@ function getExternalIncomingTransfer(
       sourceAddress: sourceBalance.owner,
     })
   }
-  if (hasKnownNonTransferMutation && externalTransfers.length === 0) {
+  if (hasKnownNonTransferMutation && targetTransferAmount === 0n) {
     return { kind: 'IRRELEVANT' }
   }
-  if (hasUnclassifiedTransfer) {
+  if (hasUnclassifiedTransfer || targetTransferAmount !== destinationDelta) {
     return { kind: 'UNCLASSIFIED' }
   }
-  const transferredAmount = externalTransfers.reduce(
+  const externalAmount = externalTransfers.reduce(
     (total, transfer) => total + transfer.amount,
     0n,
   )
+  const provenExternalAmount = externalAmount + unknownSourceAmount
   const sourceOwners = new Set(
     externalTransfers.map((transfer) => transfer.sourceAddress),
   )
-  if (externalTransfers.length > 0 && transferredAmount === destinationDelta) {
+  if (provenExternalAmount > 0n) {
     return {
       kind: 'INCOMING',
-      amount: transferredAmount,
+      amount: provenExternalAmount,
       sourceAddress:
-        sourceOwners.size === 1 ? externalTransfers[0]!.sourceAddress : undefined,
+        unknownSourceAmount === 0n && sourceOwners.size === 1
+          ? externalTransfers[0]!.sourceAddress
+          : undefined,
     }
   }
   return selfTransferAmount === destinationDelta
@@ -398,6 +409,7 @@ function getParsedTransfer(instruction: ParsedInstruction):
       readonly source: string
       readonly destination: string
       readonly amount: bigint | undefined
+      readonly mint: string | undefined
     }
   | undefined {
   if (
@@ -417,6 +429,7 @@ function getParsedTransfer(instruction: ParsedInstruction):
     readonly source?: unknown
     readonly destination?: unknown
     readonly amount?: unknown
+    readonly mint?: unknown
     readonly tokenAmount?: { readonly amount?: unknown }
   }
   const rawAmount = info.amount ?? info.tokenAmount?.amount
@@ -427,7 +440,12 @@ function getParsedTransfer(instruction: ParsedInstruction):
     return undefined
   }
   return typeof info.source === 'string' && typeof info.destination === 'string'
-    ? { source: info.source, destination: info.destination, amount }
+    ? {
+        source: info.source,
+        destination: info.destination,
+        amount,
+        mint: typeof info.mint === 'string' ? info.mint : undefined,
+      }
     : undefined
 }
 

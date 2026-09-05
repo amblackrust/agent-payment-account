@@ -31,6 +31,7 @@ import type {
   RecipientRepository,
   ReservationRepository,
 } from '@agent-payment/db'
+import { MAX_REFERENCE_BYTES } from '@agent-payment/contracts'
 
 export interface SettledBalanceReader {
   getSettlementBalance(owner: string): Promise<{ readonly settled: Money }>
@@ -95,6 +96,14 @@ export class PaymentService {
       'External reference',
       255,
     )
+    if (
+      externalReference !== undefined &&
+      Buffer.byteLength(externalReference, 'utf8') > MAX_REFERENCE_BYTES
+    ) {
+      throw new ValidationError(
+        `External reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
+      )
+    }
     const requestHash = hashCanonicalRequest({
       operation: kind,
       recipient_id: input.recipientId,

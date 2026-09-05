@@ -73,6 +73,7 @@ model AgentAccount {
   outgoingReservations  OutgoingReservation[]
   feeSponsorships       FeeSponsorship[]
   indexerCheckpoints    IndexerCheckpoint[]
+  incomingIssues        IncomingReconciliationIssue[]
 
   @@map("agent_accounts")
 }
@@ -220,6 +221,21 @@ model IndexerCheckpoint {
 
   @@unique([accountId, rail, address])
   @@map("indexer_checkpoints")
+}
+
+model IncomingReconciliationIssue {
+  id          String       @id @db.VarChar(64)
+  accountId   String       @map("account_id") @db.VarChar(64)
+  signature   String       @db.VarChar(128)
+  reason      String       @db.VarChar(128)
+  firstSeenAt DateTime     @default(now()) @map("first_seen_at")
+  lastTriedAt DateTime     @default(now()) @map("last_tried_at")
+  retryCount  Int          @default(1) @map("retry_count")
+  account     AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@unique([accountId, signature])
+  @@index([accountId, lastTriedAt])
+  @@map("incoming_reconciliation_issues")
 }
 
 model PaymentAttempt {

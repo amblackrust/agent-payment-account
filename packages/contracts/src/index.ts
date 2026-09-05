@@ -1,5 +1,14 @@
 import { z } from 'zod'
 
+export const MAX_REFERENCE_BYTES = 128
+
+const reference = z
+  .string()
+  .min(1)
+  .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_REFERENCE_BYTES, {
+    message: `reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
+  })
+
 const moneyString = z.string().regex(/^(0|[1-9][0-9]*)\.[0-9]{2}$/u)
 const currency = z.literal('USD')
 const paymentStatus = z.enum([
@@ -118,7 +127,7 @@ export const payRequestSchema = z
     amount: z.string().min(1),
     currency,
     description: z.string().min(1).max(500).optional(),
-    external_reference: z.string().min(1).max(255).optional(),
+    external_reference: reference.optional(),
   })
   .strict()
 
@@ -128,7 +137,7 @@ export const receiveRequestSchema = z
   .object({
     currency,
     amount: z.string().min(1).optional(),
-    reference: z.string().min(1).max(255).optional(),
+    reference: reference.optional(),
     expires_at: z.string().min(1).optional(),
   })
   .strict()

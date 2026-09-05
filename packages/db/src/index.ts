@@ -324,6 +324,12 @@ export interface IncomingPaymentRepository {
     limit: number,
     cursor?: { readonly createdAt: Date; readonly id: string },
   ) => Promise<readonly IncomingPaymentRecord[]>
+  readonly recordIncomingReconciliationIssue?: (input: {
+    readonly id: string
+    readonly accountId: string
+    readonly signature: string
+    readonly reason: string
+  }) => Promise<void>
 }
 
 export interface PaymentAttemptRecord {
@@ -522,6 +528,7 @@ async function matchIncomingPaymentInTransaction(
       AND "reference" = ${input.reference}
       AND "status" IN ('OPEN', 'EXPIRED')
       AND "matched_incoming_payment_id" IS NULL
+      AND "created_at" <= ${input.confirmedAt}
       AND ("expires_at" IS NULL OR "expires_at" > ${input.confirmedAt})
       AND ("amount_atomic" IS NULL OR "amount_atomic" = ${input.amountAtomic})
     ORDER BY "created_at" ASC, "id" ASC
@@ -1486,6 +1493,26 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         },
         create: { id: `idx_${randomBytes(16).toString('hex')}`, ...input },
         update: { cursorSignature: input.cursorSignature },
+      })
+    },
+    async recordIncomingReconciliationIssue(input): Promise<void> {
+      const now = new Date()
+      await prisma.incomingReconciliationIssue.upsert({
+        where: { accountId_signature: { accountId: input.accountId, signature: input.signature } },
+        create: {
+          id: input.id,
+          accountId: input.accountId,
+          signature: input.signature,
+          reason: input.reason,
+          firstSeenAt: now,
+          lastTriedAt: now,
+          retryCount: 1,
+        },
+        update: {
+          lastTriedAt: now,
+          retryCount: { increment: 1 },
+          reason: input.reason,
+        },
       })
     },
     async createIncomingPayment(input) {

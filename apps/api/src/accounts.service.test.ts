@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 import type {
   AccountRepository,
   CreateAgentAccountInput,
+  ReceiveRequestRecord,
+  ReceiveRepository,
   StoredAgentAccount,
 } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
@@ -14,7 +16,7 @@ const masterKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 describe('AccountService', () => {
   it('creates a Kit signer, persists only encrypted secret material and returns one API key', async () => {
     let persisted: CreateAgentAccountInput | undefined
-    const repository: AccountRepository = {
+    const repository: AccountRepository & ReceiveRepository = {
       createAgentAccount: async (input) => {
         persisted = input
         return {
@@ -32,6 +34,24 @@ describe('AccountService', () => {
       findAccountByCredentialHash: async () => null,
       markCredentialUsed: async () => undefined,
       revokeCredential: async () => false,
+      createReceiveRequest: async (input) =>
+        ({
+          id: input.id,
+          accountId: input.accountId,
+          amountAtomic: null,
+          currency: input.currency,
+          reference: input.reference,
+          status: 'OPEN',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          expiresAt: null,
+          paidAt: null,
+          matchedIncomingPaymentId: null,
+        }) satisfies ReceiveRequestRecord,
+      findReceiveRequestForOwner: async () => null,
+      listReceiveRequests: async () => [],
+      matchIncomingPayment: async () => null,
+      expireOpenReceiveRequests: async () => undefined,
     }
     const rail: SolanaRail = {
       getSettlementBalance: async () => {

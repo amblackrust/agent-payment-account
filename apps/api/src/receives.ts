@@ -5,6 +5,7 @@ import {
   moneyFromAtomicUnits,
   ValidationError,
 } from '@agent-payment/core'
+import { MAX_REFERENCE_BYTES } from '@agent-payment/contracts'
 import type { ReceiveRepository, ReceiveRequestRecord } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 
@@ -32,9 +33,14 @@ export class ReceiveService {
         ? undefined
         : createPositiveMoney(input.amount, input.currency)
     const id = createReceiveId()
-    const reference = input.reference?.trim() || id
-    if (reference.length > 255) {
-      throw new ValidationError('Receive reference must contain at most 255 characters')
+    const reference = input.reference === undefined ? id : input.reference.trim()
+    if (reference.length === 0) {
+      throw new ValidationError('Receive reference must not be blank')
+    }
+    if (Buffer.byteLength(reference, 'utf8') > MAX_REFERENCE_BYTES) {
+      throw new ValidationError(
+        `Receive reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
+      )
     }
     const expiresAt =
       input.expiresAt === undefined ? undefined : new Date(input.expiresAt)

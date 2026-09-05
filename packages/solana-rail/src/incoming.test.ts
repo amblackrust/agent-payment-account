@@ -311,7 +311,7 @@ describe('Solana incoming transfer reader', () => {
     ])
   })
 
-  it('does not checkpoint a positive balance change without proven transfer semantics', async () => {
+  it('records unresolved positive balance changes before advancing the checkpoint', async () => {
     const reader = createReader({
       blockTime: 1_700_000_000,
       meta: {
@@ -329,7 +329,10 @@ describe('Solana incoming transfer reader', () => {
     const result = await reader.scanWithCursor!(owner)
 
     expect(result.transfers).toEqual([])
-    expect(result.nextCursor).toBeNull()
+    expect(result.unresolved).toEqual([
+      { signature: 'sig-1', reason: 'UNCLASSIFIED_TRANSFER' },
+    ])
+    expect(result.nextCursor).toBe('sig-1')
   })
 
   it('paginates beyond 1000 signatures and returns a high-water checkpoint', async () => {

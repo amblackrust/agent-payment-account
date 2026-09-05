@@ -87,6 +87,17 @@ export class IncomingReconciliationService {
           confirmedAt: transfer.confirmedAt,
         })
       }
+      for (const issue of scan.unresolved ?? []) {
+        if (this.repository.recordIncomingReconciliationIssue === undefined) {
+          throw new Error('Incoming reconciliation issue repository is unavailable')
+        }
+        await this.repository.recordIncomingReconciliationIssue({
+          id: `issue_${randomBytes(16).toString('hex')}`,
+          accountId: account.accountId,
+          signature: issue.signature,
+          reason: issue.reason,
+        })
+      }
       await this.repository.expireOpenReceiveRequests(account.accountId, new Date())
       if (scan.nextCursor !== null && scan.nextCursor !== cursor?.cursorSignature) {
         await this.repository.saveIncomingCursor({
