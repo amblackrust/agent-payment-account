@@ -4,7 +4,7 @@ import {
   createCredentialId,
   createReceiveId,
 } from '@agent-payment/core'
-import type { AccountRepository } from '@agent-payment/db'
+import type { AccountRepository, ReceiveRepository } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 import { generateApiCredential } from './auth.js'
 import type { WalletSecretCipher } from './custody.js'
@@ -22,7 +22,7 @@ export interface CreatedAccountResponse {
 
 export class AccountService {
   public constructor(
-    private readonly repository: AccountRepository,
+    private readonly repository: AccountRepository & ReceiveRepository,
     private readonly cipher: WalletSecretCipher,
     private readonly rail: SolanaRail,
   ) {}
@@ -50,6 +50,12 @@ export class AccountService {
         keyHash: credential.keyHash,
         keyPrefix: credential.keyPrefix,
       })
+      const receiveRequest = await this.repository.createReceiveRequest({
+        id: createReceiveId(),
+        accountId: account.id,
+        currency: 'USD',
+        reference: `account:${account.id}`,
+      })
 
       return {
         id: account.id,
@@ -57,7 +63,7 @@ export class AccountService {
         status: 'ACTIVE',
         apiKey: credential.rawKey,
         credentialId,
-        receiveId: createReceiveId(),
+        receiveId: receiveRequest.id,
         destination,
       }
     } finally {
