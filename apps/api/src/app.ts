@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { AuthenticationError, ValidationError } from '@agent-payment/core'
+import { AuthenticationError, formatMoney, ValidationError } from '@agent-payment/core'
 import type { AccountRepository } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 
@@ -159,9 +159,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         )
         return {
           currency: balance.currency,
-          settled: balance.settled,
+          settled: formatMoney(balance.settled),
           pending_outgoing: '0.00',
-          available: balance.settled,
+          available: formatMoney(balance.settled),
         }
       },
     )

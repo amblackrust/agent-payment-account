@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
+import { moneyFromAtomicUnits } from '@agent-payment/core'
 import { buildApp } from './app.js'
 import type { AccountService, CreatedAccountResponse } from './accounts.js'
 import { hashApiKey } from './auth.js'
@@ -73,9 +74,9 @@ function createApp(account: AuthenticatedAccount | null = activeAccount) {
   const rail: SolanaRail = {
     getSettlementBalance: async () => ({
       currency: 'USD',
-      atomicUnits: 1250n,
-      settled: '12.50',
-      decimals: 2,
+      settled: moneyFromAtomicUnits(1250n),
+      tokenAtomicUnits: 1250000n,
+      tokenDecimals: 4,
       ata: 'token-account',
       ataStatus: 'PRESENT',
     }),

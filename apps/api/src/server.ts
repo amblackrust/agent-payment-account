@@ -13,6 +13,8 @@ async function startServer(): Promise<void> {
   const database = createDatabaseClient(config.databaseUrl)
   const rail = createSolanaRail({
     rpcUrl: config.solanaRpcUrl,
+    expectedCluster: config.solanaCluster,
+    allowMainnet: config.allowMainnet,
     settlementMint: config.solanaSettlementMint,
   })
   const accountService = new AccountService(

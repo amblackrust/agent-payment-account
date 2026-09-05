@@ -4,9 +4,14 @@ import {
   getTokenEncoder,
   TOKEN_PROGRAM_ADDRESS,
 } from '@solana-program/token'
+import { formatMoney } from '@agent-payment/core'
 import { describe, expect, it } from 'vitest'
 
-import { createSolanaRailWithRpc, formatTokenAmount } from './read.js'
+import {
+  createSolanaRailWithRpc,
+  SolanaRailConfigurationError,
+  tokenToUsdMoney,
+} from './read.js'
 
 const owner = address('11111111111111111111111111111111')
 const mint = address('So11111111111111111111111111111111111111112')
@@ -29,23 +34,29 @@ function encodeAccount(ownerAddress: string, data: Uint8Array): MockRpcAccount {
   }
 }
 
-function createMockRpc(accounts: Map<string, MockRpcAccount>) {
+function createMockRpc(
+  accounts: Map<string, MockRpcAccount>,
+  genesisHash = 'localnet-genesis',
+): never {
   return {
+    getGenesisHash() {
+      return { send: async () => genesisHash }
+    },
     getAccountInfo(accountAddress: string) {
       return {
         send: async () => ({ value: accounts.get(accountAddress) ?? null }),
       }
     },
-  }
+  } as never
 }
 
-function mintData(decimals: number): Uint8Array {
+function mintData(decimals: number, isInitialized = true): Uint8Array {
   return new Uint8Array(
     getMintEncoder().encode({
       mintAuthority: null,
       supply: 0n,
       decimals,
-      isInitialized: true,
+      isInitialized,
       freezeAuthority: null,
     }),
   )
@@ -67,13 +78,16 @@ function tokenData(amount: bigint): Uint8Array {
 }
 
 describe('Solana settlement read rail', () => {
-  it('formats token amounts without floating point arithmetic', () => {
-    expect(formatTokenAmount(0n, 6)).toBe('0.00')
-    expect(formatTokenAmount(1_250_000n, 6)).toBe('1.25')
-    expect(formatTokenAmount(1n, 6)).toBe('0.000001')
-    expect(formatTokenAmount(123n, 0)).toBe('123.00')
-    expect(formatTokenAmount(123456789012345678901234567890n, 6)).toBe(
-      '123456789012345678901234.56789',
+  it('converts raw SPL units to canonical USD cents without floating point arithmetic', () => {
+    expect(formatMoney(tokenToUsdMoney(0n, 6))).toBe('0.00')
+    expect(formatMoney(tokenToUsdMoney(12_500_000n, 6))).toBe('12.50')
+    expect(formatMoney(tokenToUsdMoney(12_500_001n, 6))).toBe('12.50')
+    expect(formatMoney(tokenToUsdMoney(1250n, 2))).toBe('12.50')
+    expect(formatMoney(tokenToUsdMoney(12n, 1))).toBe('1.20')
+    expect(formatMoney(tokenToUsdMoney(12n, 0))).toBe('12.00')
+    expect(formatMoney(tokenToUsdMoney(120n, 1))).toBe('12.00')
+    expect(formatMoney(tokenToUsdMoney(18446744073709551615n, 6))).toBe(
+      '18446744073709.55',
     )
   })
 
@@ -82,18 +96,25 @@ describe('Solana settlement read rail', () => {
       rpc: createMockRpc(
         new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
       ) as never,
+      expectedCluster: 'localnet',
+      allowMainnet: false,
       settlementMint: mint,
     })
     const result = await rail.getSettlementBalance(owner)
 
-    expect(result.settled).toBe('0.00')
-    expect(result.atomicUnits).toBe(0n)
+    expect(formatMoney(result.settled)).toBe('0.00')
+    expect(result.tokenAtomicUnits).toBe(0n)
+    expect(result.tokenDecimals).toBe(6)
     expect(result.ataStatus).toBe('MISSING')
   })
 
   it('reads present balances and preserves unusual decimals and bigint precision', async () => {
     const destinationRail = createSolanaRailWithRpc({
-      rpc: createMockRpc(new Map()) as never,
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(3))]]),
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
       settlementMint: mint,
     })
     const destination = await destinationRail.getReceiveDestination(owner)
@@ -107,26 +128,129 @@ describe('Solana settlement read rail', () => {
     ])
     const rail = createSolanaRailWithRpc({
       rpc: createMockRpc(accounts) as never,
+      expectedCluster: 'localnet',
+      allowMainnet: false,
       settlementMint: mint,
     })
 
     const result = await rail.getSettlementBalance(owner)
 
-    expect(result.atomicUnits).toBe(amount)
-    expect(result.settled).toBe('18446744073709551.615')
+    expect(result.tokenAtomicUnits).toBe(amount)
+    expect(result.tokenDecimals).toBe(3)
+    expect(formatMoney(result.settled)).toBe('18446744073709551.61')
     expect(result.ataStatus).toBe('PRESENT')
     expect(getAddressEncoder().encode(address(result.ata))).toHaveLength(32)
+  })
+
+  it('validates a configured mint before returning receive instructions', async () => {
+    const missingMint = createSolanaRailWithRpc({
+      rpc: createMockRpc(new Map()),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+    await expect(missingMint.getReceiveDestination(owner)).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
+      message: 'Configured settlement mint is unavailable',
+    })
+
+    const wrongProgram = createSolanaRailWithRpc({
+      rpc: createMockRpc(
+        new Map([
+          [mint, encodeAccount('11111111111111111111111111111111', mintData(6))],
+        ]),
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+    await expect(wrongProgram.getReceiveDestination(owner)).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
+      message: 'Configured settlement mint uses an unsupported token program',
+    })
+
+    const uninitialized = createSolanaRailWithRpc({
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6, false))]]),
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+    await expect(uninitialized.getReceiveDestination(owner)).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
+      message: 'Configured settlement mint is not initialized',
+    })
+
+    const valid = createSolanaRailWithRpc({
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+    await expect(valid.getReceiveDestination(owner)).resolves.toMatchObject({
+      settlementMint: mint,
+    })
+  })
+
+  it('rejects RPC network identity mismatches and mainnet without explicit enablement', async () => {
+    const mismatch = createSolanaRailWithRpc({
+      rpc: createMockRpc(new Map(), 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'),
+      expectedCluster: 'testnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+    await expect(mismatch.getReceiveDestination(owner)).rejects.toBeInstanceOf(
+      SolanaRailConfigurationError,
+    )
+
+    const mainnetRpc = createSolanaRailWithRpc({
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
+        '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d',
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+    await expect(mainnetRpc.getReceiveDestination(owner)).rejects.toThrow(
+      'ALLOW_MAINNET',
+    )
+    expect(() =>
+      createSolanaRailWithRpc({
+        rpc: createMockRpc(new Map()),
+        expectedCluster: 'mainnet-beta',
+        allowMainnet: false,
+        settlementMint: mint,
+      }),
+    ).toThrow('ALLOW_MAINNET')
+
+    const explicitlyEnabled = createSolanaRailWithRpc({
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
+        '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d',
+      ),
+      expectedCluster: 'mainnet-beta',
+      allowMainnet: true,
+      settlementMint: mint,
+    })
+    await expect(explicitlyEnabled.getReceiveDestination(owner)).resolves.toBeDefined()
   })
 
   it('normalizes RPC failures as external rail errors', async () => {
     const rail = createSolanaRailWithRpc({
       rpc: {
+        getGenesisHash: () => ({ send: async () => 'localnet-genesis' }),
         getAccountInfo: () => ({
           send: async () => {
             throw new Error('rpc secret should not escape')
           },
         }),
       } as never,
+      expectedCluster: 'localnet',
+      allowMainnet: false,
       settlementMint: mint,
     })
 
@@ -136,10 +260,31 @@ describe('Solana settlement read rail', () => {
     })
   })
 
+  it('returns a typed external failure when RPC exceeds the configured timeout', async () => {
+    const rail = createSolanaRailWithRpc({
+      rpc: {
+        getGenesisHash: () => ({
+          send: () => new Promise<string>(() => undefined),
+        }),
+      } as never,
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+      rpcTimeoutMs: 5,
+    })
+
+    await expect(rail.getReceiveDestination(owner)).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
+      message: 'Solana RPC request timed out',
+    })
+  })
+
   it('rejects an invalid configured mint before RPC access', () => {
     expect(() =>
       createSolanaRailWithRpc({
         rpc: createMockRpc(new Map()) as never,
+        expectedCluster: 'localnet',
+        allowMainnet: false,
         settlementMint: 'bad-mint',
       }),
     ).toThrow('Invalid Solana settlement mint')
