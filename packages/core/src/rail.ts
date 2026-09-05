@@ -31,10 +31,9 @@ export interface RailPreparedPayment {
 }
 
 export interface RailDurableExecution {
-  readonly serializedTransactionBase64: string
-  readonly expectedTransactionId: string
-  readonly blockhash: string
-  readonly lastValidBlockHeight: bigint
+  readonly serializedPayload: string
+  readonly expectedExternalId: string
+  readonly recoveryMetadata: string
 }
 
 export interface RailPreparationContext {
@@ -44,12 +43,12 @@ export interface RailPreparationContext {
   readonly getPayerSecretKey: () => Promise<Uint8Array>
 }
 
-export type RailExecutionStatus = 'SUBMITTED' | 'CONFIRMED' | 'FAILED'
+export type RailExecutionStatus = 'SUBMITTED' | 'CONFIRMED' | 'FAILED' | 'RECONCILING'
 
 export interface RailExecutionResult {
   readonly status: RailExecutionStatus
   readonly railTransactionId?: string
-  readonly confirmedSlot?: bigint
+  readonly confirmationMetadata?: string
   readonly failureCode?: string
   readonly failureMessageSafe?: string
 }
@@ -57,12 +56,15 @@ export interface RailExecutionResult {
 export interface RailStatusResult {
   readonly status: RailExecutionStatus
   readonly railTransactionId?: string
-  readonly confirmedSlot?: bigint
+  readonly confirmationMetadata?: string
+  readonly failureCode?: string
+  readonly failureMessageSafe?: string
 }
 
 export interface PaymentRail {
   readonly name: string
   canRoute(request: RailPaymentRequest): boolean
+  readonly validateDestination?: (request: RailPaymentRequest) => void
   quote(request: RailPaymentRequest): Promise<RailQuote>
   prepare(
     request: RailPaymentRequest,
@@ -73,5 +75,13 @@ export interface PaymentRail {
    * preparation boundary. Task 04 will provide the Solana implementation.
    */
   readonly execute?: (prepared: RailPreparedPayment) => Promise<RailExecutionResult>
+  readonly recover?: (
+    prepared: RailPreparedPayment,
+    context?: RailPreparationContext,
+  ) => Promise<RailRecoveryResult>
   readonly getStatus?: (railTransactionId: string) => Promise<RailStatusResult>
+}
+
+export interface RailRecoveryResult extends RailExecutionResult {
+  readonly replacement?: RailPreparedPayment
 }

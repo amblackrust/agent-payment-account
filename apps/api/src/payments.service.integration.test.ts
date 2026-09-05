@@ -5,6 +5,7 @@ import {
   ConflictError,
   createMoney,
   ExternalRailError,
+  ValidationError,
   type PaymentRail,
 } from '@agent-payment/core'
 import { createDatabaseClient, type AuthenticatedAccount } from '@agent-payment/db'
@@ -43,10 +44,21 @@ function railThatHasAmbiguousExecution(): PaymentRail {
       rail: 'SOLANA_SPL',
       payloadSafe: '{"kind":"prepared"}',
       durableExecution: {
-        serializedTransactionBase64: 'signed-bytes',
-        expectedTransactionId: 'transaction-signature',
-        blockhash: 'blockhash',
-        lastValidBlockHeight: 100n,
+        serializedPayload: 'signed-bytes',
+        expectedExternalId: 'transaction-signature',
+        recoveryMetadata: JSON.stringify({
+          version: 1,
+          blockhash: 'blockhash',
+          lastValidBlockHeight: '100',
+          payerOwner: 'payer-owner',
+          recipientOwner: 'recipient-owner',
+          payerAta: 'payer-ata',
+          recipientAta: 'recipient-ata',
+          settlementMint: 'settlement-mint',
+          tokenDecimals: 6,
+          tokenAmount: '2000000',
+          createsRecipientAta: false,
+        }),
       },
     }),
     execute: async () => {
@@ -56,6 +68,33 @@ function railThatHasAmbiguousExecution(): PaymentRail {
         'AMBIGUOUS',
       )
     },
+  }
+}
+
+function railThatConfirmsDurably(executions: { count: number }): PaymentRail {
+  return {
+    name: 'SOLANA_SPL',
+    canRoute: (request) => request.destination.rail === 'SOLANA_SPL',
+    quote: async (request) => ({ rail: 'SOLANA_SPL', amount: request.amount }),
+    prepare: async () => ({
+      rail: 'SOLANA_SPL',
+      durableExecution: {
+        serializedPayload: 'signed-bytes',
+        expectedExternalId: 'transaction-signature',
+        recoveryMetadata: JSON.stringify({ version: 1 }),
+      },
+    }),
+    execute: async () => {
+      executions.count += 1
+      return {
+        status: 'CONFIRMED',
+        railTransactionId: 'transaction-signature',
+      }
+    },
+    getStatus: async () => ({
+      status: 'CONFIRMED',
+      railTransactionId: 'transaction-signature',
+    }),
   }
 }
 
@@ -221,6 +260,110 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(
           await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
         ).toBe(0n)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('keeps the reservation recoverable when confirmed finalization persistence fails', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'finalization recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+      const executions = { count: 0 }
+      const rail = railThatConfirmsDurably(executions)
+      const failingRepository = {
+        ...database,
+        finalizeConfirmedPayment: async () => {
+          throw new Error('simulated finalization outage')
+        },
+      }
+
+      try {
+        await expect(
+          new PaymentService(
+            failingRepository,
+            { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+            [rail],
+          ).createPayment(
+            account,
+            'SEND',
+            { recipientId: recipient.id, amount: '2.00', currency: 'USD' },
+            'finalization-outage-key',
+          ),
+        ).rejects.toMatchObject({
+          code: 'EXTERNAL_RAIL_FAILURE',
+          kind: 'AMBIGUOUS',
+        })
+
+        const pending = (await database.listPayments(account.account.id))[0]
+        expect(pending?.status).toBe('RECONCILING')
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(200n)
+
+        const recovered = await new PaymentService(
+          database,
+          { getSettlementBalance: async () => ({ settled: createMoney('0.00') }) },
+          [rail],
+        ).getPayment(account.account.id, pending?.id ?? '')
+
+        expect(recovered.status).toBe('CONFIRMED')
+        expect(executions.count).toBe(1)
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(0n)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('rejects malformed rail destinations before creating a reservation', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'invalid destination recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'malformed-wallet-address',
+        },
+      })
+      const rail: PaymentRail = {
+        ...railThatConfirms(),
+        validateDestination: () => {
+          throw new ValidationError('Recipient Solana wallet address is invalid')
+        },
+      }
+
+      try {
+        await expect(
+          new PaymentService(
+            database,
+            { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+            [rail],
+          ).createPayment(
+            account,
+            'SEND',
+            { recipientId: recipient.id, amount: '1.00', currency: 'USD' },
+            'invalid-destination-key',
+          ),
+        ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+        expect(await database.listPayments(account.account.id)).toHaveLength(0)
       } finally {
         await database.disconnect()
       }

@@ -1,5 +1,7 @@
 import { PrismaPg } from '@prisma/adapter-pg'
 import {
+  assertPaymentAttemptStatusTransition,
+  assertPaymentStatusTransition,
   ConflictError,
   InsufficientFundsError,
   RecipientResolutionError,
@@ -148,6 +150,7 @@ export type ReservationStatus = 'ACTIVE' | 'RELEASED'
 export interface PaymentRecord {
   readonly id: string
   readonly payerAccountId: string
+  readonly payerPublicKey: string | null
   readonly recipientId: string
   readonly kind: PaymentKind
   readonly amountAtomic: bigint
@@ -162,6 +165,9 @@ export interface PaymentRecord {
   readonly failedAt: Date | null
   readonly failureCode: string | null
   readonly failureMessageSafe: string | null
+  readonly destinationRail: string | null
+  readonly destinationType: string | null
+  readonly destinationReference: string | null
 }
 
 export interface PaymentAttemptRecord {
@@ -172,13 +178,23 @@ export interface PaymentAttemptRecord {
   readonly status: PaymentAttemptStatus
   readonly railTransactionId: string | null
   readonly serializedPayloadSafe: string | null
-  readonly signedTransactionBase64: string | null
-  readonly expectedSignature: string | null
-  readonly blockhash: string | null
-  readonly lastValidBlockHeight: bigint | null
-  readonly confirmedSlot: bigint | null
+  readonly durablePayload: string | null
+  readonly expectedExternalId: string | null
+  readonly recoveryMetadata: string | null
+  readonly confirmationMetadata: string | null
   readonly createdAt: Date
   readonly updatedAt: Date
+}
+
+export interface CreatePaymentAttemptInput {
+  readonly id: string
+  readonly paymentId: string
+  readonly rail: string
+  readonly status: PaymentAttemptStatus
+  readonly serializedPayloadSafe?: string
+  readonly durablePayload?: string
+  readonly expectedExternalId?: string
+  readonly recoveryMetadata?: string
 }
 
 export interface CreatePaymentWithReservationInput {
@@ -190,12 +206,16 @@ export interface CreatePaymentWithReservationInput {
   readonly idempotencyKey: string
   readonly requestHash: string
   readonly payerAccountId: string
+  readonly payerPublicKey?: string
   readonly recipientId: string
   readonly amountAtomic: bigint
   readonly currency: string
   readonly description?: string
   readonly externalReference?: string
   readonly route: string
+  readonly destinationRail?: string
+  readonly destinationType?: string
+  readonly destinationReference?: string
   readonly settledAtomic: bigint
 }
 
@@ -208,6 +228,45 @@ export interface PaymentRepository {
   createPaymentWithReservation(
     input: CreatePaymentWithReservationInput,
   ): Promise<CreatePaymentWithReservationResult>
+  createReplacementPaymentAttempt(input: {
+    readonly attemptId: string
+    readonly paymentId: string
+    readonly previousAttemptId: string
+    readonly rail: string
+    readonly durablePayload: string
+    readonly expectedExternalId: string
+    readonly recoveryMetadata: string
+    readonly serializedPayloadSafe?: string
+  }): Promise<{ readonly attempt: PaymentAttemptRecord; readonly created: boolean }>
+  finalizeConfirmedPayment(input: {
+    readonly paymentId: string
+    readonly expectedPaymentStatus: PaymentStatus
+    readonly attemptId: string
+    readonly expectedAttemptStatus: PaymentAttemptStatus
+    readonly railTransactionId?: string
+    readonly confirmationMetadata?: string
+  }): Promise<PaymentRecord>
+  finalizeFailedPayment(input: {
+    readonly paymentId: string
+    readonly expectedPaymentStatus: PaymentStatus
+    readonly attemptId: string
+    readonly expectedAttemptStatus: PaymentAttemptStatus
+    readonly failureCode: string
+    readonly failureMessageSafe: string
+  }): Promise<PaymentRecord>
+  markPaymentSubmitted(input: {
+    readonly paymentId: string
+    readonly attemptId: string
+    readonly expectedPaymentStatus: PaymentStatus
+    readonly expectedAttemptStatus: PaymentAttemptStatus
+    readonly railTransactionId?: string
+  }): Promise<PaymentRecord>
+  markPaymentReconciling(input: {
+    readonly paymentId: string
+    readonly attemptId: string
+    readonly expectedPaymentStatus: PaymentStatus
+    readonly expectedAttemptStatus: PaymentAttemptStatus
+  }): Promise<PaymentRecord>
   transitionPayment(
     paymentId: string,
     currentStatus: PaymentStatus,
@@ -219,18 +278,10 @@ export interface PaymentRepository {
       failureMessageSafe?: string | null
     }>,
   ): Promise<PaymentRecord>
-  createPaymentAttempt(input: {
-    readonly id: string
-    readonly paymentId: string
-    readonly attemptNumber: number
-    readonly rail: string
-    readonly status: PaymentAttemptStatus
-    readonly serializedPayloadSafe?: string
-    readonly signedTransactionBase64?: string
-    readonly expectedSignature?: string
-    readonly blockhash?: string
-    readonly lastValidBlockHeight?: bigint
-  }): Promise<PaymentAttemptRecord>
+  createPaymentAttempt(input: CreatePaymentAttemptInput): Promise<PaymentAttemptRecord>
+  getOrCreatePaymentAttempt(
+    input: CreatePaymentAttemptInput,
+  ): Promise<{ readonly attempt: PaymentAttemptRecord; readonly created: boolean }>
   updatePaymentAttempt(
     attemptId: string,
     currentStatus: PaymentAttemptStatus,
@@ -238,11 +289,10 @@ export interface PaymentRepository {
     fields?: Readonly<{
       railTransactionId?: string | null
       serializedPayloadSafe?: string | null
-      signedTransactionBase64?: string | null
-      expectedSignature?: string | null
-      blockhash?: string | null
-      lastValidBlockHeight?: bigint | null
-      confirmedSlot?: bigint | null
+      durablePayload?: string | null
+      expectedExternalId?: string | null
+      recoveryMetadata?: string | null
+      confirmationMetadata?: string | null
     }>,
   ): Promise<PaymentAttemptRecord>
   listPaymentAttempts(paymentId: string): Promise<readonly PaymentAttemptRecord[]>
@@ -488,6 +538,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           data: {
             id: input.paymentId,
             payerAccountId: input.payerAccountId,
+            ...(input.payerPublicKey === undefined
+              ? {}
+              : { payerPublicKey: input.payerPublicKey }),
             recipientId: input.recipientId,
             kind: input.operation,
             amountAtomic: input.amountAtomic,
@@ -499,6 +552,15 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ...(input.externalReference === undefined
               ? {}
               : { externalReference: input.externalReference }),
+            ...(input.destinationRail === undefined
+              ? {}
+              : { destinationRail: input.destinationRail }),
+            ...(input.destinationType === undefined
+              ? {}
+              : { destinationType: input.destinationType }),
+            ...(input.destinationReference === undefined
+              ? {}
+              : { destinationReference: input.destinationReference }),
           },
         })
         await transaction.outgoingReservation.create({
@@ -550,6 +612,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       return result._sum.amountAtomic ?? 0n
     },
     async transitionPayment(paymentId, currentStatus, nextStatus, fields) {
+      assertPaymentStatusTransition(currentStatus, nextStatus)
       const result = await prisma.payment.updateMany({
         where: { id: paymentId, status: currentStatus },
         data: {
@@ -575,29 +638,276 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       return toPaymentRecord(payment)
     },
     async createPaymentAttempt(input): Promise<PaymentAttemptRecord> {
-      const attempt = await prisma.paymentAttempt.create({
-        data: {
-          id: input.id,
-          paymentId: input.paymentId,
-          attemptNumber: input.attemptNumber,
-          rail: input.rail,
-          status: input.status,
-          ...(input.serializedPayloadSafe === undefined
-            ? {}
-            : { serializedPayloadSafe: input.serializedPayloadSafe }),
-          ...(input.signedTransactionBase64 === undefined
-            ? {}
-            : { signedTransactionBase64: input.signedTransactionBase64 }),
-          ...(input.expectedSignature === undefined
-            ? {}
-            : { expectedSignature: input.expectedSignature }),
-          ...(input.blockhash === undefined ? {} : { blockhash: input.blockhash }),
-          ...(input.lastValidBlockHeight === undefined
-            ? {}
-            : { lastValidBlockHeight: input.lastValidBlockHeight }),
-        },
+      const attempt = await prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT id FROM "payments" WHERE id = ${input.paymentId} FOR UPDATE
+        `
+        const latest = await transaction.paymentAttempt.findFirst({
+          where: { paymentId: input.paymentId },
+          orderBy: { attemptNumber: 'desc' },
+          select: { attemptNumber: true },
+        })
+        return transaction.paymentAttempt.create({
+          data: {
+            id: input.id,
+            paymentId: input.paymentId,
+            attemptNumber: (latest?.attemptNumber ?? 0) + 1,
+            rail: input.rail,
+            status: input.status,
+            ...(input.serializedPayloadSafe === undefined
+              ? {}
+              : { serializedPayloadSafe: input.serializedPayloadSafe }),
+            ...(input.durablePayload === undefined
+              ? {}
+              : { durablePayload: input.durablePayload }),
+            ...(input.expectedExternalId === undefined
+              ? {}
+              : { expectedExternalId: input.expectedExternalId }),
+            ...(input.recoveryMetadata === undefined
+              ? {}
+              : { recoveryMetadata: input.recoveryMetadata }),
+          },
+        })
       })
       return toPaymentAttemptRecord(attempt)
+    },
+    async getOrCreatePaymentAttempt(input) {
+      return prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT id FROM "payments" WHERE id = ${input.paymentId} FOR UPDATE
+        `
+        const latest = await transaction.paymentAttempt.findFirst({
+          where: { paymentId: input.paymentId },
+          orderBy: { attemptNumber: 'desc' },
+        })
+        if (latest !== null) {
+          return { attempt: toPaymentAttemptRecord(latest), created: false }
+        }
+        const attempt = await transaction.paymentAttempt.create({
+          data: {
+            id: input.id,
+            paymentId: input.paymentId,
+            attemptNumber: 1,
+            rail: input.rail,
+            status: input.status,
+            ...(input.serializedPayloadSafe === undefined
+              ? {}
+              : { serializedPayloadSafe: input.serializedPayloadSafe }),
+            ...(input.durablePayload === undefined
+              ? {}
+              : { durablePayload: input.durablePayload }),
+            ...(input.expectedExternalId === undefined
+              ? {}
+              : { expectedExternalId: input.expectedExternalId }),
+            ...(input.recoveryMetadata === undefined
+              ? {}
+              : { recoveryMetadata: input.recoveryMetadata }),
+          },
+        })
+        return { attempt: toPaymentAttemptRecord(attempt), created: true }
+      })
+    },
+    async createReplacementPaymentAttempt(input) {
+      return prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT id FROM "payments" WHERE id = ${input.paymentId} FOR UPDATE
+        `
+        const latest = await transaction.paymentAttempt.findFirst({
+          where: { paymentId: input.paymentId },
+          orderBy: { attemptNumber: 'desc' },
+        })
+        if (latest === null || latest.id !== input.previousAttemptId) {
+          if (latest === null) {
+            throw new ConflictError('Payment attempt history is unavailable')
+          }
+          return { attempt: toPaymentAttemptRecord(latest), created: false }
+        }
+        const replacement = await transaction.paymentAttempt.create({
+          data: {
+            id: input.attemptId,
+            paymentId: input.paymentId,
+            attemptNumber: latest.attemptNumber + 1,
+            rail: input.rail,
+            status: 'PREPARED',
+            ...(input.serializedPayloadSafe === undefined
+              ? {}
+              : { serializedPayloadSafe: input.serializedPayloadSafe }),
+            durablePayload: input.durablePayload,
+            expectedExternalId: input.expectedExternalId,
+            recoveryMetadata: input.recoveryMetadata,
+          },
+        })
+        return { attempt: toPaymentAttemptRecord(replacement), created: true }
+      })
+    },
+    async finalizeConfirmedPayment(input): Promise<PaymentRecord> {
+      if (input.expectedAttemptStatus === 'PREPARED') {
+        assertPaymentAttemptStatusTransition('PREPARED', 'SUBMITTED')
+      } else {
+        assertPaymentAttemptStatusTransition(input.expectedAttemptStatus, 'CONFIRMED')
+      }
+      if (input.expectedPaymentStatus === 'ROUTING') {
+        assertPaymentStatusTransition('ROUTING', 'SUBMITTED')
+      } else {
+        assertPaymentStatusTransition(input.expectedPaymentStatus, 'CONFIRMED')
+      }
+      return prisma.$transaction(async (transaction) => {
+        const currentAttempt = await transaction.paymentAttempt.findUniqueOrThrow({
+          where: { id: input.attemptId },
+          select: { expectedExternalId: true },
+        })
+        let attemptStatus = input.expectedAttemptStatus
+        if (attemptStatus === 'PREPARED') {
+          const submittedAttempt = await transaction.paymentAttempt.updateMany({
+            where: { id: input.attemptId, status: 'PREPARED' },
+            data: {
+              status: 'SUBMITTED',
+              ...(input.railTransactionId === undefined
+                ? {}
+                : { railTransactionId: input.railTransactionId }),
+            },
+          })
+          if (submittedAttempt.count !== 1) {
+            throw new ConflictError('Payment attempt state changed concurrently')
+          }
+          attemptStatus = 'SUBMITTED'
+        }
+        const attemptResult = await transaction.paymentAttempt.updateMany({
+          where: { id: input.attemptId, status: attemptStatus },
+          data: {
+            status: 'CONFIRMED',
+            ...(input.railTransactionId === undefined &&
+            currentAttempt.expectedExternalId === null
+              ? {}
+              : {
+                  railTransactionId:
+                    input.railTransactionId ?? currentAttempt.expectedExternalId,
+                }),
+            ...(input.confirmationMetadata === undefined
+              ? {}
+              : { confirmationMetadata: input.confirmationMetadata }),
+          },
+        })
+        if (attemptResult.count !== 1) {
+          throw new ConflictError('Payment attempt state changed concurrently')
+        }
+        let paymentStatus = input.expectedPaymentStatus
+        if (paymentStatus === 'ROUTING') {
+          const submittedPayment = await transaction.payment.updateMany({
+            where: { id: input.paymentId, status: 'ROUTING' },
+            data: { status: 'SUBMITTED' },
+          })
+          if (submittedPayment.count !== 1) {
+            throw new ConflictError('Payment state changed concurrently')
+          }
+          paymentStatus = 'SUBMITTED'
+        }
+        const paymentResult = await transaction.payment.updateMany({
+          where: { id: input.paymentId, status: paymentStatus },
+          data: { status: 'CONFIRMED', confirmedAt: new Date() },
+        })
+        if (paymentResult.count !== 1) {
+          throw new ConflictError('Payment state changed concurrently')
+        }
+        await transaction.outgoingReservation.updateMany({
+          where: { paymentId: input.paymentId, status: 'ACTIVE' },
+          data: { status: 'RELEASED', releasedAt: new Date() },
+        })
+        return toPaymentRecord(
+          await transaction.payment.findUniqueOrThrow({
+            where: { id: input.paymentId },
+          }),
+        )
+      })
+    },
+    async finalizeFailedPayment(input): Promise<PaymentRecord> {
+      assertPaymentAttemptStatusTransition(input.expectedAttemptStatus, 'FAILED')
+      assertPaymentStatusTransition(input.expectedPaymentStatus, 'FAILED')
+      return prisma.$transaction(async (transaction) => {
+        const attemptResult = await transaction.paymentAttempt.updateMany({
+          where: { id: input.attemptId, status: input.expectedAttemptStatus },
+          data: { status: 'FAILED' },
+        })
+        if (attemptResult.count !== 1) {
+          throw new ConflictError('Payment attempt state changed concurrently')
+        }
+        const paymentResult = await transaction.payment.updateMany({
+          where: { id: input.paymentId, status: input.expectedPaymentStatus },
+          data: {
+            status: 'FAILED',
+            failedAt: new Date(),
+            failureCode: input.failureCode,
+            failureMessageSafe: input.failureMessageSafe,
+          },
+        })
+        if (paymentResult.count !== 1) {
+          throw new ConflictError('Payment state changed concurrently')
+        }
+        await transaction.outgoingReservation.updateMany({
+          where: { paymentId: input.paymentId, status: 'ACTIVE' },
+          data: { status: 'RELEASED', releasedAt: new Date() },
+        })
+        return toPaymentRecord(
+          await transaction.payment.findUniqueOrThrow({
+            where: { id: input.paymentId },
+          }),
+        )
+      })
+    },
+    async markPaymentSubmitted(input): Promise<PaymentRecord> {
+      assertPaymentAttemptStatusTransition(input.expectedAttemptStatus, 'SUBMITTED')
+      assertPaymentStatusTransition(input.expectedPaymentStatus, 'SUBMITTED')
+      return prisma.$transaction(async (transaction) => {
+        const attemptResult = await transaction.paymentAttempt.updateMany({
+          where: { id: input.attemptId, status: input.expectedAttemptStatus },
+          data: {
+            status: 'SUBMITTED',
+            ...(input.railTransactionId === undefined
+              ? {}
+              : { railTransactionId: input.railTransactionId }),
+          },
+        })
+        if (attemptResult.count !== 1) {
+          throw new ConflictError('Payment attempt state changed concurrently')
+        }
+        const paymentResult = await transaction.payment.updateMany({
+          where: { id: input.paymentId, status: input.expectedPaymentStatus },
+          data: { status: 'SUBMITTED' },
+        })
+        if (paymentResult.count !== 1) {
+          throw new ConflictError('Payment state changed concurrently')
+        }
+        return toPaymentRecord(
+          await transaction.payment.findUniqueOrThrow({
+            where: { id: input.paymentId },
+          }),
+        )
+      })
+    },
+    async markPaymentReconciling(input): Promise<PaymentRecord> {
+      assertPaymentAttemptStatusTransition(input.expectedAttemptStatus, 'RECONCILING')
+      assertPaymentStatusTransition(input.expectedPaymentStatus, 'RECONCILING')
+      return prisma.$transaction(async (transaction) => {
+        const attemptResult = await transaction.paymentAttempt.updateMany({
+          where: { id: input.attemptId, status: input.expectedAttemptStatus },
+          data: { status: 'RECONCILING' },
+        })
+        if (attemptResult.count !== 1) {
+          throw new ConflictError('Payment attempt state changed concurrently')
+        }
+        const paymentResult = await transaction.payment.updateMany({
+          where: { id: input.paymentId, status: input.expectedPaymentStatus },
+          data: { status: 'RECONCILING' },
+        })
+        if (paymentResult.count !== 1) {
+          throw new ConflictError('Payment state changed concurrently')
+        }
+        return toPaymentRecord(
+          await transaction.payment.findUniqueOrThrow({
+            where: { id: input.paymentId },
+          }),
+        )
+      })
     },
     async updatePaymentAttempt(attemptId, currentStatus, nextStatus, fields) {
       const result = await prisma.paymentAttempt.updateMany({
@@ -610,19 +920,18 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           ...(fields?.serializedPayloadSafe === undefined
             ? {}
             : { serializedPayloadSafe: fields.serializedPayloadSafe }),
-          ...(fields?.signedTransactionBase64 === undefined
+          ...(fields?.durablePayload === undefined
             ? {}
-            : { signedTransactionBase64: fields.signedTransactionBase64 }),
-          ...(fields?.expectedSignature === undefined
+            : { durablePayload: fields.durablePayload }),
+          ...(fields?.expectedExternalId === undefined
             ? {}
-            : { expectedSignature: fields.expectedSignature }),
-          ...(fields?.blockhash === undefined ? {} : { blockhash: fields.blockhash }),
-          ...(fields?.lastValidBlockHeight === undefined
+            : { expectedExternalId: fields.expectedExternalId }),
+          ...(fields?.recoveryMetadata === undefined
             ? {}
-            : { lastValidBlockHeight: fields.lastValidBlockHeight }),
-          ...(fields?.confirmedSlot === undefined
+            : { recoveryMetadata: fields.recoveryMetadata }),
+          ...(fields?.confirmationMetadata === undefined
             ? {}
-            : { confirmedSlot: fields.confirmedSlot }),
+            : { confirmationMetadata: fields.confirmationMetadata }),
         },
       })
       if (result.count !== 1) {
@@ -706,6 +1015,7 @@ function toRecipientRecord(recipient: {
 function toPaymentRecord(payment: {
   id: string
   payerAccountId: string
+  payerPublicKey: string | null
   recipientId: string
   kind: PaymentKind
   amountAtomic: bigint
@@ -720,6 +1030,9 @@ function toPaymentRecord(payment: {
   failedAt: Date | null
   failureCode: string | null
   failureMessageSafe: string | null
+  destinationRail: string | null
+  destinationType: string | null
+  destinationReference: string | null
 }): PaymentRecord {
   return payment
 }
@@ -732,11 +1045,10 @@ function toPaymentAttemptRecord(attempt: {
   status: PaymentAttemptStatus
   railTransactionId: string | null
   serializedPayloadSafe: string | null
-  signedTransactionBase64: string | null
-  expectedSignature: string | null
-  blockhash: string | null
-  lastValidBlockHeight: bigint | null
-  confirmedSlot: bigint | null
+  durablePayload: string | null
+  expectedExternalId: string | null
+  recoveryMetadata: string | null
+  confirmationMetadata: string | null
   createdAt: Date
   updatedAt: Date
 }): PaymentAttemptRecord {

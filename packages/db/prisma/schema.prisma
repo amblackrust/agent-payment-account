@@ -105,6 +105,7 @@ model RecipientDestination {
 model Payment {
   id                 String               @id @db.VarChar(64)
   payerAccountId     String               @map("payer_account_id") @db.VarChar(64)
+  payerPublicKey     String?              @map("payer_public_key") @db.VarChar(64)
   recipientId        String               @map("recipient_id") @db.VarChar(64)
   kind               PaymentKind
   amountAtomic       BigInt               @map("amount_atomic")
@@ -119,6 +120,9 @@ model Payment {
   failedAt           DateTime?            @map("failed_at")
   failureCode        String?              @map("failure_code") @db.VarChar(64)
   failureMessageSafe String?              @map("failure_message_safe") @db.Text
+  destinationRail      String?              @map("destination_rail") @db.VarChar(64)
+  destinationType      String?              @map("destination_type") @db.VarChar(64)
+  destinationReference String?              @map("destination_reference") @db.VarChar(255)
   payerAccount       AgentAccount         @relation("PayerPayments", fields: [payerAccountId], references: [id], onDelete: Restrict)
   recipient          Recipient            @relation(fields: [recipientId], references: [id], onDelete: Restrict)
   attempts           PaymentAttempt[]
@@ -138,11 +142,15 @@ model PaymentAttempt {
   status                PaymentAttemptStatus @default(CREATED)
   railTransactionId     String?              @map("rail_transaction_id") @db.VarChar(255)
   serializedPayloadSafe String?              @map("serialized_payload_safe") @db.Text
-  signedTransactionBase64 String?            @map("signed_transaction_base64") @db.Text
-  expectedSignature     String?              @map("expected_signature") @db.VarChar(128)
-  blockhash             String?              @db.VarChar(128)
-  lastValidBlockHeight  BigInt?              @map("last_valid_block_height")
-  confirmedSlot         BigInt?              @map("confirmed_slot")
+  durablePayload        String?              @map("durable_payload") @db.Text
+  expectedExternalId    String?              @map("expected_external_id") @db.VarChar(255)
+  recoveryMetadata      String?              @map("recovery_metadata") @db.Text
+  confirmationMetadata  String?              @map("confirmation_metadata") @db.Text
+  legacySignedTransactionBase64 String?     @map("signed_transaction_base64") @db.Text
+  legacyExpectedSignature       String?     @map("expected_signature") @db.VarChar(128)
+  legacyBlockhash               String?     @map("blockhash") @db.VarChar(128)
+  legacyLastValidBlockHeight    BigInt?     @map("last_valid_block_height")
+  legacyConfirmedSlot           BigInt?     @map("confirmed_slot")
   createdAt             DateTime             @default(now()) @map("created_at")
   updatedAt             DateTime             @updatedAt @map("updated_at")
   payment               Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)

@@ -51,7 +51,6 @@ describe('Solana payment rail on isolated offline Surfpool', () => {
       freezeAuthority: null,
     })
 
-    client.surfnet.fundSol(payer.address, 1_000_000_000)
     client.surfnet.fundSol(feePayer.address, 1_000_000_000)
     await client.cheatcodes
       .setAccount(mint.address, {
@@ -108,7 +107,7 @@ describe('Solana payment rail on isolated offline Surfpool', () => {
 
     expect(execution?.status).toBe('CONFIRMED')
     expect(execution?.railTransactionId).toBe(
-      prepared.durableExecution?.expectedTransactionId,
+      prepared.durableExecution?.expectedExternalId,
     )
     expect(payerToken.exists && payerToken.data.amount).toBe(750_000n)
     expect(recipientToken.exists && recipientToken.data.amount).toBe(1_250_000n)

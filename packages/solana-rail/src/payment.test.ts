@@ -41,22 +41,32 @@ function createMockRpc(
   feePayerBalance = 1_000_000_000n,
   onSend?: (transaction: string) => string,
   onSignatureStatus?: () => unknown,
+  rpcOptions: { readonly blockHeight?: bigint; readonly latestBlockhash?: string } = {},
 ) {
+  let latestBlockhashCalls = 0
   return {
     getGenesisHash: () => ({ send: async () => localnetGenesisHash }),
     getAccountInfo: (accountAddress: string) => ({
       send: async () => ({ value: accounts.get(accountAddress) ?? null }),
     }),
     getBalance: () => ({ send: async () => ({ value: feePayerBalance }) }),
+    getFeeForMessage: () => ({ send: async () => ({ value: 5_000n }) }),
+    getMinimumBalanceForRentExemption: () => ({ send: async () => 2_039_280n }),
     getLatestBlockhash: () => ({
       send: async () => ({
-        value: { blockhash, lastValidBlockHeight: 100n },
+        value: {
+          blockhash:
+            latestBlockhashCalls++ === 0
+              ? blockhash
+              : (rpcOptions.latestBlockhash ?? blockhash),
+          lastValidBlockHeight: 100n,
+        },
       }),
     }),
     getSignatureStatuses: () => ({
       send: async () => onSignatureStatus?.() ?? { value: [null] },
     }),
-    getBlockHeight: () => ({ send: async () => 1n }),
+    getBlockHeight: () => ({ send: async () => rpcOptions.blockHeight ?? 1n }),
     sendTransaction: (transaction: string) => ({
       send: async () => onSend?.(transaction) ?? '',
     }),
@@ -99,12 +109,26 @@ async function exportSecret(signer: Awaited<ReturnType<typeof generateKeyPairSig
   return secret
 }
 
-async function createPreparedRail() {
+async function createPreparedRail(
+  options: {
+    readonly feePayerBalance?: bigint
+    readonly includeRecipientAta?: boolean
+    readonly sameSigner?: boolean
+    readonly statusSequence?: readonly unknown[]
+    readonly blockHeight?: bigint
+    readonly latestBlockhash?: string
+  } = {},
+) {
   const payer = await generateKeyPairSigner(true)
-  const feePayer = await generateKeyPairSigner(true)
+  const feePayer = options.sameSigner ? payer : await generateKeyPairSigner(true)
   const recipient = await generateKeyPairSigner(true)
   const [payerAta] = await findAssociatedTokenPda({
     owner: payer.address,
+    tokenProgram: TOKEN_PROGRAM_ADDRESS,
+    mint,
+  })
+  const [recipientAta] = await findAssociatedTokenPda({
+    owner: recipient.address,
     tokenProgram: TOKEN_PROGRAM_ADDRESS,
     mint,
   })
@@ -114,6 +138,14 @@ async function createPreparedRail() {
       payerAta,
       encodeAccount(TOKEN_PROGRAM_ADDRESS, tokenData(payer.address, 12_500_000n)),
     ],
+    ...(options.includeRecipientAta
+      ? [
+          [
+            recipientAta,
+            encodeAccount(TOKEN_PROGRAM_ADDRESS, tokenData(recipient.address, 0n)),
+          ] as const,
+        ]
+      : []),
   ])
   let sentTransaction = ''
   let signatureValue = ''
@@ -121,17 +153,22 @@ async function createPreparedRail() {
   const rail = createSolanaPaymentRailWithRpc({
     rpc: createMockRpc(
       accounts,
-      1_000_000_000n,
+      options.feePayerBalance ?? 1_000_000_000n,
       (transaction) => {
         sentTransaction = transaction
         return signatureValue
       },
       () => {
         statusCalls += 1
+        const sequenceValue = options.statusSequence?.[statusCalls - 1]
+        if (sequenceValue !== undefined) {
+          return sequenceValue
+        }
         return statusCalls === 1
           ? { value: [null] }
           : { value: [{ err: null, confirmationStatus: 'confirmed', slot: 42n }] }
       },
+      options,
     ),
     expectedCluster: 'localnet',
     allowMainnet: false,
@@ -159,8 +196,16 @@ async function createPreparedRail() {
       getPayerSecretKey: async () => payerSecret,
     },
   )
-  signatureValue = prepared.durableExecution?.expectedTransactionId ?? ''
-  return { rail, prepared, payerSecret, getSent: () => sentTransaction }
+  signatureValue = prepared.durableExecution?.expectedExternalId ?? ''
+  const recoverySecret = await exportSecret(payer)
+  return {
+    rail,
+    prepared,
+    payerSecret,
+    recoverySecret,
+    payerAddress: payer.address,
+    getSent: () => sentTransaction,
+  }
 }
 
 describe('Solana payment rail', () => {
@@ -174,8 +219,8 @@ describe('Solana payment rail', () => {
     const durable = fixture.prepared.durableExecution
 
     expect(durable).toBeDefined()
-    expect(durable?.serializedTransactionBase64).toMatch(/^[A-Za-z0-9+/=]+$/)
-    expect(durable?.expectedTransactionId).toBeTruthy()
+    expect(durable?.serializedPayload).toMatch(/^[A-Za-z0-9+/=]+$/)
+    expect(durable?.expectedExternalId).toBeTruthy()
     expect(fixture.payerSecret.every((byte) => byte === 0)).toBe(true)
   })
 
@@ -184,9 +229,108 @@ describe('Solana payment rail', () => {
     const execution = await fixture.rail.execute?.(fixture.prepared)
 
     expect(execution?.status).toBe('CONFIRMED')
-    expect(execution?.confirmedSlot).toBe(42n)
-    expect(fixture.getSent()).toBe(
-      fixture.prepared.durableExecution?.serializedTransactionBase64,
+    expect(execution?.confirmationMetadata).toBe('{"slot":"42"}')
+    expect(fixture.getSent()).toBe(fixture.prepared.durableExecution?.serializedPayload)
+  })
+
+  it('does not resend an already confirmed signature', async () => {
+    const fixture = await createPreparedRail()
+    await fixture.rail.execute?.(fixture.prepared)
+    const sentBytes = fixture.getSent()
+
+    const secondExecution = await fixture.rail.execute?.(fixture.prepared)
+
+    expect(secondExecution?.status).toBe('CONFIRMED')
+    expect(fixture.getSent()).toBe(sentBytes)
+  })
+
+  it('resends the exact durable bytes while the original blockhash is alive', async () => {
+    const fixture = await createPreparedRail({
+      statusSequence: [
+        { value: [null] },
+        { value: [null] },
+        { value: [null] },
+        { value: [{ err: null, confirmationStatus: 'confirmed', slot: 7n }] },
+        { value: [null] },
+        { value: [null] },
+        { value: [null] },
+        { value: [{ err: null, confirmationStatus: 'confirmed', slot: 8n }] },
+      ],
+    })
+
+    await fixture.rail.recover?.(fixture.prepared)
+    const firstBytes = fixture.getSent()
+    await fixture.rail.recover?.(fixture.prepared)
+
+    expect(firstBytes).toBe(fixture.prepared.durableExecution?.serializedPayload)
+    expect(fixture.getSent()).toBe(firstBytes)
+  })
+
+  it('creates a replacement only after the original blockhash is proven expired', async () => {
+    const fixture = await createPreparedRail({
+      statusSequence: [{ value: [null] }, { value: [null] }],
+      blockHeight: 101n,
+      latestBlockhash: '11111111111111111111111111111112',
+    })
+    const recovery = await fixture.rail.recover?.(fixture.prepared, {
+      paymentId: 'pay_transfer',
+      payerAccountId: 'acct_payer',
+      payerPublicKey: fixture.payerAddress,
+      getPayerSecretKey: async () => fixture.recoverySecret,
+    })
+
+    expect(recovery?.status).toBe('RECONCILING')
+    expect(recovery?.replacement?.durableExecution?.expectedExternalId).toBeTruthy()
+    expect(recovery?.replacement?.durableExecution?.expectedExternalId).not.toBe(
+      fixture.prepared.durableExecution?.expectedExternalId,
+    )
+  })
+
+  it('reports rejected signatures as deterministic failed execution', async () => {
+    const fixture = await createPreparedRail()
+    const rejectedRail = createSolanaPaymentRailWithRpc({
+      rpc: createMockRpc(
+        new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
+        1_000_000_000n,
+        () => fixture.prepared.durableExecution?.expectedExternalId ?? '',
+        () => ({
+          value: [
+            { err: { InstructionError: [0, 'Custom'] }, confirmationStatus: null },
+          ],
+        }),
+      ),
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+      feePayerSecret: JSON.stringify(Array.from(new Uint8Array(64).fill(1))),
+    })
+
+    const result = await rejectedRail.execute?.(fixture.prepared)
+
+    expect(result).toMatchObject({
+      status: 'FAILED',
+      railTransactionId: fixture.prepared.durableExecution?.expectedExternalId,
+      failureCode: 'EXTERNAL_RAIL_FAILURE',
+    })
+    expect(fixture.getSent()).toBe('')
+  })
+
+  it('requires enough fee-payer SOL for network fee and ATA rent', async () => {
+    await expect(createPreparedRail({ feePayerBalance: 0n })).rejects.toMatchObject({
+      kind: 'DETERMINISTIC',
+    })
+    await expect(createPreparedRail({ feePayerBalance: 5_000n })).rejects.toMatchObject(
+      { kind: 'DETERMINISTIC' },
+    )
+
+    await expect(
+      createPreparedRail({ feePayerBalance: 5_000n, includeRecipientAta: true }),
+    ).resolves.toBeDefined()
+  })
+
+  it('rejects using the payer signer as the platform fee payer', async () => {
+    await expect(createPreparedRail({ sameSigner: true })).rejects.toThrow(
+      'different from the payer account signer',
     )
   })
 
@@ -197,7 +341,7 @@ describe('Solana payment rail', () => {
       rpc: createMockRpc(
         new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
         1_000_000_000n,
-        () => fixture.prepared.durableExecution?.expectedTransactionId ?? '',
+        () => fixture.prepared.durableExecution?.expectedExternalId ?? '',
         () => {
           statusCalls += 1
           return statusCalls === 1 ? { value: [null] } : new Promise(() => undefined)

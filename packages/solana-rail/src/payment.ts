@@ -1,6 +1,7 @@
 import {
   address,
   appendTransactionMessageInstructions,
+  compileTransaction,
   createKeyPairSignerFromBytes,
   createSolanaRpc,
   createTransactionMessage,
@@ -30,9 +31,13 @@ import {
   ExternalRailError,
   formatMoney,
   InsufficientFundsError,
+  ValidationError,
   type Money,
   type PaymentRail,
+  type RailPreparedPayment,
+  type RailPreparationContext,
   type RailExecutionResult,
+  type RailRecoveryResult,
   type RailStatusResult,
 } from '@agent-payment/core'
 import type { SolanaRpc } from './read.js'
@@ -76,10 +81,28 @@ interface SignatureObservation {
   readonly result: RailExecutionResult
 }
 
-class DeterministicTransactionFailure extends ExternalRailError {
-  public constructor(message: string, cause?: unknown) {
-    super(message, cause, 'DETERMINISTIC')
-    this.name = 'DeterministicTransactionFailure'
+interface SolanaRecoveryMetadata {
+  readonly version: 1
+  readonly blockhash: string
+  readonly lastValidBlockHeight: string
+  readonly payerOwner: string
+  readonly recipientOwner: string
+  readonly payerAta: string
+  readonly recipientAta: string
+  readonly settlementMint: string
+  readonly tokenDecimals: number
+  readonly tokenAmount: string
+  readonly createsRecipientAta: boolean
+}
+
+class SolanaBlockhashExpiredError extends ExternalRailError {
+  public constructor() {
+    super(
+      'Solana transaction blockhash expired before confirmation',
+      undefined,
+      'DETERMINISTIC',
+    )
+    this.name = 'SolanaBlockhashExpiredError'
   }
 }
 
@@ -173,6 +196,35 @@ function usdMoneyToTokenAtomicUnits(money: Money, tokenDecimals: number): bigint
     )
   }
   return money.atomicUnits / divisor
+}
+
+function serializeConfirmationMetadata(slot: bigint | undefined): string | undefined {
+  return slot === undefined ? undefined : JSON.stringify({ slot: slot.toString() })
+}
+
+function parseRecoveryMetadata(value: string): SolanaRecoveryMetadata {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch (error) {
+    throw new ExternalRailError(
+      'Solana recovery metadata is invalid',
+      error,
+      'DETERMINISTIC',
+    )
+  }
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    (parsed as { version?: unknown }).version !== 1
+  ) {
+    throw new ExternalRailError(
+      'Solana recovery metadata is invalid',
+      undefined,
+      'DETERMINISTIC',
+    )
+  }
+  return parsed as SolanaRecoveryMetadata
 }
 
 function identifyCluster(genesisHash: string): SolanaCluster | undefined {
@@ -383,25 +435,31 @@ export function createSolanaPaymentRailWithRpc(
     if (status === null || status === undefined) {
       return {
         known: false,
-        result: { status: 'SUBMITTED', railTransactionId: transactionId },
+        result: { status: 'RECONCILING', railTransactionId: transactionId },
       }
     }
     if (status.err !== null) {
-      throw new DeterministicTransactionFailure(
-        'Solana transaction was rejected by the network',
-        status.err,
-      )
+      return {
+        known: true,
+        result: {
+          status: 'FAILED',
+          railTransactionId: transactionId,
+          failureCode: 'EXTERNAL_RAIL_FAILURE',
+          failureMessageSafe: 'Solana transaction was rejected by the network',
+        },
+      }
     }
     if (
       status.confirmationStatus === 'confirmed' ||
       status.confirmationStatus === 'finalized'
     ) {
+      const confirmationMetadata = serializeConfirmationMetadata(status.slot)
       return {
         known: true,
         result: {
           status: 'CONFIRMED',
           railTransactionId: transactionId,
-          confirmedSlot: status.slot,
+          ...(confirmationMetadata === undefined ? {} : { confirmationMetadata }),
         },
       }
     }
@@ -418,7 +476,10 @@ export function createSolanaPaymentRailWithRpc(
     const deadline = now() + confirmationTimeoutMs
     while (now() <= deadline) {
       const observation = await observeSignature(transactionId)
-      if (observation.result.status === 'CONFIRMED') {
+      if (
+        observation.result.status === 'CONFIRMED' ||
+        observation.result.status === 'FAILED'
+      ) {
         return observation.result
       }
       const currentBlockHeight = await withRpcTimeout((abortSignal) =>
@@ -427,9 +488,7 @@ export function createSolanaPaymentRailWithRpc(
           .send({ abortSignal }),
       )
       if (currentBlockHeight > lastValidBlockHeight) {
-        throw new ExternalRailError(
-          'Solana transaction blockhash expired before confirmation',
-        )
+        throw new SolanaBlockhashExpiredError()
       }
       if (pollIntervalMs > 0) {
         await sleep(pollIntervalMs)
@@ -438,10 +497,228 @@ export function createSolanaPaymentRailWithRpc(
     throw new ExternalRailError('Solana transaction confirmation timed out')
   }
 
+  async function buildReplacementPreparedPayment(
+    prepared: RailPreparedPayment,
+    context: RailPreparationContext,
+  ): Promise<RailPreparedPayment> {
+    const durableExecution = prepared.durableExecution
+    if (durableExecution === undefined) {
+      throw new ExternalRailError(
+        'Prepared Solana transaction is unavailable',
+        undefined,
+        'DETERMINISTIC',
+      )
+    }
+    const metadata = parseRecoveryMetadata(durableExecution.recoveryMetadata)
+    if (metadata.settlementMint !== settlementMint) {
+      throw new ExternalRailError(
+        'Solana recovery metadata settlement mint mismatch',
+        undefined,
+        'DETERMINISTIC',
+      )
+    }
+    const payerOwner = parseAddress(context.payerPublicKey, 'payer public key')
+    if (metadata.payerOwner !== payerOwner) {
+      throw new ExternalRailError(
+        'Solana recovery metadata payer mismatch',
+        undefined,
+        'DETERMINISTIC',
+      )
+    }
+    const recipientOwner = parseAddress(metadata.recipientOwner, 'recipient public key')
+    const payerAta = parseAddress(metadata.payerAta, 'payer token account')
+    const recipientAta = parseAddress(metadata.recipientAta, 'recipient token account')
+    const tokenAmount = BigInt(metadata.tokenAmount)
+    const payerSecret = await context.getPayerSecretKey()
+    try {
+      const payerSigner = await createSigner(payerSecret, 'payer secret')
+      const feePayerSigner = await createSigner(
+        options.feePayerSecret,
+        'fee payer secret',
+      )
+      if (feePayerSigner.address === payerSigner.address) {
+        throw new ExternalRailError(
+          'Platform fee payer must be different from the payer account signer',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
+      const sourceData = await fetchTokenAccount(payerAta, 'Payer')
+      if (sourceData.owner !== payerOwner || sourceData.amount < tokenAmount) {
+        throw new InsufficientFundsError(
+          'Payer settlement token balance is insufficient',
+        )
+      }
+      const instructions: Instruction[] = []
+      if (metadata.createsRecipientAta) {
+        instructions.push(
+          getCreateAssociatedTokenIdempotentInstruction({
+            payer: feePayerSigner,
+            ata: recipientAta,
+            owner: recipientOwner,
+            mint: settlementMint,
+          }),
+        )
+      }
+      instructions.push(
+        getTransferCheckedInstruction({
+          source: payerAta,
+          mint: settlementMint,
+          destination: recipientAta,
+          authority: payerSigner,
+          amount: tokenAmount,
+          decimals: metadata.tokenDecimals,
+        }),
+        getAddMemoInstruction({ memo: context.paymentId }),
+      )
+      const latestBlockhash = await withRpcTimeout((abortSignal) =>
+        options.rpc
+          .getLatestBlockhash({ commitment: CONFIRMATION_COMMITMENT })
+          .send({ abortSignal }),
+      )
+      const transactionMessage = pipe(
+        createTransactionMessage({ version: 0 }),
+        (message) => setTransactionMessageFeePayerSigner(feePayerSigner, message),
+        (message) =>
+          setTransactionMessageLifetimeUsingBlockhash(latestBlockhash.value, message),
+        (message) => appendTransactionMessageInstructions(instructions, message),
+      )
+      const compiledTransaction = compileTransaction(transactionMessage)
+      const messageBase64 = Buffer.from(compiledTransaction.messageBytes).toString(
+        'base64',
+      )
+      const feeForMessage = await withRpcTimeout((abortSignal) =>
+        options.rpc
+          .getFeeForMessage(messageBase64 as never, {
+            commitment: CONFIRMATION_COMMITMENT,
+          })
+          .send({ abortSignal }),
+      )
+      if (feeForMessage.value === null) {
+        throw new ExternalRailError(
+          'Solana network fee could not be determined',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
+      const recipientAtaRent = metadata.createsRecipientAta
+        ? await withRpcTimeout((abortSignal) =>
+            options.rpc.getMinimumBalanceForRentExemption(165n).send({ abortSignal }),
+          )
+        : 0n
+      const feeBalance = await withRpcTimeout((abortSignal) =>
+        options.rpc
+          .getBalance(feePayerSigner.address, { commitment: CONFIRMATION_COMMITMENT })
+          .send({ abortSignal }),
+      )
+      if (feeBalance.value < feeForMessage.value + recipientAtaRent) {
+        throw new ExternalRailError(
+          'Platform fee payer balance is insufficient for this transaction',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
+      const signedTransaction =
+        await signTransactionMessageWithSigners(transactionMessage)
+      const serializedPayload = getBase64EncodedWireTransaction(signedTransaction)
+      const expectedExternalId = getSignatureFromTransaction(signedTransaction)
+      const replacementMetadata: SolanaRecoveryMetadata = {
+        ...metadata,
+        blockhash: latestBlockhash.value.blockhash,
+        lastValidBlockHeight: latestBlockhash.value.lastValidBlockHeight.toString(),
+      }
+      return {
+        rail: SOLANA_SPL_RAIL,
+        ...(prepared.payloadSafe === undefined
+          ? {}
+          : { payloadSafe: prepared.payloadSafe }),
+        durableExecution: {
+          serializedPayload,
+          expectedExternalId,
+          recoveryMetadata: JSON.stringify(replacementMetadata),
+        },
+      }
+    } finally {
+      payerSecret.fill(0)
+    }
+  }
+
+  async function executePrepared(
+    prepared: RailPreparedPayment,
+  ): Promise<RailExecutionResult> {
+    const durableExecution = prepared.durableExecution
+    if (durableExecution === undefined) {
+      throw new ExternalRailError(
+        'Prepared Solana transaction is unavailable',
+        undefined,
+        'DETERMINISTIC',
+      )
+    }
+    const initialObservation = await observeSignature(
+      durableExecution.expectedExternalId,
+    )
+    if (
+      initialObservation.result.status === 'CONFIRMED' ||
+      initialObservation.result.status === 'FAILED'
+    ) {
+      return initialObservation.result
+    }
+    if (initialObservation.known) {
+      return waitForConfirmation(
+        durableExecution.expectedExternalId,
+        BigInt(
+          parseRecoveryMetadata(durableExecution.recoveryMetadata).lastValidBlockHeight,
+        ),
+      )
+    }
+
+    try {
+      const sentSignature = await withRpcTimeout((abortSignal) =>
+        options.rpc
+          .sendTransaction(
+            durableExecution.serializedPayload as Base64EncodedWireTransaction,
+            {
+              encoding: 'base64',
+              preflightCommitment: CONFIRMATION_COMMITMENT,
+              maxRetries: 0n,
+            },
+          )
+          .send({ abortSignal }),
+      )
+      if (sentSignature !== durableExecution.expectedExternalId) {
+        throw new ExternalRailError(
+          'Solana RPC returned an unexpected transaction signature',
+        )
+      }
+      return await waitForConfirmation(
+        durableExecution.expectedExternalId,
+        BigInt(
+          parseRecoveryMetadata(durableExecution.recoveryMetadata).lastValidBlockHeight,
+        ),
+      )
+    } catch (error) {
+      throw new ExternalRailError(
+        'Solana transaction outcome is ambiguous',
+        error,
+        'AMBIGUOUS',
+      )
+    }
+  }
+
   return {
     name: SOLANA_SPL_RAIL,
     canRoute: (request) =>
       request.currency === 'USD' && request.destination.rail === SOLANA_SPL_RAIL,
+    validateDestination: (request) => {
+      if (request.destination.rail !== SOLANA_SPL_RAIL) {
+        return
+      }
+      try {
+        parseAddress(request.destination.reference, 'recipient public key')
+      } catch {
+        throw new ValidationError('Recipient Solana wallet address is invalid')
+      }
+    },
     quote: async (request) => ({ rail: SOLANA_SPL_RAIL, amount: request.amount }),
     prepare: async (request, context) => {
       if (context === undefined) {
@@ -463,14 +740,9 @@ export function createSolanaPaymentRailWithRpc(
         if (payerSigner.address !== payerOwner) {
           throw new ExternalRailError('Payer custody public key does not match account')
         }
-        const feeBalance = await withRpcTimeout((abortSignal) =>
-          options.rpc
-            .getBalance(feePayerSigner.address, { commitment: CONFIRMATION_COMMITMENT })
-            .send({ abortSignal }),
-        )
-        if (feeBalance.value <= 0n) {
+        if (feePayerSigner.address === payerSigner.address) {
           throw new ExternalRailError(
-            'Platform fee payer has no SOL for transaction fees',
+            'Platform fee payer must be different from the payer account signer',
           )
         }
 
@@ -551,12 +823,61 @@ export function createSolanaPaymentRailWithRpc(
             setTransactionMessageLifetimeUsingBlockhash(latestBlockhash.value, message),
           (message) => appendTransactionMessageInstructions(instructions, message),
         )
+        const compiledTransaction = compileTransaction(transactionMessage)
+        const messageBase64 = Buffer.from(compiledTransaction.messageBytes).toString(
+          'base64',
+        )
+        const feeForMessage = await withRpcTimeout((abortSignal) =>
+          options.rpc
+            .getFeeForMessage(messageBase64 as never, {
+              commitment: CONFIRMATION_COMMITMENT,
+            })
+            .send({ abortSignal }),
+        )
+        if (feeForMessage.value === null) {
+          throw new ExternalRailError(
+            'Solana network fee could not be determined',
+            undefined,
+            'DETERMINISTIC',
+          )
+        }
+        const recipientAtaRent = recipientAccount.exists
+          ? 0n
+          : await withRpcTimeout((abortSignal) =>
+              options.rpc.getMinimumBalanceForRentExemption(165n).send({ abortSignal }),
+            )
+        const requiredFeePayerBalance = feeForMessage.value + recipientAtaRent
+        const feeBalance = await withRpcTimeout((abortSignal) =>
+          options.rpc
+            .getBalance(feePayerSigner.address, { commitment: CONFIRMATION_COMMITMENT })
+            .send({ abortSignal }),
+        )
+        if (feeBalance.value < requiredFeePayerBalance) {
+          throw new ExternalRailError(
+            'Platform fee payer balance is insufficient for this transaction',
+            undefined,
+            'DETERMINISTIC',
+          )
+        }
         const signedTransaction =
           await signTransactionMessageWithSigners(transactionMessage)
         const serializedTransactionBase64 =
           getBase64EncodedWireTransaction(signedTransaction)
         const expectedTransactionId = getSignatureFromTransaction(signedTransaction)
 
+        const recoveryMetadata: SolanaRecoveryMetadata = {
+          version: 1,
+          blockhash: latestBlockhash.value.blockhash,
+          lastValidBlockHeight: latestBlockhash.value.lastValidBlockHeight.toString(),
+          payerOwner,
+          recipientOwner,
+          payerAta: payerAta[0],
+          recipientAta: recipientAta[0],
+          settlementMint,
+          tokenDecimals: metadata.decimals,
+          tokenAmount: tokenAmount.toString(),
+          createsRecipientAta: !recipientAccount.exists,
+        }
         return {
           rail: SOLANA_SPL_RAIL,
           payloadSafe: JSON.stringify({
@@ -568,10 +889,9 @@ export function createSolanaPaymentRailWithRpc(
             creates_recipient_ata: !recipientAccount.exists,
           }),
           durableExecution: {
-            serializedTransactionBase64,
-            expectedTransactionId,
-            blockhash: latestBlockhash.value.blockhash,
-            lastValidBlockHeight: latestBlockhash.value.lastValidBlockHeight,
+            serializedPayload: serializedTransactionBase64,
+            expectedExternalId: expectedTransactionId,
+            recoveryMetadata: JSON.stringify(recoveryMetadata),
           },
         }
       } catch (error) {
@@ -583,55 +903,63 @@ export function createSolanaPaymentRailWithRpc(
         payerSecret.fill(0)
       }
     },
-    execute: async (prepared) => {
+    execute: executePrepared,
+    recover: async (prepared, context): Promise<RailRecoveryResult> => {
       const durableExecution = prepared.durableExecution
       if (durableExecution === undefined) {
-        throw new ExternalRailError('Prepared Solana transaction is unavailable')
-      }
-      const initialObservation = await observeSignature(
-        durableExecution.expectedTransactionId,
-      )
-      if (initialObservation.result.status === 'CONFIRMED') {
-        return initialObservation.result
-      }
-      if (initialObservation.known) {
-        return waitForConfirmation(
-          durableExecution.expectedTransactionId,
-          durableExecution.lastValidBlockHeight,
-        )
-      }
-
-      try {
-        const sentSignature = await withRpcTimeout((abortSignal) =>
-          options.rpc
-            .sendTransaction(
-              durableExecution.serializedTransactionBase64 as Base64EncodedWireTransaction,
-              {
-                encoding: 'base64',
-                preflightCommitment: CONFIRMATION_COMMITMENT,
-                maxRetries: 0n,
-              },
-            )
-            .send({ abortSignal }),
-        )
-        if (sentSignature !== durableExecution.expectedTransactionId) {
-          throw new ExternalRailError(
-            'Solana RPC returned an unexpected transaction signature',
-          )
-        }
-        return await waitForConfirmation(
-          durableExecution.expectedTransactionId,
-          durableExecution.lastValidBlockHeight,
-        )
-      } catch (error) {
-        if (error instanceof DeterministicTransactionFailure) {
-          throw error
-        }
         throw new ExternalRailError(
-          'Solana transaction outcome is ambiguous',
-          error,
-          'AMBIGUOUS',
+          'Prepared Solana transaction is unavailable',
+          undefined,
+          'DETERMINISTIC',
         )
+      }
+      const metadata = parseRecoveryMetadata(durableExecution.recoveryMetadata)
+      const observation = await observeSignature(durableExecution.expectedExternalId)
+      if (
+        observation.result.status === 'CONFIRMED' ||
+        observation.result.status === 'FAILED'
+      ) {
+        return observation.result
+      }
+      if (observation.known) {
+        try {
+          return await waitForConfirmation(
+            durableExecution.expectedExternalId,
+            BigInt(metadata.lastValidBlockHeight),
+          )
+        } catch (error) {
+          if (!(error instanceof SolanaBlockhashExpiredError)) {
+            throw error
+          }
+        }
+      }
+      const currentBlockHeight = await withRpcTimeout((abortSignal) =>
+        options.rpc
+          .getBlockHeight({ commitment: CONFIRMATION_COMMITMENT })
+          .send({ abortSignal }),
+      )
+      const finalObservation = await observeSignature(
+        durableExecution.expectedExternalId,
+      )
+      if (
+        finalObservation.result.status === 'CONFIRMED' ||
+        finalObservation.result.status === 'FAILED'
+      ) {
+        return finalObservation.result
+      }
+      if (currentBlockHeight <= BigInt(metadata.lastValidBlockHeight)) {
+        return executePrepared(prepared)
+      }
+      if (finalObservation.known || context === undefined) {
+        return {
+          status: 'RECONCILING',
+          railTransactionId: durableExecution.expectedExternalId,
+        }
+      }
+      return {
+        status: 'RECONCILING',
+        railTransactionId: durableExecution.expectedExternalId,
+        replacement: await buildReplacementPreparedPayment(prepared, context),
       }
     },
     getStatus: async (transactionId): Promise<RailStatusResult> => {

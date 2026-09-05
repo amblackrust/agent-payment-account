@@ -57,7 +57,6 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       const accountId = id('acct')
 
       try {
-        await client.surfnet.fundSol(payer.address, 1_000_000_000)
         await client.surfnet.fundSol(feePayer.address, 1_000_000_000)
         await client.cheatcodes
           .setAccount(mint.address, {
@@ -166,8 +165,8 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(attempts).toHaveLength(1)
         expect(attempts[0]?.status).toBe('CONFIRMED')
         expect(attempts[0]?.railTransactionId).toBeTruthy()
-        expect(attempts[0]?.signedTransactionBase64).toBeTruthy()
-        expect(attempts[0]?.confirmedSlot).toBeTypeOf('bigint')
+        expect(attempts[0]?.durablePayload).toBeTruthy()
+        expect(attempts[0]?.confirmationMetadata).toBeTruthy()
         expect(payerToken.exists && payerToken.data.amount).toBe(750_000n)
         expect(recipientToken.exists && recipientToken.data.amount).toBe(1_250_000n)
         expect(

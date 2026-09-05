@@ -74,6 +74,7 @@ export type {
   RailPaymentRequest,
   RailPreparationContext,
   RailPreparedPayment,
+  RailRecoveryResult,
   RailRecipientDestination,
   RailQuote,
   RailStatusResult,

@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  assertPaymentAttemptStatusTransition,
   assertPaymentStatusTransition,
   ConflictError,
   createPaymentAttemptId,
@@ -17,13 +16,16 @@ import {
   type Money,
   type PaymentKind,
   type PaymentRail,
+  type RailExecutionResult,
+  type RailRecoveryResult,
+  type RailPreparedPayment,
   type RailPreparationContext,
   type RailPaymentRequest,
 } from '@agent-payment/core'
 import type {
   AuthenticatedAccount,
-  PaymentAttemptStatus as StoredPaymentAttemptStatus,
   PaymentRecord,
+  PaymentAttemptRecord,
   PaymentRepository,
   RecipientRecord,
   RecipientRepository,
@@ -121,6 +123,10 @@ export class PaymentService {
       ...(description === undefined ? {} : { description }),
       ...(externalReference === undefined ? {} : { externalReference }),
       route: routed.rail.name,
+      payerPublicKey: account.account.solanaPublicKey,
+      destinationRail: routed.request.destination.rail,
+      destinationType: routed.request.destination.type,
+      destinationReference: routed.request.destination.reference,
       settledAtomic: balance.settled.atomicUnits,
     })
     if (!persisted.created) {
@@ -143,67 +149,275 @@ export class PaymentService {
     if (payment === null) {
       throw new ResourceNotFoundError('Payment not found')
     }
-    return this.reconcilePaymentIfNeeded(payment)
+    return this.recoverPayment(payment)
   }
 
   public listPayments(accountId: string): Promise<readonly PaymentRecord[]> {
     return this.repository.listPayments(accountId)
   }
 
-  private async reconcilePaymentIfNeeded(
-    payment: PaymentRecord,
-  ): Promise<PaymentRecord> {
-    if (payment.status !== 'RECONCILING') {
+  private async recoverPayment(payment: PaymentRecord): Promise<PaymentRecord> {
+    if (payment.status === 'CONFIRMED' || payment.status === 'FAILED') {
       return payment
     }
     const attempts = await this.repository.listPaymentAttempts(payment.id)
-    const attempt = attempts.at(-1)
-    if (attempt === undefined) {
-      return payment
-    }
-    const rail = this.rails.find((candidate) => candidate.name === attempt.rail)
-    const transactionId = attempt.railTransactionId ?? attempt.expectedSignature
-    if (rail?.getStatus === undefined || transactionId === null) {
+    let attempt = attempts.at(-1)
+    const rail = this.rails.find((candidate) => candidate.name === payment.route)
+    const request = this.createPersistedRailRequest(payment)
+    if (
+      rail === undefined ||
+      request === undefined ||
+      payment.payerPublicKey === null
+    ) {
       return payment
     }
 
-    const status = await rail.getStatus(transactionId)
-    if (status.status === 'SUBMITTED') {
-      return payment
-    }
-    if (status.status === 'CONFIRMED') {
-      await this.repository.updatePaymentAttempt(
-        attempt.id,
-        'RECONCILING',
-        'CONFIRMED',
-        {
-          railTransactionId: status.railTransactionId ?? transactionId,
-          ...(status.confirmedSlot === undefined
-            ? {}
-            : { confirmedSlot: status.confirmedSlot }),
-        },
-      )
-      const confirmedPayment = await this.repository.transitionPayment(
+    if (payment.status === 'CREATED') {
+      payment = await this.repository.transitionPayment(
         payment.id,
-        'RECONCILING',
-        'CONFIRMED',
-        { confirmedAt: new Date() },
+        'CREATED',
+        'ROUTING',
       )
-      await this.repository.releaseReservation(payment.id)
-      return confirmedPayment
     }
 
-    await this.repository.updatePaymentAttempt(attempt.id, 'RECONCILING', 'FAILED')
-    await this.repository.transitionPayment(payment.id, 'RECONCILING', 'FAILED', {
-      failedAt: new Date(),
-      failureCode: 'EXTERNAL_RAIL_FAILURE',
-      failureMessageSafe: 'Payment rail execution failed',
-    })
-    await this.repository.releaseReservation(payment.id)
-    return (
-      (await this.repository.findPaymentForOwner(payment.payerAccountId, payment.id)) ??
-      payment
-    )
+    const context = this.createPreparationContext(payment)
+    if (attempt === undefined) {
+      const initialAttempt = await this.repository.getOrCreatePaymentAttempt({
+        id: createPaymentAttemptId(),
+        paymentId: payment.id,
+        rail: rail.name,
+        status: 'CREATED',
+      })
+      attempt = initialAttempt.attempt
+    }
+    if (attempt.status === 'CREATED') {
+      const prepared = await rail.prepare(request, context)
+      try {
+        attempt = await this.repository.updatePaymentAttempt(
+          attempt.id,
+          'CREATED',
+          'PREPARED',
+          this.durableAttemptFields(prepared),
+        )
+      } catch (error) {
+        if (!(error instanceof ConflictError)) {
+          throw error
+        }
+        const latestAttempt = (
+          await this.repository.listPaymentAttempts(payment.id)
+        ).at(-1)
+        if (latestAttempt === undefined) {
+          throw error
+        }
+        attempt = latestAttempt
+      }
+    }
+
+    const prepared = this.preparedPaymentFromAttempt(attempt)
+    if (
+      prepared === undefined ||
+      attempt.status === 'CONFIRMED' ||
+      attempt.status === 'FAILED'
+    ) {
+      return payment
+    }
+
+    let recovery: RailRecoveryResult
+    try {
+      recovery =
+        rail.recover === undefined
+          ? await this.executeRail(prepared, rail)
+          : await rail.recover(prepared, context)
+    } catch {
+      // A recovery read can be unavailable after a send. Keep the payment and
+      // reservation recoverable instead of turning an unknown outcome into a failure.
+      await this.tryMarkReconciling(payment, attempt)
+      return (
+        (await this.repository.findPaymentForOwner(
+          payment.payerAccountId,
+          payment.id,
+        )) ?? payment
+      )
+    }
+    if (recovery.replacement !== undefined) {
+      const replacement = await this.repository.createReplacementPaymentAttempt({
+        attemptId: createPaymentAttemptId(),
+        paymentId: payment.id,
+        previousAttemptId: attempt.id,
+        rail: rail.name,
+        durablePayload: recovery.replacement.durableExecution?.serializedPayload ?? '',
+        expectedExternalId:
+          recovery.replacement.durableExecution?.expectedExternalId ?? '',
+        recoveryMetadata: recovery.replacement.durableExecution?.recoveryMetadata ?? '',
+        ...(recovery.replacement.payloadSafe === undefined
+          ? {}
+          : { serializedPayloadSafe: recovery.replacement.payloadSafe }),
+      })
+      attempt = replacement.attempt
+      if (replacement.created) {
+        return this.executeRecoveredAttempt(
+          payment,
+          attempt,
+          recovery.replacement,
+          rail,
+        )
+      }
+      const existingPrepared = this.preparedPaymentFromAttempt(attempt)
+      if (existingPrepared === undefined) {
+        return payment
+      }
+      return this.executeRecoveredAttempt(payment, attempt, existingPrepared, rail)
+    }
+    return this.finalizeRecoveredResult(payment, attempt, recovery)
+  }
+
+  private async applyRecoveredExecutionResult(
+    payment: PaymentRecord,
+    attempt: PaymentAttemptRecord,
+    execution: RailExecutionResult,
+  ): Promise<PaymentRecord> {
+    try {
+      return await this.applyExecutionResult(payment, attempt, execution)
+    } catch (error) {
+      if (!(error instanceof ConflictError)) {
+        throw error
+      }
+      // Another process may have finalized this exact attempt while this
+      // process was reading the chain. Its result is authoritative.
+      return (
+        (await this.repository.findPaymentForOwner(
+          payment.payerAccountId,
+          payment.id,
+        )) ?? payment
+      )
+    }
+  }
+
+  private async executeRecoveredAttempt(
+    payment: PaymentRecord,
+    attempt: PaymentAttemptRecord,
+    prepared: RailPreparedPayment,
+    rail: PaymentRail,
+  ): Promise<PaymentRecord> {
+    try {
+      return await this.applyRecoveredExecutionResult(
+        payment,
+        attempt,
+        await this.executeRail(prepared, rail),
+      )
+    } catch {
+      // The attempt already has durable recovery material. Any local failure
+      // after this point may follow a network send, so it must stay recoverable.
+      await this.tryMarkReconciling(payment, attempt)
+      return (
+        (await this.repository.findPaymentForOwner(
+          payment.payerAccountId,
+          payment.id,
+        )) ?? payment
+      )
+    }
+  }
+
+  private async finalizeRecoveredResult(
+    payment: PaymentRecord,
+    attempt: PaymentAttemptRecord,
+    execution: RailExecutionResult,
+  ): Promise<PaymentRecord> {
+    try {
+      return await this.applyRecoveredExecutionResult(payment, attempt, execution)
+    } catch {
+      // Confirmation may already exist on-chain. Persistence failure must not
+      // release the reservation or mark this payment as failed.
+      await this.tryMarkReconciling(payment, attempt)
+      return (
+        (await this.repository.findPaymentForOwner(
+          payment.payerAccountId,
+          payment.id,
+        )) ?? payment
+      )
+    }
+  }
+
+  private createPersistedRailRequest(
+    payment: PaymentRecord,
+  ): RailPaymentRequest | undefined {
+    if (
+      payment.destinationRail === null ||
+      payment.destinationType === null ||
+      payment.destinationReference === null
+    ) {
+      return undefined
+    }
+    const amount = moneyFromAtomicUnits(payment.amountAtomic, payment.currency)
+    return {
+      operation: payment.kind,
+      currency: amount.currency,
+      amount,
+      payerAccountId: payment.payerAccountId,
+      recipientId: payment.recipientId,
+      destination: {
+        rail: payment.destinationRail,
+        type: payment.destinationType,
+        reference: payment.destinationReference,
+      },
+      ...(payment.description === null ? {} : { description: payment.description }),
+      ...(payment.externalReference === null
+        ? {}
+        : { externalReference: payment.externalReference }),
+    }
+  }
+
+  private createPreparationContext(payment: PaymentRecord): RailPreparationContext {
+    return {
+      paymentId: payment.id,
+      payerAccountId: payment.payerAccountId,
+      payerPublicKey: payment.payerPublicKey as string,
+      getPayerSecretKey: async () => {
+        if (this.payerSecretKeyProvider === undefined) {
+          throw new ExternalRailError('Payer custody is not configured')
+        }
+        return this.payerSecretKeyProvider(payment.payerAccountId)
+      },
+    }
+  }
+
+  private durableAttemptFields(prepared: RailPreparedPayment) {
+    const durable = prepared.durableExecution
+    return {
+      ...(prepared.payloadSafe === undefined
+        ? {}
+        : { serializedPayloadSafe: prepared.payloadSafe }),
+      ...(durable === undefined
+        ? {}
+        : {
+            durablePayload: durable.serializedPayload,
+            expectedExternalId: durable.expectedExternalId,
+            recoveryMetadata: durable.recoveryMetadata,
+          }),
+    }
+  }
+
+  private preparedPaymentFromAttempt(
+    attempt: PaymentAttemptRecord,
+  ): RailPreparedPayment | undefined {
+    if (
+      attempt.durablePayload === null ||
+      attempt.expectedExternalId === null ||
+      attempt.recoveryMetadata === null
+    ) {
+      return undefined
+    }
+    return {
+      rail: attempt.rail,
+      ...(attempt.serializedPayloadSafe === null
+        ? {}
+        : { payloadSafe: attempt.serializedPayloadSafe }),
+      durableExecution: {
+        serializedPayload: attempt.durablePayload,
+        expectedExternalId: attempt.expectedExternalId,
+        recoveryMetadata: attempt.recoveryMetadata,
+      },
+    }
   }
 
   private async resolveRecipient(
@@ -250,11 +464,15 @@ export class PaymentService {
         ...(description === undefined ? {} : { description }),
         ...(externalReference === undefined ? {} : { externalReference }),
       }
+      let rail: PaymentRail
       try {
-        return { rail: selectPaymentRail(request, this.rails), request }
+        rail = selectPaymentRail(request, this.rails)
       } catch (error) {
         lastUnsupportedRail = error instanceof Error ? error : undefined
+        continue
       }
+      rail.validateDestination?.(request)
+      return { rail, request }
     }
     if (lastUnsupportedRail !== undefined) {
       throw lastUnsupportedRail
@@ -268,22 +486,22 @@ export class PaymentService {
     request: RailPaymentRequest,
     payerPublicKey: string,
   ): Promise<PaymentResult> {
-    let paymentStatus = payment.status
-    let attemptStatus: StoredPaymentAttemptStatus = 'CREATED'
-    let attempt:
-      Awaited<ReturnType<PaymentRepository['createPaymentAttempt']>> | undefined
+    let attempt: PaymentAttemptRecord | undefined
+    let executionCalled = false
 
     try {
       attempt = await this.repository.createPaymentAttempt({
         id: createPaymentAttemptId(),
         paymentId: payment.id,
-        attemptNumber: 1,
         rail: rail.name,
-        status: attemptStatus,
+        status: 'CREATED',
       })
-      assertPaymentStatusTransition(paymentStatus, 'ROUTING')
-      await this.repository.transitionPayment(payment.id, paymentStatus, 'ROUTING')
-      paymentStatus = 'ROUTING'
+      assertPaymentStatusTransition(payment.status, 'ROUTING')
+      payment = await this.repository.transitionPayment(
+        payment.id,
+        payment.status,
+        'ROUTING',
+      )
 
       const quote = await rail.quote(request)
       if (
@@ -292,42 +510,17 @@ export class PaymentService {
       ) {
         throw new ExternalRailError('Payment rail returned an invalid quote')
       }
-      const preparationContext: RailPreparationContext = {
-        paymentId: payment.id,
-        payerAccountId: payment.payerAccountId,
+      const preparationContext = this.createPreparationContext({
+        ...payment,
         payerPublicKey,
-        getPayerSecretKey: async () => {
-          if (this.payerSecretKeyProvider === undefined) {
-            throw new ExternalRailError('Payer custody is not configured')
-          }
-          return this.payerSecretKeyProvider(payment.payerAccountId)
-        },
-      }
+      })
       const prepared = await rail.prepare(request, preparationContext)
-      assertPaymentAttemptStatusTransition(attemptStatus, 'PREPARED')
-      const durableExecution = prepared.durableExecution
-      await this.repository.updatePaymentAttempt(
+      attempt = await this.repository.updatePaymentAttempt(
         attempt.id,
-        attemptStatus,
+        'CREATED',
         'PREPARED',
-        prepared.payloadSafe === undefined && durableExecution === undefined
-          ? undefined
-          : {
-              ...(prepared.payloadSafe === undefined
-                ? {}
-                : { serializedPayloadSafe: prepared.payloadSafe }),
-              ...(durableExecution === undefined
-                ? {}
-                : {
-                    signedTransactionBase64:
-                      durableExecution.serializedTransactionBase64,
-                    expectedSignature: durableExecution.expectedTransactionId,
-                    blockhash: durableExecution.blockhash,
-                    lastValidBlockHeight: durableExecution.lastValidBlockHeight,
-                  }),
-            },
+        this.durableAttemptFields(prepared),
       )
-      attemptStatus = 'PREPARED'
 
       const execute = rail.execute
       if (execute === undefined) {
@@ -337,74 +530,22 @@ export class PaymentService {
         }
       }
 
+      executionCalled = true
       const execution = await execute(prepared)
-      if (execution.status === 'FAILED') {
-        throw new ExternalRailError('Payment rail reported a failed execution')
+      return {
+        payment: await this.applyExecutionResult(payment, attempt, execution),
+        created: true,
       }
-      assertPaymentAttemptStatusTransition(attemptStatus, 'SUBMITTED')
-      await this.repository.updatePaymentAttempt(
-        attempt.id,
-        attemptStatus,
-        'SUBMITTED',
-        execution.railTransactionId === undefined
-          ? undefined
-          : { railTransactionId: execution.railTransactionId },
-      )
-      attemptStatus = 'SUBMITTED'
-      assertPaymentStatusTransition(paymentStatus, 'SUBMITTED')
-      await this.repository.transitionPayment(payment.id, paymentStatus, 'SUBMITTED')
-      paymentStatus = 'SUBMITTED'
-
-      if (execution.status === 'CONFIRMED') {
-        assertPaymentAttemptStatusTransition(attemptStatus, 'CONFIRMED')
-        await this.repository.updatePaymentAttempt(
-          attempt.id,
-          attemptStatus,
-          'CONFIRMED',
-          execution.railTransactionId === undefined &&
-            execution.confirmedSlot === undefined
-            ? undefined
-            : {
-                ...(execution.railTransactionId === undefined
-                  ? {}
-                  : { railTransactionId: execution.railTransactionId }),
-                ...(execution.confirmedSlot === undefined
-                  ? {}
-                  : { confirmedSlot: execution.confirmedSlot }),
-              },
-        )
-        attemptStatus = 'CONFIRMED'
-        assertPaymentStatusTransition(paymentStatus, 'CONFIRMED')
-        const confirmedPayment = await this.repository.transitionPayment(
-          payment.id,
-          paymentStatus,
-          'CONFIRMED',
-          { confirmedAt: new Date() },
-        )
-        await this.repository.releaseReservation(payment.id)
-        return { payment: confirmedPayment, created: true }
-      }
-      if (execution.status === 'SUBMITTED') {
-        return {
-          payment: await this.getPayment(payment.payerAccountId, payment.id),
-          created: true,
-        }
-      }
-      throw new ExternalRailError(
-        'Payment rail returned an unsupported execution state',
-      )
     } catch (error) {
-      if (
-        error instanceof ExternalRailError &&
-        error.kind === 'AMBIGUOUS' &&
-        attempt !== undefined
-      ) {
-        await this.markPaymentReconciling(
-          payment.id,
-          paymentStatus,
-          attempt.id,
-          attemptStatus,
-        )
+      if (attempt === undefined) {
+        throw error
+      }
+      if (executionCalled) {
+        if (error instanceof ExternalRailError && error.kind === 'DETERMINISTIC') {
+          await this.tryFinalizeFailure(payment, attempt, error)
+          throw error
+        }
+        await this.tryMarkReconciling(payment, attempt)
         throw new ExternalRailError(
           'Payment execution outcome is ambiguous',
           error,
@@ -412,17 +553,7 @@ export class PaymentService {
           { payment_id: payment.id },
         )
       }
-      if (attempt === undefined) {
-        assertPaymentStatusTransition(paymentStatus, 'FAILED')
-        await this.repository.transitionPayment(payment.id, paymentStatus, 'FAILED', {
-          failedAt: new Date(),
-          failureCode: 'EXTERNAL_RAIL_FAILURE',
-          failureMessageSafe: 'Payment rail execution failed',
-        })
-        await this.repository.releaseReservation(payment.id)
-      } else {
-        await this.failPayment(payment.id, paymentStatus, attempt.id, attemptStatus)
-      }
+      await this.tryFinalizeFailure(payment, attempt, error)
       if (error instanceof InsufficientFundsError) {
         throw error
       }
@@ -432,44 +563,103 @@ export class PaymentService {
     }
   }
 
-  private async markPaymentReconciling(
-    paymentId: string,
-    paymentStatus: PaymentRecord['status'],
-    attemptId: string,
-    attemptStatus: StoredPaymentAttemptStatus,
-  ): Promise<void> {
-    if (attemptStatus !== 'RECONCILING') {
-      assertPaymentAttemptStatusTransition(attemptStatus, 'RECONCILING')
-      await this.repository.updatePaymentAttempt(
-        attemptId,
-        attemptStatus,
-        'RECONCILING',
-      )
+  private async executeRail(
+    prepared: RailPreparedPayment,
+    rail: PaymentRail,
+  ): Promise<RailRecoveryResult> {
+    const expectedExternalId = prepared.durableExecution?.expectedExternalId
+    if (expectedExternalId !== undefined && rail.getStatus !== undefined) {
+      return rail.getStatus(expectedExternalId)
     }
-    if (paymentStatus !== 'RECONCILING') {
-      assertPaymentStatusTransition(paymentStatus, 'RECONCILING')
-      await this.repository.transitionPayment(paymentId, paymentStatus, 'RECONCILING')
+    if (rail.execute === undefined) {
+      return { status: 'RECONCILING' }
+    }
+    return rail.execute(prepared)
+  }
+
+  private async applyExecutionResult(
+    payment: PaymentRecord,
+    attempt: PaymentAttemptRecord,
+    execution: RailExecutionResult,
+  ): Promise<PaymentRecord> {
+    if (execution.status === 'CONFIRMED') {
+      return this.repository.finalizeConfirmedPayment({
+        paymentId: payment.id,
+        expectedPaymentStatus: payment.status,
+        attemptId: attempt.id,
+        expectedAttemptStatus: attempt.status,
+        ...(execution.railTransactionId === undefined
+          ? {}
+          : { railTransactionId: execution.railTransactionId }),
+        ...(execution.confirmationMetadata === undefined
+          ? {}
+          : { confirmationMetadata: execution.confirmationMetadata }),
+      })
+    }
+    if (execution.status === 'FAILED') {
+      return this.repository.finalizeFailedPayment({
+        paymentId: payment.id,
+        expectedPaymentStatus: payment.status,
+        attemptId: attempt.id,
+        expectedAttemptStatus: attempt.status,
+        failureCode: execution.failureCode ?? 'EXTERNAL_RAIL_FAILURE',
+        failureMessageSafe:
+          execution.failureMessageSafe ?? 'Payment rail execution failed',
+      })
+    }
+    if (execution.status === 'SUBMITTED') {
+      if (payment.status === 'SUBMITTED' && attempt.status === 'SUBMITTED') {
+        return payment
+      }
+      return this.repository.markPaymentSubmitted({
+        paymentId: payment.id,
+        attemptId: attempt.id,
+        expectedPaymentStatus: payment.status,
+        expectedAttemptStatus: attempt.status,
+        ...(execution.railTransactionId === undefined
+          ? {}
+          : { railTransactionId: execution.railTransactionId }),
+      })
+    }
+    if (payment.status === 'RECONCILING' && attempt.status === 'RECONCILING') {
+      return payment
+    }
+    return this.repository.markPaymentReconciling({
+      paymentId: payment.id,
+      attemptId: attempt.id,
+      expectedPaymentStatus: payment.status,
+      expectedAttemptStatus: attempt.status,
+    })
+  }
+
+  private async tryMarkReconciling(
+    payment: PaymentRecord,
+    attempt: PaymentAttemptRecord,
+  ): Promise<void> {
+    try {
+      await this.applyExecutionResult(payment, attempt, { status: 'RECONCILING' })
+    } catch {
+      // The original ambiguous error is safer than changing state without a DB commit.
     }
   }
 
-  private async failPayment(
-    paymentId: string,
-    paymentStatus: PaymentRecord['status'],
-    attemptId: string,
-    attemptStatus: StoredPaymentAttemptStatus,
+  private async tryFinalizeFailure(
+    payment: PaymentRecord,
+    attempt: PaymentAttemptRecord,
+    error: unknown,
   ): Promise<void> {
-    if (attemptStatus !== 'FAILED' && attemptStatus !== 'CONFIRMED') {
-      assertPaymentAttemptStatusTransition(attemptStatus, 'FAILED')
-      await this.repository.updatePaymentAttempt(attemptId, attemptStatus, 'FAILED')
-    }
-    if (paymentStatus !== 'FAILED' && paymentStatus !== 'CONFIRMED') {
-      assertPaymentStatusTransition(paymentStatus, 'FAILED')
-      await this.repository.transitionPayment(paymentId, paymentStatus, 'FAILED', {
-        failedAt: new Date(),
-        failureCode: 'EXTERNAL_RAIL_FAILURE',
+    try {
+      await this.repository.finalizeFailedPayment({
+        paymentId: payment.id,
+        expectedPaymentStatus: payment.status,
+        attemptId: attempt.id,
+        expectedAttemptStatus: attempt.status,
+        failureCode:
+          error instanceof ExternalRailError ? error.code : 'EXTERNAL_RAIL_FAILURE',
         failureMessageSafe: 'Payment rail execution failed',
       })
-      await this.repository.releaseReservation(paymentId)
+    } catch {
+      // A failed persistence transaction leaves the reservation recoverable.
     }
   }
 }
