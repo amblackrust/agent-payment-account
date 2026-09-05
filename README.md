@@ -195,6 +195,12 @@ Payments move through `CREATED`, `ROUTING`, `SUBMITTED`, `RECONCILING`,
 reservation until chain status is known. Transaction history is available via
 `GET /v1/transactions` and `account.listTransactions()`.
 
+Transaction history is cursor-paginated with `limit` (default 50, maximum 100)
+and an opaque `cursor`; `account.listTransactionsPage()` exposes one page and
+`account.listTransactions()` explicitly collects all pages for compatibility.
+The cursor uses `(created_at, id)` ordering so new inserts do not create gaps or
+duplicates in an existing traversal.
+
 ## Idempotency
 
 `pay`, `send`, and `refund` require an idempotency key at the HTTP boundary.
@@ -279,6 +285,10 @@ console.log(balance.available, current.status, transactions.length)
 
 The polling loop is explicit application code; the SDK does not silently poll.
 The SDK package has no Solana dependency.
+
+After startup, API workers recover bounded batches of pending outgoing payments
+and reconcile incoming transfers. They are single-flight, stop accepting new
+runs during shutdown, drain active runs, and only then disconnect PostgreSQL.
 
 ## Release / CI verification
 

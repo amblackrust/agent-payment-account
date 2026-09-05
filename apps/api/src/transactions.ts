@@ -72,7 +72,7 @@ export class TransactionService {
       .sort(compareTransactions)
       .slice(0, limit)
     const last = merged.at(-1)
-    const hasMore = payments.length > limit || incoming.length > limit
+    const hasMore = payments.length + incoming.length > limit
     return {
       transactions: merged,
       next_cursor:
