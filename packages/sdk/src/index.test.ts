@@ -304,6 +304,16 @@ describe('AgentPaymentAccount SDK', () => {
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',
         apiKey: 'key',
+        fetch: response('EXTERNAL_RAIL_FAILURE', 502),
+      }).pay({ recipientId: 'rcpt_test', amount: '1.20' }, 'rail-failure-key'),
+    ).rejects.toMatchObject({
+      code: 'EXTERNAL_SERVICE_ERROR',
+      statusCode: 502,
+    })
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'key',
         fetch: response('FST_ERR_VALIDATION', 400),
       }).pay({ recipientId: 'rcpt_test', amount: '1.20' }, 'validation-key'),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', statusCode: 400 })

@@ -227,6 +227,10 @@ export class ExternalServiceError extends SdkError {
   }
 }
 
+class HttpResponseExternalServiceError extends ExternalServiceError {
+  public readonly fromHttpResponse = true
+}
+
 function parseContract<T>(
   value: unknown,
   schema: { safeParse(input: unknown): { success: true; data: T } | { success: false } },
@@ -558,6 +562,7 @@ export class AgentPaymentAccount {
         }
       } catch (error) {
         if (error instanceof SdkError) {
+          if (error instanceof HttpResponseExternalServiceError) throw error
           if (
             method === 'POST' &&
             idempotencyKey !== undefined &&
@@ -656,7 +661,10 @@ function mapHttpError(
           paymentId,
         )
       }
-      return new ExternalServiceError('Payment rail is unavailable', statusCode)
+      return new HttpResponseExternalServiceError(
+        'Payment rail is unavailable',
+        statusCode,
+      )
     default:
       if (isAmbiguousMoneyError) {
         return new PaymentPendingError(
@@ -670,6 +678,9 @@ function mapHttpError(
       if (statusCode >= 400 && statusCode < 500) {
         return new ValidationError(message, statusCode)
       }
-      return new ExternalServiceError('Payment service is unavailable', statusCode)
+      return new HttpResponseExternalServiceError(
+        'Payment service is unavailable',
+        statusCode,
+      )
   }
 }
