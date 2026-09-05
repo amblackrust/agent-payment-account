@@ -200,7 +200,11 @@ function getMemo(transaction: TransactionResponse): string | undefined {
       continue
     }
     if (typeof instruction.parsed === 'string' && instruction.parsed.length <= 255) {
-      return instruction.parsed
+      const marker = '|reference:'
+      const markerIndex = instruction.parsed.indexOf(marker)
+      return markerIndex === -1
+        ? instruction.parsed
+        : instruction.parsed.slice(markerIndex + marker.length)
     }
   }
   return undefined

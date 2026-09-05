@@ -221,8 +221,15 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           confirmedAt: new Date(),
         })
         const duplicate = await database.createIncomingPayment({
-          ...first.payment,
           id: `in_${randomUUID().replaceAll('-', '')}`,
+          accountId: first.payment.accountId,
+          signature: first.payment.signature,
+          amountAtomic: first.payment.amountAtomic,
+          currency: first.payment.currency,
+          ...(first.payment.sourceAddress === null ? {} : { sourceAddress: first.payment.sourceAddress }),
+          ...(first.payment.reference === null ? {} : { reference: first.payment.reference }),
+          tokenAccount: first.payment.tokenAccount,
+          settlementMint: first.payment.settlementMint,
           confirmedAt: new Date(),
         })
         expect(first.created).toBe(true)

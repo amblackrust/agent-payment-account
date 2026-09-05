@@ -49,6 +49,12 @@ const DEFAULT_CONFIRMATION_TIMEOUT_MS = 15_000
 const DEFAULT_POLL_INTERVAL_MS = 250
 const SOLANA_SECRET_KEY_BYTES = 64
 
+function createPaymentMemo(paymentId: string, externalReference: string | undefined): string {
+  return externalReference === undefined
+    ? paymentId
+    : `${paymentId}|reference:${externalReference}`
+}
+
 type SolanaCluster = 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
 
 export interface SolanaPaymentRailOptions {
@@ -93,6 +99,7 @@ interface SolanaRecoveryMetadata {
   readonly tokenDecimals: number
   readonly tokenAmount: string
   readonly createsRecipientAta: boolean
+  readonly externalReference?: string
 }
 
 class SolanaBlockhashExpiredError extends ExternalRailError {
@@ -569,7 +576,7 @@ export function createSolanaPaymentRailWithRpc(
           amount: tokenAmount,
           decimals: metadata.tokenDecimals,
         }),
-        getAddMemoInstruction({ memo: context.paymentId }),
+        getAddMemoInstruction({ memo: createPaymentMemo(context.paymentId, metadata.externalReference) }),
       )
       const latestBlockhash = await withRpcTimeout((abortSignal) =>
         options.rpc
@@ -808,7 +815,7 @@ export function createSolanaPaymentRailWithRpc(
             amount: tokenAmount,
             decimals: metadata.decimals,
           }),
-          getAddMemoInstruction({ memo: context.paymentId }),
+          getAddMemoInstruction({ memo: createPaymentMemo(context.paymentId, request.externalReference) }),
         )
 
         const latestBlockhash = await withRpcTimeout((abortSignal) =>
@@ -877,6 +884,9 @@ export function createSolanaPaymentRailWithRpc(
           tokenDecimals: metadata.decimals,
           tokenAmount: tokenAmount.toString(),
           createsRecipientAta: !recipientAccount.exists,
+          ...(request.externalReference === undefined
+            ? {}
+            : { externalReference: request.externalReference }),
         }
         return {
           rail: SOLANA_SPL_RAIL,

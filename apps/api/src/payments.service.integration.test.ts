@@ -5,6 +5,7 @@ import {
   ConflictError,
   createMoney,
   ExternalRailError,
+  RefundNotSupportedError,
   ValidationError,
   type PaymentRail,
 } from '@agent-payment/core'
@@ -481,6 +482,74 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(
           await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
         ).toBe(1000n)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('supports only managed-account refunds and applies refund idempotency', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const payer = await createAccount(database)
+      const recipientAccount = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: payer.account.id,
+        managedAccountId: recipientAccount.account.id,
+        displayName: 'managed recipient',
+        type: 'AGENT',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: recipientAccount.account.solanaPublicKey,
+        },
+      })
+      const service = new PaymentService(
+        database,
+        { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+        [railThatConfirms()],
+      )
+
+      try {
+        const original = await service.createPayment(
+          payer,
+          'PAY',
+          { recipientId: recipient.id, amount: '2.00', currency: 'USD' },
+          'managed-payment',
+        )
+        const refund = await service.createRefund(
+          recipientAccount,
+          { originalPaymentId: original.payment.id, amount: '1.25', currency: 'USD' },
+          'refund-key',
+        )
+        const replay = await new PaymentService(
+          database,
+          { getSettlementBalance: async () => { throw new Error('replay must not read balance') } },
+          [],
+        ).createRefund(
+          recipientAccount,
+          { originalPaymentId: original.payment.id, amount: '1.25', currency: 'USD' },
+          'refund-key',
+        )
+
+        expect(refund.payment.kind).toBe('REFUND')
+        expect(refund.payment.status).toBe('CONFIRMED')
+        expect(replay.created).toBe(false)
+        expect(replay.payment.id).toBe(refund.payment.id)
+        await expect(
+          service.createRefund(
+            recipientAccount,
+            { originalPaymentId: original.payment.id, amount: '0.76', currency: 'USD' },
+            'another-refund',
+          ),
+        ).rejects.toThrow(ConflictError)
+        await expect(
+          service.createRefund(
+            payer,
+            { originalPaymentId: original.payment.id, amount: '0.01', currency: 'USD' },
+            'payer-refund',
+          ),
+        ).rejects.toThrow(RefundNotSupportedError)
       } finally {
         await database.disconnect()
       }
