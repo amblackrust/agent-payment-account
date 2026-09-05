@@ -1,9 +1,9 @@
 import 'dotenv/config'
 import { defineConfig } from 'prisma/config'
 
-const databaseUrl =
-  process.env.DATABASE_URL ??
-  'postgresql://postgres:postgres@localhost:5432/agent_payment_account?schema=public'
+import { requireDatabaseUrl } from './prisma-env.js'
+
+const databaseUrl = requireDatabaseUrl()
 
 export default defineConfig({
   schema: 'prisma/schema.prisma',

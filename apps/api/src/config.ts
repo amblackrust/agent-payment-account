@@ -78,10 +78,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
 }
 
 export interface RedactedConfig {
-  readonly databaseUrl: string
   readonly port: number
   readonly nodeEnv: AppConfig['nodeEnv']
-  readonly solanaRpcUrl: string
   readonly solanaCluster: AppConfig['solanaCluster']
   readonly solanaSettlementMint: string
   readonly allowMainnet: boolean
@@ -92,10 +90,8 @@ export interface RedactedConfig {
 
 export function redactConfig(config: AppConfig): RedactedConfig {
   return {
-    databaseUrl: config.databaseUrl.replace(/:\/\/[^@]+@/, '://[redacted]@'),
     port: config.port,
     nodeEnv: config.nodeEnv,
-    solanaRpcUrl: config.solanaRpcUrl,
     solanaCluster: config.solanaCluster,
     solanaSettlementMint: config.solanaSettlementMint,
     allowMainnet: config.allowMainnet,

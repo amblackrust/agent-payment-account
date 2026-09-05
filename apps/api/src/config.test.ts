@@ -43,12 +43,28 @@ describe('configuration', () => {
   })
 
   it('redacts secrets from the serialized configuration', () => {
-    const config = loadConfig(validEnvironment)
+    const config = loadConfig({
+      ...validEnvironment,
+      DATABASE_URL:
+        'postgresql://db-user:db-password@db.example/agent?token=database-query-secret',
+      SOLANA_RPC_URL:
+        'https://rpc.example/path/rpc-path-secret?api-key=rpc-query-secret',
+      ADMIN_API_KEY: 'admin-sentinel-secret',
+      SOLANA_FEE_PAYER_SECRET: 'fee-payer-sentinel-secret',
+      WALLET_MASTER_KEY: 'wallet-master-sentinel-secret',
+    })
     const serialized = JSON.stringify(redactConfig(config))
 
-    expect(serialized).not.toContain('admin-secret')
-    expect(serialized).not.toContain('fee-payer-secret')
-    expect(serialized).not.toContain('wallet-master-key')
+    expect(serialized).not.toContain('db-user')
+    expect(serialized).not.toContain('db-password')
+    expect(serialized).not.toContain('database-query-secret')
+    expect(serialized).not.toContain('rpc-path-secret')
+    expect(serialized).not.toContain('rpc-query-secret')
+    expect(serialized).not.toContain('admin-sentinel-secret')
+    expect(serialized).not.toContain('fee-payer-sentinel-secret')
+    expect(serialized).not.toContain('wallet-master-sentinel-secret')
+    expect(serialized).not.toContain('db.example')
+    expect(serialized).not.toContain('rpc.example')
     expect(serialized).toContain('hasAdminApiKey')
   })
 })

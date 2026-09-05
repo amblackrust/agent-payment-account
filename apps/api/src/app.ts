@@ -100,8 +100,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       try {
         await options.readinessDependency.checkReadiness()
         return { status: 'ok' }
-      } catch (error) {
-        app.log.error({ err: error }, 'Readiness check failed')
+      } catch {
+        app.log.error('Readiness check failed')
         return reply.code(503).send({ status: 'not_ready' })
       }
     },
