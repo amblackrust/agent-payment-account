@@ -7,6 +7,10 @@ import type { AppConfig } from './config.js'
 import { serializeAccountCreation, serializeReceiveDestination } from './accounts.js'
 import type { AccountService } from './accounts.js'
 import { assertAdminApiKey, authenticateAgent } from './auth.js'
+import { serializePayment } from './payments.js'
+import type { PaymentService } from './payments.js'
+import { serializeRecipient } from './recipients.js'
+import type { RecipientService } from './recipients.js'
 
 export interface ReadinessDependency {
   checkReadiness(): Promise<void>
@@ -18,6 +22,8 @@ export interface BuildAppOptions {
   readonly accountRepository?: AccountRepository
   readonly accountService?: AccountService
   readonly solanaRail?: SolanaRail
+  readonly recipientService?: RecipientService
+  readonly paymentService?: PaymentService
 }
 
 interface ErrorWithCode {
@@ -193,6 +199,238 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         )
       },
     )
+
+    if (options.recipientService !== undefined) {
+      const { recipientService } = options
+      app.post<{
+        Body: {
+          display_name: string
+          type: string
+          destination: { type: string; wallet_address: string }
+        }
+      }>(
+        '/v1/recipients',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: {
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                display_name: { type: 'string', minLength: 1, maxLength: 120 },
+                type: { type: 'string', minLength: 1, maxLength: 64 },
+                destination: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    type: { type: 'string', const: 'SOLANA_SPL' },
+                    wallet_address: { type: 'string', minLength: 1, maxLength: 128 },
+                  },
+                  required: ['type', 'wallet_address'],
+                },
+              },
+              required: ['display_name', 'type', 'destination'],
+            },
+          },
+        },
+        async (request, reply) => {
+          const account = requireAgentAccount(request)
+          const recipient = await recipientService.createRecipient(account.account.id, {
+            displayName: request.body.display_name,
+            type: request.body.type,
+            destination: {
+              type: request.body.destination.type,
+              walletAddress: request.body.destination.wallet_address,
+            },
+          })
+          return reply.code(201).send(serializeRecipient(recipient))
+        },
+      )
+
+      app.get(
+        '/v1/recipients',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+        },
+        async (request) => {
+          const account = requireAgentAccount(request)
+          const recipients = await recipientService.listRecipients(account.account.id)
+          return { recipients: recipients.map(serializeRecipient) }
+        },
+      )
+
+      app.get<{ Params: { recipientId: string } }>(
+        '/v1/recipients/:recipientId',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+        },
+        async (request) => {
+          const account = requireAgentAccount(request)
+          return serializeRecipient(
+            await recipientService.getRecipient(
+              account.account.id,
+              request.params.recipientId,
+            ),
+          )
+        },
+      )
+
+      app.patch<{
+        Params: { recipientId: string }
+        Body: {
+          display_name?: string
+          type?: string
+          destination?: { id: string; type: string; wallet_address: string }
+        }
+      }>(
+        '/v1/recipients/:recipientId',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: {
+            params: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { recipientId: { type: 'string', minLength: 1 } },
+              required: ['recipientId'],
+            },
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                display_name: { type: 'string', minLength: 1, maxLength: 120 },
+                type: { type: 'string', minLength: 1, maxLength: 64 },
+                destination: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: 'string', minLength: 1, maxLength: 64 },
+                    type: { type: 'string', const: 'SOLANA_SPL' },
+                    wallet_address: { type: 'string', minLength: 1, maxLength: 128 },
+                  },
+                  required: ['id', 'type', 'wallet_address'],
+                },
+              },
+              minProperties: 1,
+            },
+          },
+        },
+        async (request) => {
+          const account = requireAgentAccount(request)
+          return serializeRecipient(
+            await recipientService.updateRecipient(
+              account.account.id,
+              request.params.recipientId,
+              {
+                ...(request.body.display_name === undefined
+                  ? {}
+                  : { displayName: request.body.display_name }),
+                ...(request.body.type === undefined ? {} : { type: request.body.type }),
+                ...(request.body.destination === undefined
+                  ? {}
+                  : {
+                      destination: {
+                        id: request.body.destination.id,
+                        type: request.body.destination.type,
+                        walletAddress: request.body.destination.wallet_address,
+                      },
+                    }),
+              },
+            ),
+          )
+        },
+      )
+    }
+
+    if (options.paymentService !== undefined) {
+      const { paymentService } = options
+      const paymentSchema = {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            recipient_id: { type: 'string', minLength: 1 },
+            amount: { type: 'string', minLength: 1 },
+            currency: { type: 'string', minLength: 1 },
+            description: { type: 'string', minLength: 1, maxLength: 500 },
+            external_reference: { type: 'string', minLength: 1, maxLength: 255 },
+          },
+          required: ['recipient_id', 'amount', 'currency'],
+        },
+        headers: {
+          type: 'object',
+          properties: {
+            'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+          },
+          required: ['idempotency-key'],
+        },
+      } as const
+
+      app.post<{ Body: PaymentBody }>(
+        '/v1/pay',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: paymentSchema,
+        },
+        async (request, reply) => {
+          const result = await paymentService.createPayment(
+            requireAgentAccount(request),
+            'PAY',
+            toPaymentRequest(request.body),
+            getIdempotencyKey(request),
+          )
+          return reply
+            .code(result.created ? 201 : 200)
+            .send(serializePayment(result.payment))
+        },
+      )
+
+      app.post<{ Body: PaymentBody }>(
+        '/v1/send',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: paymentSchema,
+        },
+        async (request, reply) => {
+          const result = await paymentService.createPayment(
+            requireAgentAccount(request),
+            'SEND',
+            toPaymentRequest(request.body),
+            getIdempotencyKey(request),
+          )
+          return reply
+            .code(result.created ? 201 : 200)
+            .send(serializePayment(result.payment))
+        },
+      )
+
+      app.get<{ Params: { paymentId: string } }>(
+        '/v1/payments/:paymentId',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+        },
+        async (request) => {
+          const account = requireAgentAccount(request)
+          return serializePayment(
+            await paymentService.getPayment(
+              account.account.id,
+              request.params.paymentId,
+            ),
+          )
+        },
+      )
+
+      app.get(
+        '/v1/payments',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+        },
+        async (request) => {
+          const account = requireAgentAccount(request)
+          const payments = await paymentService.listPayments(account.account.id)
+          return { payments: payments.map(serializePayment) }
+        },
+      )
+    }
   }
 
   app.get(
@@ -229,4 +467,40 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
   })
 
   return app
+}
+
+interface PaymentBody {
+  readonly recipient_id: string
+  readonly amount: string
+  readonly currency: string
+  readonly description?: string
+  readonly external_reference?: string
+}
+
+function requireAgentAccount(request: Parameters<typeof authenticateAgent>[0]) {
+  if (request.agentAccount === null) {
+    throw new AuthenticationError()
+  }
+  return request.agentAccount
+}
+
+function getIdempotencyKey(request: Parameters<typeof authenticateAgent>[0]): string {
+  const value = request.headers['idempotency-key']
+  const key = Array.isArray(value) ? value[0] : value
+  if (key === undefined) {
+    throw new ValidationError('Idempotency-Key header is required')
+  }
+  return key
+}
+
+function toPaymentRequest(body: PaymentBody) {
+  return {
+    recipientId: body.recipient_id,
+    amount: body.amount,
+    currency: body.currency,
+    ...(body.description === undefined ? {} : { description: body.description }),
+    ...(body.external_reference === undefined
+      ? {}
+      : { externalReference: body.external_reference }),
+  }
 }

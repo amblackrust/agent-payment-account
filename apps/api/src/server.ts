@@ -7,6 +7,8 @@ import { buildApp } from './app.js'
 import { AccountService } from './accounts.js'
 import { loadConfig, redactConfig } from './config.js'
 import { WalletSecretCipher } from './custody.js'
+import { PaymentService } from './payments.js'
+import { RecipientService } from './recipients.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -22,12 +24,18 @@ async function startServer(): Promise<void> {
     new WalletSecretCipher(config.walletMasterKey),
     rail,
   )
+  const recipientService = new RecipientService(database)
+  // Task 04 will register the real execution rail. No successful fake rail is
+  // registered in production while this execution boundary is still read-only.
+  const paymentService = new PaymentService(database, rail, [])
   const app = buildApp({
     config,
     readinessDependency: database,
     accountRepository: database,
     accountService,
     solanaRail: rail,
+    recipientService,
+    paymentService,
   })
 
   app.addHook('onClose', async () => {

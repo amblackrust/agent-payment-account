@@ -53,8 +53,22 @@ export type {
 } from './ids.js'
 
 export {
+  assertPaymentAttemptStatusTransition,
   assertPaymentStatusTransition,
+  canTransitionPaymentAttemptStatus,
   canTransitionPaymentStatus,
   PaymentStatus,
 } from './payment.js'
-export type { PaymentOperation } from './payment.js'
+export type { PaymentAttemptStatus, PaymentKind, PaymentOperation } from './payment.js'
+
+export { selectPaymentRail } from './router.js'
+export type {
+  PaymentRail,
+  RailExecutionResult,
+  RailExecutionStatus,
+  RailPaymentRequest,
+  RailPreparedPayment,
+  RailRecipientDestination,
+  RailQuote,
+  RailStatusResult,
+} from './rail.js'

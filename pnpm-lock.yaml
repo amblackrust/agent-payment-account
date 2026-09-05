@@ -62,6 +62,9 @@ importers:
 
   packages/db:
     dependencies:
+      '@agent-payment/core':
+        specifier: workspace:*
+        version: link:../core
       '@prisma/adapter-pg':
         specifier: 7.10.0
         version: 7.10.0

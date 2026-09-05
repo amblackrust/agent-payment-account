@@ -1,0 +1,165 @@
+import { randomUUID } from 'node:crypto'
+import { describe, expect, it } from 'vitest'
+
+import {
+  ConflictError,
+  createMoney,
+  ExternalRailError,
+  type PaymentRail,
+} from '@agent-payment/core'
+import { createDatabaseClient, type AuthenticatedAccount } from '@agent-payment/db'
+import { PaymentService } from './payments.js'
+
+const databaseUrl = process.env.DATABASE_URL?.trim()
+
+function id(prefix: string): string {
+  return `${prefix}_${randomUUID().replaceAll('-', '')}`
+}
+
+function railThatConfirms(): PaymentRail {
+  return {
+    name: 'SOLANA_SPL',
+    canRoute: (request) => request.destination.rail === 'SOLANA_SPL',
+    quote: async (request) => ({ rail: 'SOLANA_SPL', amount: request.amount }),
+    prepare: async () => ({ rail: 'SOLANA_SPL', payloadSafe: '{"kind":"prepared"}' }),
+    execute: async () => ({ status: 'CONFIRMED', railTransactionId: 'rail-tx-1' }),
+    getStatus: async () => ({ status: 'CONFIRMED', railTransactionId: 'rail-tx-1' }),
+  }
+}
+
+function railThatFails(): PaymentRail {
+  return {
+    ...railThatConfirms(),
+    quote: async () => {
+      throw new ExternalRailError('quote unavailable')
+    },
+  }
+}
+
+describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
+  'PaymentService with PostgreSQL',
+  () => {
+    it('shares the pay pipeline, canonicalizes idempotent requests and survives a new service instance', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'service recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+      const input = {
+        recipientId: recipient.id,
+        amount: '1.20',
+        currency: 'USD',
+        description: 'dataset access',
+        externalReference: 'order-1',
+      }
+
+      try {
+        const first = await new PaymentService(
+          database,
+          { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+          [railThatConfirms()],
+        ).createPayment(account, 'PAY', input, 'payment-key')
+        const second = await new PaymentService(
+          database,
+          { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+          [railThatConfirms()],
+        ).createPayment(account, 'PAY', { ...input, amount: '1.2' }, 'payment-key')
+
+        expect(first.created).toBe(true)
+        expect(first.payment.status).toBe('CONFIRMED')
+        expect(first.payment.amountAtomic).toBe(120n)
+        expect(second.created).toBe(false)
+        expect(second.payment.id).toBe(first.payment.id)
+
+        await expect(
+          new PaymentService(
+            database,
+            { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+            [railThatConfirms()],
+          ).createPayment(account, 'PAY', { ...input, amount: '1.21' }, 'payment-key'),
+        ).rejects.toThrow(ConflictError)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('releases a reservation when execution fails before submission', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'failure recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+
+      try {
+        const failingService = new PaymentService(
+          database,
+          { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+          [railThatFails()],
+        )
+        await expect(
+          failingService.createPayment(
+            account,
+            'SEND',
+            { recipientId: recipient.id, amount: '10.00', currency: 'USD' },
+            'failed-payment-key',
+          ),
+        ).rejects.toThrow(ExternalRailError)
+
+        const successful = await new PaymentService(
+          database,
+          { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+          [railThatConfirms()],
+        ).createPayment(
+          account,
+          'SEND',
+          { recipientId: recipient.id, amount: '10.00', currency: 'USD' },
+          'retry-after-failure-key',
+        )
+        expect(successful.payment.status).toBe('CONFIRMED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+  },
+)
+
+async function createAccount(
+  database: ReturnType<typeof createDatabaseClient>,
+): Promise<AuthenticatedAccount> {
+  const accountId = id('acct')
+  const credentialId = id('cred')
+  await database.createAgentAccount({
+    id: accountId,
+    name: 'payment-service-agent',
+    solanaPublicKey: `${accountId}_public`,
+    encryptedSolanaSecret: 'ciphertext',
+    encryptionNonce: 'bm9uY2U=',
+    encryptionAuthTag: 'dGFn',
+    credentialId,
+    keyHash: `${accountId}_hash`,
+    keyPrefix: 'apa_integration',
+  })
+  const authenticated = await database.findAccountByCredentialHash(`${accountId}_hash`)
+  if (authenticated === null) {
+    throw new Error('Integration account was not created')
+  }
+  return authenticated
+}

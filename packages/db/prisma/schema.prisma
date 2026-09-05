@@ -12,17 +12,47 @@ enum AgentAccountStatus {
   DISABLED
 }
 
+enum PaymentKind {
+  PAY
+  SEND
+}
+
+enum PaymentStatus {
+  CREATED
+  ROUTING
+  SUBMITTED
+  CONFIRMED
+  FAILED
+}
+
+enum PaymentAttemptStatus {
+  CREATED
+  PREPARED
+  SUBMITTED
+  CONFIRMED
+  FAILED
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+}
+
 model AgentAccount {
-  id                    String            @id @db.VarChar(64)
-  name                  String            @db.VarChar(120)
-  status                AgentAccountStatus @default(ACTIVE)
-  solanaPublicKey       String            @unique @map("solana_public_key") @db.VarChar(64)
-  encryptedSolanaSecret String            @map("encrypted_solana_secret") @db.Text
-  encryptionNonce       String            @map("encryption_nonce") @db.VarChar(32)
-  encryptionAuthTag     String            @map("encryption_auth_tag") @db.VarChar(32)
-  createdAt             DateTime          @default(now()) @map("created_at")
-  updatedAt             DateTime          @updatedAt @map("updated_at")
+  id                    String                @id @db.VarChar(64)
+  name                  String                @db.VarChar(120)
+  status                AgentAccountStatus    @default(ACTIVE)
+  solanaPublicKey       String                @unique @map("solana_public_key") @db.VarChar(64)
+  encryptedSolanaSecret String                @map("encrypted_solana_secret") @db.Text
+  encryptionNonce       String                @map("encryption_nonce") @db.VarChar(32)
+  encryptionAuthTag     String                @map("encryption_auth_tag") @db.VarChar(32)
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
   credentials           ApiCredential[]
+  recipients            Recipient[]
+  outgoingPayments      Payment[]             @relation("PayerPayments")
+  idempotencyRecords    IdempotencyRecord[]
+  outgoingReservations  OutgoingReservation[]
 
   @@map("agent_accounts")
 }
@@ -39,6 +69,112 @@ model ApiCredential {
 
   @@index([accountId])
   @@map("api_credentials")
+}
+
+model Recipient {
+  id             String                 @id @db.VarChar(64)
+  ownerAccountId String                 @map("owner_account_id") @db.VarChar(64)
+  displayName    String                 @map("display_name") @db.VarChar(120)
+  type           String                 @db.VarChar(64)
+  createdAt      DateTime               @default(now()) @map("created_at")
+  updatedAt      DateTime               @updatedAt @map("updated_at")
+  ownerAccount   AgentAccount           @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
+  destinations   RecipientDestination[]
+  payments       Payment[]
+
+  @@index([ownerAccountId])
+  @@map("recipients")
+}
+
+model RecipientDestination {
+  id            String    @id @db.VarChar(64)
+  recipientId   String    @map("recipient_id") @db.VarChar(64)
+  rail          String    @db.VarChar(64)
+  type          String    @db.VarChar(64)
+  walletAddress String    @map("wallet_address") @db.VarChar(128)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  recipient     Recipient @relation(fields: [recipientId], references: [id], onDelete: Restrict)
+
+  @@index([recipientId])
+  @@map("recipient_destinations")
+}
+
+model Payment {
+  id                 String               @id @db.VarChar(64)
+  payerAccountId     String               @map("payer_account_id") @db.VarChar(64)
+  recipientId        String               @map("recipient_id") @db.VarChar(64)
+  kind               PaymentKind
+  amountAtomic       BigInt               @map("amount_atomic")
+  currency           String               @db.VarChar(3)
+  status             PaymentStatus        @default(CREATED)
+  description        String?              @db.Text
+  externalReference  String?              @map("external_reference") @db.VarChar(255)
+  route              String?              @db.VarChar(64)
+  createdAt          DateTime             @default(now()) @map("created_at")
+  updatedAt          DateTime             @updatedAt @map("updated_at")
+  confirmedAt        DateTime?            @map("confirmed_at")
+  failedAt           DateTime?            @map("failed_at")
+  failureCode        String?              @map("failure_code") @db.VarChar(64)
+  failureMessageSafe String?              @map("failure_message_safe") @db.Text
+  payerAccount       AgentAccount         @relation("PayerPayments", fields: [payerAccountId], references: [id], onDelete: Restrict)
+  recipient          Recipient            @relation(fields: [recipientId], references: [id], onDelete: Restrict)
+  attempts           PaymentAttempt[]
+  reservation        OutgoingReservation?
+
+  @@index([payerAccountId, createdAt])
+  @@index([recipientId, createdAt])
+  @@index([payerAccountId, status])
+  @@map("payments")
+}
+
+model PaymentAttempt {
+  id                    String               @id @db.VarChar(64)
+  paymentId             String               @map("payment_id") @db.VarChar(64)
+  attemptNumber         Int                  @map("attempt_number")
+  rail                  String               @db.VarChar(64)
+  status                PaymentAttemptStatus @default(CREATED)
+  railTransactionId     String?              @map("rail_transaction_id") @db.VarChar(255)
+  serializedPayloadSafe String?              @map("serialized_payload_safe") @db.Text
+  createdAt             DateTime             @default(now()) @map("created_at")
+  updatedAt             DateTime             @updatedAt @map("updated_at")
+  payment               Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([paymentId, attemptNumber])
+  @@index([paymentId, createdAt])
+  @@map("payment_attempts")
+}
+
+model IdempotencyRecord {
+  id             String       @id @db.VarChar(64)
+  ownerAccountId String       @map("owner_account_id") @db.VarChar(64)
+  operation      String       @db.VarChar(32)
+  key            String       @db.VarChar(255)
+  requestHash    String       @map("request_hash") @db.Char(64)
+  resourceId     String       @map("resource_id") @db.VarChar(64)
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+  ownerAccount   AgentAccount @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
+
+  @@unique([ownerAccountId, operation, key])
+  @@index([ownerAccountId, createdAt])
+  @@map("idempotency_records")
+}
+
+model OutgoingReservation {
+  id             String            @id @db.VarChar(64)
+  paymentId      String            @unique @map("payment_id") @db.VarChar(64)
+  ownerAccountId String            @map("owner_account_id") @db.VarChar(64)
+  amountAtomic   BigInt            @map("amount_atomic")
+  currency       String            @db.VarChar(3)
+  status         ReservationStatus @default(ACTIVE)
+  createdAt      DateTime          @default(now()) @map("created_at")
+  releasedAt     DateTime?         @map("released_at")
+  payment        Payment           @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  ownerAccount   AgentAccount      @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
+
+  @@index([ownerAccountId, status])
+  @@map("outgoing_reservations")
 }
 
 model RuntimeMetadata {

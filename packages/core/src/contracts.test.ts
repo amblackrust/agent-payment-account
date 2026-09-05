@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   assertPaymentStatusTransition,
+  assertPaymentAttemptStatusTransition,
+  canTransitionPaymentAttemptStatus,
   canTransitionPaymentStatus,
   ConflictError,
   createAccountId,
@@ -25,5 +27,13 @@ describe('domain contracts', () => {
     expect(() =>
       assertPaymentStatusTransition(PaymentStatus.CONFIRMED, PaymentStatus.FAILED),
     ).toThrow(ConflictError)
+  })
+
+  it('does not allow payment attempts to leave terminal states', () => {
+    expect(canTransitionPaymentAttemptStatus('SUBMITTED', 'CONFIRMED')).toBe(true)
+    expect(canTransitionPaymentAttemptStatus('CONFIRMED', 'FAILED')).toBe(false)
+    expect(() => assertPaymentAttemptStatusTransition('FAILED', 'SUBMITTED')).toThrow(
+      ConflictError,
+    )
   })
 })
