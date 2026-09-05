@@ -63,6 +63,9 @@ importers:
         specifier: 4.5.4
         version: 4.5.4
     devDependencies:
+      '@agent-payment/sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk
       '@solana-program/token':
         specifier: 0.16.1
         version: 0.16.1(@solana/kit@8.2.0(typescript@5.9.3))
@@ -103,7 +106,11 @@ importers:
         specifier: 7.10.0
         version: 7.10.0(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3)
 
-  packages/sdk: {}
+  packages/sdk:
+    devDependencies:
+      fastify:
+        specifier: 5.12.3
+        version: 5.12.3
 
   packages/solana-rail:
     dependencies:
