@@ -51,6 +51,12 @@ interface TransactionResponse {
     readonly err: unknown
     readonly preTokenBalances?: readonly TokenBalance[]
     readonly postTokenBalances?: readonly TokenBalance[]
+    readonly innerInstructions?:
+      | readonly {
+          readonly index: number
+          readonly instructions: readonly ParsedInstruction[]
+        }[]
+      | null
   } | null
   readonly transaction: {
     readonly message: {
@@ -145,16 +151,17 @@ export function createSolanaIncomingReader(
         withRpcTimeout,
       )
       const transfers: IncomingTransfer[] = []
+      let blockedByUnclassifiedSignature = false
       for (const item of [...history.signatures].reverse()) {
         if (item.err !== null) {
           continue
         }
         const transaction = await fetchTransaction(rpc, item.signature, withRpcTimeout)
-        if (
-          transaction === null ||
-          transaction.meta === null ||
-          transaction.meta.err !== null
-        ) {
+        if (transaction === null || transaction.meta === null) {
+          blockedByUnclassifiedSignature = true
+          break
+        }
+        if (transaction.meta.err !== null) {
           continue
         }
         const transfer = getExternalIncomingTransfer(
@@ -163,8 +170,21 @@ export function createSolanaIncomingReader(
           destination.tokenAccount,
           settlementMint,
         )
-        if (transfer === undefined || transfer.amount <= 0n) {
+        if (transfer.kind === 'IRRELEVANT') {
           continue
+        }
+        if (transfer.kind === 'UNCLASSIFIED') {
+          blockedByUnclassifiedSignature = true
+          break
+        }
+        if (transaction.blockTime === null) {
+          blockedByUnclassifiedSignature = true
+          break
+        }
+        const confirmedAt = new Date(Number(transaction.blockTime) * 1000)
+        if (Number.isNaN(confirmedAt.getTime())) {
+          blockedByUnclassifiedSignature = true
+          break
         }
         const amount = tokenAmountToUsd(transfer.amount, tokenDecimals)
         if (amount.atomicUnits <= 0n) {
@@ -177,13 +197,15 @@ export function createSolanaIncomingReader(
           reference: getMemo(transaction),
           tokenAccount: destination.tokenAccount,
           settlementMint,
-          confirmedAt:
-            transaction.blockTime === null
-              ? new Date()
-              : new Date(Number(transaction.blockTime) * 1000),
+          confirmedAt,
         })
       }
-      return { transfers, nextCursor: history.nextCursor }
+      return {
+        transfers,
+        nextCursor: blockedByUnclassifiedSignature
+          ? cursorSignature
+          : history.nextCursor,
+      }
     },
   }
 }
@@ -251,7 +273,14 @@ function getExternalIncomingTransfer(
   owner: string,
   tokenAccount: string,
   mint: string,
-): { readonly amount: bigint; readonly sourceAddress: string | undefined } | undefined {
+):
+  | {
+      readonly kind: 'INCOMING'
+      readonly amount: bigint
+      readonly sourceAddress: string
+    }
+  | { readonly kind: 'IRRELEVANT' }
+  | { readonly kind: 'UNCLASSIFIED' } {
   const before = new Map<number, bigint>()
   const preBalances = new Map<number, TokenBalance>()
   for (const balance of transaction.meta?.preTokenBalances ?? []) {
@@ -275,36 +304,89 @@ function getExternalIncomingTransfer(
       destinationDelta += change
     }
   }
-  if (destinationDelta <= 0n) return undefined
+  if (destinationDelta <= 0n) return { kind: 'IRRELEVANT' }
+  const instructions = [
+    ...(transaction.transaction.message.instructions ?? []),
+    ...(transaction.meta?.innerInstructions?.flatMap((group) => group.instructions) ??
+      []),
+  ]
   const externalTransfers: {
     readonly amount: bigint
     readonly sourceAddress: string
   }[] = []
-  for (const instruction of transaction.transaction.message.instructions ?? []) {
+  let selfTransferAmount = 0n
+  let hasUnclassifiedTransfer = false
+  let hasKnownNonTransferMutation = false
+  for (const instruction of instructions) {
     const parsed = getParsedTransfer(instruction)
-    if (parsed === undefined || parsed.destination !== tokenAccount) continue
+    if (parsed === undefined) {
+      hasKnownNonTransferMutation ||= isKnownNonTransferMutation(instruction)
+      continue
+    }
+    if (parsed.destination !== tokenAccount) continue
     const sourceIndex = findAccountIndex(transaction, parsed.source)
-    if (sourceIndex === undefined) continue
+    if (sourceIndex === undefined) {
+      hasUnclassifiedTransfer = true
+      continue
+    }
     const sourceBalance = preBalances.get(sourceIndex)
-    if (sourceBalance?.owner === undefined || sourceBalance.owner === owner) continue
+    if (sourceBalance?.owner === undefined) {
+      hasUnclassifiedTransfer = true
+      continue
+    }
     const sourceAfter =
       getBalance(transaction.meta?.postTokenBalances, sourceIndex) ?? 0n
     const sourceBefore = BigInt(sourceBalance.uiTokenAmount.amount)
-    if (sourceBefore <= sourceAfter || parsed.amount === undefined) continue
-    if (sourceBefore - sourceAfter !== parsed.amount) continue
+    if (
+      sourceBefore <= sourceAfter ||
+      parsed.amount === undefined ||
+      sourceBefore - sourceAfter !== parsed.amount
+    ) {
+      hasUnclassifiedTransfer = true
+      continue
+    }
+    if (sourceBalance.owner === owner) {
+      selfTransferAmount += parsed.amount
+      continue
+    }
     externalTransfers.push({
       amount: parsed.amount,
       sourceAddress: sourceBalance.owner,
     })
+  }
+  if (hasKnownNonTransferMutation && externalTransfers.length === 0) {
+    return { kind: 'IRRELEVANT' }
+  }
+  if (hasUnclassifiedTransfer) {
+    return { kind: 'UNCLASSIFIED' }
   }
   const transferredAmount = externalTransfers.reduce(
     (total, transfer) => total + transfer.amount,
     0n,
   )
   const firstTransfer = externalTransfers[0]
-  return firstTransfer === undefined || transferredAmount !== destinationDelta
-    ? undefined
-    : { amount: transferredAmount, sourceAddress: firstTransfer.sourceAddress }
+  if (firstTransfer !== undefined && transferredAmount === destinationDelta) {
+    return {
+      kind: 'INCOMING',
+      amount: transferredAmount,
+      sourceAddress: firstTransfer.sourceAddress,
+    }
+  }
+  return selfTransferAmount === destinationDelta
+    ? { kind: 'IRRELEVANT' }
+    : { kind: 'UNCLASSIFIED' }
+}
+
+function isKnownNonTransferMutation(instruction: ParsedInstruction): boolean {
+  if (
+    instruction.program !== 'spl-token' ||
+    instruction.parsed === null ||
+    typeof instruction.parsed !== 'object'
+  ) {
+    return false
+  }
+  const parsed = instruction.parsed as { readonly type?: unknown }
+  return parsed.type === 'mintTo' || parsed.type === 'mintToChecked'
 }
 
 function getParsedTransfer(instruction: ParsedInstruction):

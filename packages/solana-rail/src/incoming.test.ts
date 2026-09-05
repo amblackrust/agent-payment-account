@@ -9,12 +9,15 @@ const tokenAccount = 'So11111111111111111111111111111111111111112'
 const sourceToken = 'SysvarRent111111111111111111111111111111111'
 const mint = '11111111111111111111111111111111'
 
-function createReader(transaction: unknown) {
+function createReader(transaction: unknown | (() => unknown)) {
   const rpc = {
     getSignaturesForAddress: () => ({
       send: async () => [{ signature: 'sig-1', err: null, blockTime: 1_700_000_000 }],
     }),
-    getTransaction: () => ({ send: async () => transaction }),
+    getTransaction: () => ({
+      send: async () =>
+        typeof transaction === 'function' ? transaction() : transaction,
+    }),
   } as unknown as SolanaRpc
   const rail: SolanaRail = {
     getReceiveDestination: async () => ({ owner, tokenAccount, settlementMint: mint }),
@@ -93,9 +96,69 @@ describe('Solana incoming transfer reader', () => {
     ])
   })
 
+  it('does not advance the cursor past an unavailable transaction, then retries it after restart', async () => {
+    let available = false
+    const reader = createReader(() =>
+      available
+        ? {
+            blockTime: 1_700_000_000,
+            meta: {
+              err: null,
+              preTokenBalances: [
+                {
+                  accountIndex: 2,
+                  mint,
+                  owner: sourceToken,
+                  uiTokenAmount: { amount: '5000000' },
+                },
+                { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } },
+              ],
+              postTokenBalances: [
+                {
+                  accountIndex: 2,
+                  mint,
+                  owner: sourceToken,
+                  uiTokenAmount: { amount: '3000000' },
+                },
+                { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '2000000' } },
+              ],
+            },
+            transaction: {
+              message: {
+                accountKeys: [owner, tokenAccount, sourceToken],
+                instructions: [
+                  {
+                    program: 'spl-token',
+                    parsed: {
+                      type: 'transfer',
+                      info: {
+                        source: sourceToken,
+                        destination: tokenAccount,
+                        amount: '2000000',
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+          }
+        : null,
+    )
+
+    const first = await reader.scanWithCursor!(owner)
+    expect(first.transfers).toEqual([])
+    expect(first.nextCursor).toBeNull()
+
+    available = true
+    const second = await reader.scanWithCursor!(owner)
+    expect(second.transfers).toHaveLength(1)
+    expect(second.transfers[0]?.signature).toBe('sig-1')
+    expect(second.nextCursor).toBe('sig-1')
+  })
+
   it('ignores wrong mint, failed and non-incoming transactions', async () => {
     const reader = createReader({
-      blockTime: null,
+      blockTime: 1_700_000_000,
       meta: {
         err: null,
         preTokenBalances: [
@@ -120,6 +183,81 @@ describe('Solana incoming transfer reader', () => {
     await expect(reader.scan(owner)).resolves.toEqual([])
   })
 
+  it('recognizes an external SPL transfer in an inner instruction', async () => {
+    const reader = createReader({
+      blockTime: 1_700_000_000,
+      meta: {
+        err: null,
+        preTokenBalances: [
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '5000000' },
+          },
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } },
+        ],
+        postTokenBalances: [
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '3000000' },
+          },
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '2000000' } },
+        ],
+        innerInstructions: [
+          {
+            index: 0,
+            instructions: [
+              {
+                program: 'spl-token',
+                parsed: {
+                  type: 'transferChecked',
+                  info: {
+                    source: sourceToken,
+                    destination: tokenAccount,
+                    tokenAmount: { amount: '2000000' },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      },
+      transaction: { message: { accountKeys: [owner, tokenAccount, sourceToken] } },
+    })
+
+    await expect(reader.scan(owner)).resolves.toEqual([
+      expect.objectContaining({
+        signature: 'sig-1',
+        sourceAddress: sourceToken,
+        amount: expect.objectContaining({ atomicUnits: 200n }),
+      }),
+    ])
+  })
+
+  it('does not checkpoint a positive balance change without proven transfer semantics', async () => {
+    const reader = createReader({
+      blockTime: 1_700_000_000,
+      meta: {
+        err: null,
+        preTokenBalances: [
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } },
+        ],
+        postTokenBalances: [
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '2000000' } },
+        ],
+      },
+      transaction: { message: { accountKeys: [owner, tokenAccount] } },
+    })
+
+    const result = await reader.scanWithCursor!(owner)
+
+    expect(result.transfers).toEqual([])
+    expect(result.nextCursor).toBeNull()
+  })
+
   it('paginates beyond 1000 signatures and returns a high-water checkpoint', async () => {
     const firstPage = Array.from({ length: 1000 }, (_, index) => ({
       signature: `sig-${index}`,
@@ -130,7 +268,7 @@ describe('Solana incoming transfer reader', () => {
       { signature: 'incoming-after-backlog', err: null, blockTime: null },
     ]
     const validTransaction = {
-      blockTime: null,
+      blockTime: 1_700_000_000,
       meta: {
         err: null,
         preTokenBalances: [
@@ -171,6 +309,11 @@ describe('Solana incoming transfer reader', () => {
         },
       },
     }
+    const irrelevantTransaction = {
+      blockTime: null,
+      meta: { err: null, preTokenBalances: [], postTokenBalances: [] },
+      transaction: { message: { accountKeys: [] } },
+    }
     let pageCalls = 0
     const rpc = {
       getSignaturesForAddress: (_account: Address, config: { before?: string }) => ({
@@ -181,7 +324,9 @@ describe('Solana incoming transfer reader', () => {
       }),
       getTransaction: (signature: string) => ({
         send: async () =>
-          signature === 'incoming-after-backlog' ? validTransaction : null,
+          signature === 'incoming-after-backlog'
+            ? validTransaction
+            : irrelevantTransaction,
       }),
     } as unknown as SolanaRpc
     const rail: SolanaRail = {
@@ -227,6 +372,11 @@ describe('Solana incoming transfer reader', () => {
       { signature: 'older', err: null, blockTime: null },
     ]
     let pageCalls = 0
+    const irrelevantTransaction = {
+      blockTime: null,
+      meta: { err: null, preTokenBalances: [], postTokenBalances: [] },
+      transaction: { message: { accountKeys: [] } },
+    }
     const rpc = {
       getSignaturesForAddress: (_account: Address, config: { before?: string }) => ({
         send: async () => {
@@ -234,7 +384,7 @@ describe('Solana incoming transfer reader', () => {
           return config.before === undefined ? firstPage : secondPage
         },
       }),
-      getTransaction: () => ({ send: async () => null }),
+      getTransaction: () => ({ send: async () => irrelevantTransaction }),
     } as unknown as SolanaRpc
     const rail: SolanaRail = {
       getReceiveDestination: async () => ({

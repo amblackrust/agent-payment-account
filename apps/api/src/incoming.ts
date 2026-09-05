@@ -48,7 +48,6 @@ export class IncomingReconciliationService {
   }
 
   private async reconcileAccount(account: IndexedAccount): Promise<void> {
-    await this.repository.expireOpenReceiveRequests(account.accountId, new Date())
     const cursor = await this.repository.getIncomingCursor(
       account.accountId,
       'SOLANA_SPL',
@@ -86,6 +85,7 @@ export class IncomingReconciliationService {
           confirmedAt: transfer.confirmedAt,
         })
       }
+      await this.repository.expireOpenReceiveRequests(account.accountId, new Date())
       if (scan.nextCursor !== null && scan.nextCursor !== cursor?.cursorSignature) {
         await this.repository.saveIncomingCursor({
           accountId: account.accountId,

@@ -43,7 +43,7 @@ function createHarness() {
     },
   }
   return {
-    repository: repository as never,
+    repository,
     state: {
       get cursor() {
         return cursor
@@ -72,9 +72,13 @@ describe('incoming reconciliation worker', () => {
       }),
     }
     const errors: object[] = []
-    const service = new IncomingReconciliationService(harness.repository, reader, {
-      error: (data) => errors.push(data),
-    })
+    const service = new IncomingReconciliationService(
+      harness.repository as never,
+      reader,
+      {
+        error: (data) => errors.push(data),
+      },
+    )
     harness.state.failCreate = true
     await service.runOnce()
     expect(harness.state.cursor).toBeNull()
@@ -83,7 +87,7 @@ describe('incoming reconciliation worker', () => {
 
     harness.state.failCreate = false
     const restartedService = new IncomingReconciliationService(
-      harness.repository,
+      harness.repository as never,
       reader,
       { error: () => undefined },
     )
@@ -107,13 +111,47 @@ describe('incoming reconciliation worker', () => {
         return { transfers: [], nextCursor: 'signature-1' }
       },
     }
-    const service = new IncomingReconciliationService(harness.repository, reader, {
-      error: () => undefined,
-    })
+    const service = new IncomingReconciliationService(
+      harness.repository as never,
+      reader,
+      {
+        error: () => undefined,
+      },
+    )
     const first = service.runOnce()
     const second = service.runOnce()
     releaseScan()
     await Promise.all([first, second])
     expect(scans).toBe(1)
+  })
+
+  it('processes confirmed transfers before wall-clock expiry cleanup', async () => {
+    const harness = createHarness()
+    const events: string[] = []
+    const repository = {
+      ...harness.repository,
+      createIncomingPayment: async () => {
+        events.push('incoming')
+        return { payment: {} as never, created: true }
+      },
+      expireOpenReceiveRequests: async () => {
+        events.push('expire')
+      },
+    }
+    const service = new IncomingReconciliationService(
+      repository as never,
+      {
+        scan: async () => [],
+        scanWithCursor: async () => ({
+          transfers: [transfer],
+          nextCursor: 'signature-1',
+        }),
+      },
+      { error: () => undefined },
+    )
+
+    await service.runOnce()
+
+    expect(events).toEqual(['incoming', 'expire'])
   })
 })

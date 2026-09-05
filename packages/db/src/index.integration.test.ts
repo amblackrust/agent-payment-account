@@ -247,6 +247,87 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('matches by chain confirmation time even when reconciliation runs later', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
+      const confirmedAt = new Date('2026-01-01T00:00:00.000Z')
+      const expiresAt = new Date('2026-01-01T00:00:01.000Z')
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'receive-confirmation-time-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.createReceiveRequest({
+          id: receiveId,
+          accountId,
+          amountAtomic: 100n,
+          currency: 'USD',
+          reference: 'confirmed-before-expiry',
+          expiresAt,
+        })
+
+        const incoming = await database.createIncomingPayment({
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          accountId,
+          signature: `confirmed-before-expiry-${randomUUID()}`,
+          amountAtomic: 100n,
+          currency: 'USD',
+          sourceAddress: 'external-wallet',
+          reference: 'confirmed-before-expiry',
+          tokenAccount: 'destination-token-account',
+          settlementMint: 'settlement-mint',
+          confirmedAt,
+        })
+
+        expect(incoming.payment.receiveRequestId).toBe(receiveId)
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
+        ).toBe('PAID')
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.paidAt,
+        ).toEqual(confirmedAt)
+
+        const exactBoundaryReceiveId = `recv_${randomUUID().replaceAll('-', '')}`
+        await database.createReceiveRequest({
+          id: exactBoundaryReceiveId,
+          accountId,
+          amountAtomic: 100n,
+          currency: 'USD',
+          reference: 'confirmed-at-expiry',
+          expiresAt: confirmedAt,
+        })
+        const exactBoundaryIncoming = await database.createIncomingPayment({
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          accountId,
+          signature: `confirmed-at-expiry-${randomUUID()}`,
+          amountAtomic: 100n,
+          currency: 'USD',
+          sourceAddress: 'external-wallet',
+          reference: 'confirmed-at-expiry',
+          tokenAccount: 'destination-token-account',
+          settlementMint: 'settlement-mint',
+          confirmedAt,
+        })
+        expect(exactBoundaryIncoming.payment.receiveRequestId).toBeNull()
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, exactBoundaryReceiveId))
+            ?.status,
+        ).toBe('EXPIRED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
     it('expires receive requests and keeps late or unmatched incoming payments in history', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`

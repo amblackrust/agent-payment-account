@@ -261,6 +261,7 @@ export interface ReceiveRepository {
     readonly accountId: string
     readonly amountAtomic: bigint
     readonly reference: string | null
+    readonly confirmedAt: Date
   }): Promise<string | null>
   expireOpenReceiveRequests(accountId: string, now: Date): Promise<void>
 }
@@ -1312,7 +1313,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           where: {
             accountId: input.accountId,
             status: 'OPEN',
-            expiresAt: { lte: new Date() },
+            expiresAt: { lte: input.confirmedAt },
           },
           data: { status: 'EXPIRED' },
         })
@@ -1321,7 +1322,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             accountId: input.accountId,
             reference: input.reference,
             status: 'OPEN',
-            AND: [{ OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] }],
+            AND: [
+              { OR: [{ expiresAt: null }, { expiresAt: { gt: input.confirmedAt } }] },
+            ],
             OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
           },
           orderBy: { createdAt: 'asc' },
@@ -1333,7 +1336,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           where: { id: request.id, status: 'OPEN' },
           data: {
             status: 'PAID',
-            paidAt: new Date(),
+            paidAt: input.confirmedAt,
             matchedIncomingPaymentId: input.incomingPaymentId,
           },
         })
@@ -1415,7 +1418,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
                   reference: input.reference,
                   status: 'OPEN',
                   AND: [
-                    { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+                    {
+                      OR: [
+                        { expiresAt: null },
+                        { expiresAt: { gt: input.confirmedAt } },
+                      ],
+                    },
                   ],
                   OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
                 },
