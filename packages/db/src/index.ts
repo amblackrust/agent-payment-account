@@ -420,6 +420,7 @@ export interface PaymentRepository {
     paymentId: string,
   ): Promise<PaymentRecord | null>
   listPayments(ownerAccountId: string): Promise<readonly PaymentRecord[]>
+  listRecoverablePayments(limit: number): Promise<readonly PaymentRecord[]>
   findPaymentForRefund(
     accountId: string,
     paymentId: string,
@@ -1251,6 +1252,16 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       const payments = await prisma.payment.findMany({
         where: { payerAccountId: ownerAccountId },
         orderBy: { createdAt: 'desc' },
+      })
+      return payments.map(toPaymentRecord)
+    },
+    async listRecoverablePayments(limit): Promise<readonly PaymentRecord[]> {
+      const payments = await prisma.payment.findMany({
+        where: {
+          status: { in: ['CREATED', 'ROUTING', 'SUBMITTED', 'RECONCILING'] },
+        },
+        orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+        take: limit,
       })
       return payments.map(toPaymentRecord)
     },

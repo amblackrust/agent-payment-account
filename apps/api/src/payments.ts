@@ -50,17 +50,30 @@ export interface PaymentResult {
   readonly created: boolean
 }
 
+export interface PaymentEventSink {
+  info(data: Readonly<Record<string, unknown>>, message: string): void
+}
+
 export type PayerSecretKeyProvider = (accountId: string) => Promise<Uint8Array>
 
 type PaymentStore = PaymentRepository & RecipientRepository & ReservationRepository
 
 export class PaymentService {
+  private eventSink: PaymentEventSink | undefined
+
   public constructor(
     private readonly repository: PaymentStore,
     private readonly balanceReader: SettledBalanceReader,
     private readonly rails: readonly PaymentRail[],
     private readonly payerSecretKeyProvider?: PayerSecretKeyProvider,
-  ) {}
+    eventSink?: PaymentEventSink,
+  ) {
+    this.eventSink = eventSink
+  }
+
+  public setEventSink(eventSink: PaymentEventSink): void {
+    this.eventSink = eventSink
+  }
 
   public async createPayment(
     account: AuthenticatedAccount,
@@ -258,14 +271,22 @@ export class PaymentService {
     if (payment === null) {
       throw new ResourceNotFoundError('Payment not found')
     }
-    return this.recoverPayment(payment)
+    return this.recoverPersistedPayment(payment)
+  }
+
+  public async recoverPersistedPaymentById(
+    accountId: string,
+    paymentId: string,
+  ): Promise<PaymentRecord | null> {
+    const payment = await this.repository.findPaymentForOwner(accountId, paymentId)
+    return payment === null ? null : this.recoverPersistedPayment(payment)
   }
 
   public listPayments(accountId: string): Promise<readonly PaymentRecord[]> {
     return this.repository.listPayments(accountId)
   }
 
-  private async recoverPayment(payment: PaymentRecord): Promise<PaymentRecord> {
+  public async recoverPersistedPayment(payment: PaymentRecord): Promise<PaymentRecord> {
     if (payment.status === 'CONFIRMED' || payment.status === 'FAILED') {
       return payment
     }
@@ -287,6 +308,7 @@ export class PaymentService {
         'CREATED',
         'ROUTING',
       )
+      this.logTransition(payment, 'CREATED', 'ROUTING')
     }
 
     const context = this.createPreparationContext(payment)
@@ -692,7 +714,7 @@ export class PaymentService {
     execution: RailExecutionResult,
   ): Promise<PaymentRecord> {
     if (execution.status === 'CONFIRMED') {
-      return this.repository.finalizeConfirmedPayment({
+      const finalized = await this.repository.finalizeConfirmedPayment({
         paymentId: payment.id,
         expectedPaymentStatus: payment.status,
         attemptId: attempt.id,
@@ -704,9 +726,16 @@ export class PaymentService {
           ? {}
           : { confirmationMetadata: execution.confirmationMetadata }),
       })
+      this.logTransition(
+        payment,
+        payment.status,
+        'CONFIRMED',
+        execution.railTransactionId,
+      )
+      return finalized
     }
     if (execution.status === 'FAILED') {
-      return this.repository.finalizeFailedPayment({
+      const failed = await this.repository.finalizeFailedPayment({
         paymentId: payment.id,
         expectedPaymentStatus: payment.status,
         attemptId: attempt.id,
@@ -715,12 +744,20 @@ export class PaymentService {
         failureMessageSafe:
           execution.failureMessageSafe ?? 'Payment rail execution failed',
       })
+      this.logTransition(
+        payment,
+        payment.status,
+        'FAILED',
+        undefined,
+        execution.failureCode ?? 'EXTERNAL_RAIL_FAILURE',
+      )
+      return failed
     }
     if (execution.status === 'SUBMITTED') {
       if (payment.status === 'SUBMITTED' && attempt.status === 'SUBMITTED') {
         return payment
       }
-      return this.repository.markPaymentSubmitted({
+      const submitted = await this.repository.markPaymentSubmitted({
         paymentId: payment.id,
         attemptId: attempt.id,
         expectedPaymentStatus: payment.status,
@@ -729,16 +766,47 @@ export class PaymentService {
           ? {}
           : { railTransactionId: execution.railTransactionId }),
       })
+      this.logTransition(
+        payment,
+        payment.status,
+        'SUBMITTED',
+        execution.railTransactionId,
+      )
+      return submitted
     }
     if (payment.status === 'RECONCILING' && attempt.status === 'RECONCILING') {
       return payment
     }
-    return this.repository.markPaymentReconciling({
+    const reconciling = await this.repository.markPaymentReconciling({
       paymentId: payment.id,
       attemptId: attempt.id,
       expectedPaymentStatus: payment.status,
       expectedAttemptStatus: attempt.status,
     })
+    this.logTransition(payment, payment.status, 'RECONCILING')
+    return reconciling
+  }
+
+  private logTransition(
+    payment: PaymentRecord,
+    fromState: string,
+    toState: string,
+    railTransactionId?: string,
+    errorCode?: string,
+  ): void {
+    this.eventSink?.info(
+      {
+        paymentId: payment.id,
+        accountId: payment.payerAccountId,
+        operation: payment.kind,
+        fromState,
+        toState,
+        rail: payment.route,
+        ...(railTransactionId === undefined ? {} : { railTransactionId }),
+        ...(errorCode === undefined ? {} : { errorCode }),
+      },
+      'Payment lifecycle transition',
+    )
   }
 
   private async tryMarkReconciling(

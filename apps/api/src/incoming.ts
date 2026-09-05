@@ -10,7 +10,8 @@ interface IndexedAccount {
 type IncomingStore = IncomingPaymentRepository & ReceiveRepository
 
 export class IncomingReconciliationService {
-  private isRunning = false
+  private stopped = false
+  private currentRun: Promise<void> | undefined
 
   public constructor(
     private readonly repository: IncomingStore,
@@ -19,16 +20,30 @@ export class IncomingReconciliationService {
   ) {}
 
   public async runOnce(): Promise<void> {
-    if (this.isRunning) return
-    this.isRunning = true
-    try {
-      const accounts: readonly IndexedAccount[] =
-        await this.repository.listActiveAccountSettlements()
-      for (const account of accounts) {
-        await this.reconcileAccount(account)
-      }
-    } finally {
-      this.isRunning = false
+    if (this.stopped) return
+    if (this.currentRun !== undefined) return this.currentRun
+    const run = this.reconcileAllAccounts()
+    let trackedRun: Promise<void>
+    trackedRun = run.finally(() => {
+      if (this.currentRun === trackedRun) this.currentRun = undefined
+    })
+    this.currentRun = trackedRun
+    return trackedRun
+  }
+
+  public stop(): void {
+    this.stopped = true
+  }
+
+  public async drain(): Promise<void> {
+    await this.currentRun
+  }
+
+  private async reconcileAllAccounts(): Promise<void> {
+    const accounts: readonly IndexedAccount[] =
+      await this.repository.listActiveAccountSettlements()
+    for (const account of accounts) {
+      await this.reconcileAccount(account)
     }
   }
 

@@ -17,6 +17,7 @@ import { PaymentService } from './payments.js'
 import { RecipientService } from './recipients.js'
 import { ReceiveService } from './receives.js'
 import { IncomingReconciliationService } from './incoming.js'
+import { OutgoingPaymentReconciliationService } from './outgoing.js'
 import { TransactionService } from './transactions.js'
 
 async function startServer(): Promise<void> {
@@ -78,21 +79,45 @@ async function startServer(): Promise<void> {
     receiveService,
     transactionService,
   })
+  paymentService.setEventSink({
+    info: (data, message) => app.log.info(data, message),
+  })
   const incomingReconciliation = new IncomingReconciliationService(
     database,
     incomingReader,
     { error: (data, message) => app.log.error(data, message) },
   )
+  const outgoingReconciliation = new OutgoingPaymentReconciliationService(
+    database,
+    paymentService,
+    { info: (data, message) => app.log.info(data, message) },
+  )
 
-  const reconciliationTimer = setInterval(() => {
+  const runWorkers = (): void => {
     void incomingReconciliation.runOnce().catch((error: unknown) => {
       app.log.error(
         { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
         'Incoming reconciliation loop failed',
       )
     })
-  }, 5_000)
-  app.addHook('onClose', async () => clearInterval(reconciliationTimer))
+    void outgoingReconciliation.runOnce().catch((error: unknown) => {
+      app.log.error(
+        { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
+        'Outgoing reconciliation loop failed',
+      )
+    })
+  }
+  runWorkers()
+  const reconciliationTimer = setInterval(runWorkers, 5_000)
+  app.addHook('onClose', async () => {
+    clearInterval(reconciliationTimer)
+    incomingReconciliation.stop()
+    outgoingReconciliation.stop()
+    await Promise.all([
+      incomingReconciliation.drain(),
+      outgoingReconciliation.drain(),
+    ])
+  })
 
   app.addHook('onClose', async () => {
     await database.disconnect()
