@@ -15,7 +15,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:solana": "vitest run packages/solana-rail/src/surfpool.integration.test.ts",
+    "test:solana": "vitest run packages/solana-rail/src/surfpool.integration.test.ts apps/api/src/payments.solana.integration.test.ts",
     "test:watch": "vitest",
     "typecheck": "pnpm --recursive --if-present typecheck",
     "db:generate": "pnpm --filter @agent-payment/db generate",
