@@ -39,6 +39,19 @@ function railThatFails(): PaymentRail {
   }
 }
 
+function railThatDeterministicallyRejects(): PaymentRail {
+  return {
+    ...railThatConfirms(),
+    execute: async () => {
+      throw new ExternalRailError(
+        'transaction rejected during preflight',
+        undefined,
+        'DETERMINISTIC',
+      )
+    },
+  }
+}
+
 function railThatHasAmbiguousExecution(): PaymentRail {
   return {
     ...railThatConfirms(),
@@ -206,6 +219,51 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           'retry-after-failure-key',
         )
         expect(successful.payment.status).toBe('CONFIRMED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('finalizes deterministic execution rejection as failed and releases its reservation', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'preflight rejection recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+
+      try {
+        await expect(
+          new PaymentService(
+            database,
+            { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+            [railThatDeterministicallyRejects()],
+          ).createPayment(
+            account,
+            'SEND',
+            { recipientId: recipient.id, amount: '2.00', currency: 'USD' },
+            'preflight-rejection-key',
+          ),
+        ).rejects.toMatchObject({
+          code: 'EXTERNAL_RAIL_FAILURE',
+          kind: 'DETERMINISTIC',
+        })
+
+        const payment = (await database.listPayments(account.account.id))[0]
+        const attempts = await database.listPaymentAttempts(payment?.id ?? '')
+        expect(payment?.status).toBe('FAILED')
+        expect(attempts[0]?.status).toBe('FAILED')
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(0n)
       } finally {
         await database.disconnect()
       }
