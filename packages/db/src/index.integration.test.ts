@@ -182,5 +182,56 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await database.disconnect()
       }
     })
+
+    it('matches receive references atomically and deduplicates a signature per account', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
+      const incomingId = `in_${randomUUID().replaceAll('-', '')}`
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'receive-integration-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        const request = await database.createReceiveRequest({
+          id: receiveId,
+          accountId,
+          amountAtomic: 1250n,
+          currency: 'USD',
+          reference: 'invoice-42',
+        })
+        const first = await database.createIncomingPayment({
+          id: incomingId,
+          accountId,
+          signature: 'chain-signature-42',
+          amountAtomic: 1250n,
+          currency: 'USD',
+          sourceAddress: 'source-wallet',
+          reference: request.reference,
+          tokenAccount: 'destination-token-account',
+          settlementMint: 'settlement-mint',
+          confirmedAt: new Date(),
+        })
+        const duplicate = await database.createIncomingPayment({
+          ...first.payment,
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          confirmedAt: new Date(),
+        })
+        expect(first.created).toBe(true)
+        expect(duplicate.created).toBe(false)
+        expect((await database.findReceiveRequestForOwner(accountId, receiveId))?.status).toBe('PAID')
+        expect((await database.listIncomingPayments(accountId))).toHaveLength(1)
+      } finally {
+        await database.disconnect()
+      }
+    })
   },
 )

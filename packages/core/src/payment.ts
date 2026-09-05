@@ -12,7 +12,7 @@ export const PaymentStatus = {
 export type PaymentStatus = (typeof PaymentStatus)[keyof typeof PaymentStatus]
 
 export type PaymentOperation = 'PAY' | 'SEND' | 'RECEIVE' | 'REFUND'
-export type PaymentKind = Extract<PaymentOperation, 'PAY' | 'SEND'>
+export type PaymentKind = Extract<PaymentOperation, 'PAY' | 'SEND' | 'REFUND'>
 
 export type PaymentAttemptStatus =
   'CREATED' | 'PREPARED' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'

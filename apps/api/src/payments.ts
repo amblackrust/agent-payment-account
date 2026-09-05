@@ -11,6 +11,7 @@ import {
   moneyFromAtomicUnits,
   selectPaymentRail,
   RecipientResolutionError,
+  RefundNotSupportedError,
   UnsupportedRailError,
   ValidationError,
   type Money,
@@ -127,6 +128,9 @@ export class PaymentService {
       destinationRail: routed.request.destination.rail,
       destinationType: routed.request.destination.type,
       destinationReference: routed.request.destination.reference,
+      ...(recipient.managedAccountId === null
+        ? {}
+        : { recipientManagedAccountId: recipient.managedAccountId }),
       settledAtomic: balance.settled.atomicUnits,
     })
     if (!persisted.created) {
@@ -137,6 +141,92 @@ export class PaymentService {
       persisted.payment,
       routed.rail,
       routed.request,
+      account.account.solanaPublicKey,
+    )
+  }
+
+  public async createRefund(
+    account: AuthenticatedAccount,
+    input: { readonly originalPaymentId: string; readonly amount: string; readonly currency: string },
+    idempotencyKey: string,
+  ): Promise<PaymentResult> {
+    const money = createPositiveMoney(input.amount, input.currency)
+    const normalizedKey = normalizeIdempotencyKey(idempotencyKey)
+    const requestHash = hashCanonicalRequest({
+      operation: 'REFUND',
+      original_payment_id: input.originalPaymentId,
+      amount: formatMoney(money),
+      currency: money.currency,
+    })
+    const replay = await this.repository.findIdempotencyReplay(
+      account.account.id,
+      'REFUND',
+      normalizedKey,
+    )
+    if (replay !== null) {
+      if (replay.requestHash !== requestHash) {
+        throw new ConflictError('Idempotency key was already used for another request')
+      }
+      return { payment: replay.payment, created: false }
+    }
+    const original = await this.repository.findPaymentForRefund(
+      account.account.id,
+      input.originalPaymentId,
+    )
+    if (original === null || original.payerPublicKey === null) {
+      throw new RefundNotSupportedError()
+    }
+    if (original.status !== 'CONFIRMED' || original.recipientManagedAccountId !== account.account.id) {
+      throw new RefundNotSupportedError('This account does not control the original recipient')
+    }
+    if (original.destinationRail === null || original.destinationType === null) {
+      throw new RefundNotSupportedError()
+    }
+    const request: RailPaymentRequest = {
+      operation: 'REFUND',
+      currency: money.currency,
+      amount: money,
+      payerAccountId: account.account.id,
+      recipientId: original.recipientId,
+      destination: {
+        rail: original.destinationRail,
+        type: original.destinationType,
+        reference: original.payerPublicKey,
+      },
+      externalReference: `refund:${original.id}`,
+    }
+    const rail = selectPaymentRail(request, this.rails)
+    rail.validateDestination?.(request)
+    const balance = await this.balanceReader.getSettlementBalance(account.account.solanaPublicKey)
+    const persisted = await this.repository.createRefundWithReservation({
+      paymentId: createPaymentId(),
+      reservationId: createPrefixedId('resv'),
+      idempotencyId: createPrefixedId('idem'),
+      ownerAccountId: account.account.id,
+      operation: 'REFUND',
+      idempotencyKey: normalizedKey,
+      requestHash,
+      payerAccountId: account.account.id,
+      payerPublicKey: account.account.solanaPublicKey,
+      recipientId: original.recipientId,
+      amountAtomic: money.atomicUnits,
+      currency: money.currency,
+      route: rail.name,
+      destinationRail: request.destination.rail,
+      destinationType: request.destination.type,
+      destinationReference: request.destination.reference,
+      recipientManagedAccountId: original.payerAccountId,
+      originalPaymentId: original.id,
+      refundInitiatorAccountId: account.account.id,
+      settledAtomic: balance.settled.atomicUnits,
+    })
+    if (!persisted.created) {
+      return persisted
+    }
+    return this.executePayment(
+      persisted.payment,
+      rail,
+      request,
       account.account.solanaPublicKey,
     )
   }
@@ -681,6 +771,7 @@ export function serializePayment(payment: PaymentRecord) {
     failed_at: payment.failedAt?.toISOString() ?? null,
     failure_code: payment.failureCode,
     failure_message: payment.failureMessageSafe,
+    original_payment_id: payment.originalPaymentId,
   }
 }
 

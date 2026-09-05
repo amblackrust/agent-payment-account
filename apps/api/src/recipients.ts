@@ -15,6 +15,7 @@ export interface CreateRecipientRequest {
     readonly type: string
     readonly walletAddress: string
   }
+  readonly managedAccountId?: string
 }
 
 export interface UpdateRecipientRequest {
@@ -25,6 +26,7 @@ export interface UpdateRecipientRequest {
     readonly type: string
     readonly walletAddress: string
   }
+  readonly managedAccountId?: string | null
 }
 
 export class RecipientService {
@@ -56,6 +58,9 @@ export class RecipientService {
       ownerAccountId,
       displayName,
       type,
+      ...(input.managedAccountId === undefined
+        ? {}
+        : { managedAccountId: validateText(input.managedAccountId, 'Managed account id', 64) }),
       destination,
     }
     return this.repository.createRecipient(createInput)
@@ -90,6 +95,14 @@ export class RecipientService {
                 128,
               ),
             },
+        }),
+      ...(input.managedAccountId === undefined
+        ? {}
+        : {
+            managedAccountId:
+              input.managedAccountId === null
+                ? null
+                : validateText(input.managedAccountId, 'Managed account id', 64),
           }),
     }
     if (
@@ -129,6 +142,7 @@ export function serializeRecipient(recipient: RecipientRecord) {
     id: recipient.id,
     display_name: recipient.displayName,
     type: recipient.type,
+    managed_account_id: recipient.managedAccountId,
     destinations: recipient.destinations.map((destination) => ({
       id: destination.id,
       rail: destination.rail,

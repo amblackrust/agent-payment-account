@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { PrismaPg } from '@prisma/adapter-pg'
 import {
   assertPaymentAttemptStatusTransition,
@@ -81,6 +82,7 @@ export interface RecipientRecord {
   readonly ownerAccountId: string
   readonly displayName: string
   readonly type: string
+  readonly managedAccountId: string | null
   readonly ownerStatus: AgentAccountStatus
   readonly destinations: readonly RecipientDestinationRecord[]
   readonly createdAt: Date
@@ -92,6 +94,7 @@ export interface CreateRecipientInput {
   readonly ownerAccountId: string
   readonly displayName: string
   readonly type: string
+  readonly managedAccountId?: string
   readonly destination: {
     readonly id: string
     readonly rail: string
@@ -105,6 +108,7 @@ export interface UpdateRecipientInput {
   readonly ownerAccountId: string
   readonly displayName?: string
   readonly type?: string
+  readonly managedAccountId?: string | null
   readonly destination?: {
     readonly id: string
     readonly rail: string
@@ -140,7 +144,7 @@ export interface ReservationRepository {
   ): Promise<bigint>
 }
 
-export type PaymentKind = 'PAY' | 'SEND'
+export type PaymentKind = 'PAY' | 'SEND' | 'REFUND'
 export type PaymentStatus =
   'CREATED' | 'ROUTING' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
 export type PaymentAttemptStatus =
@@ -168,6 +172,95 @@ export interface PaymentRecord {
   readonly destinationRail: string | null
   readonly destinationType: string | null
   readonly destinationReference: string | null
+  readonly recipientManagedAccountId: string | null
+  readonly originalPaymentId: string | null
+}
+
+export type ReceiveRequestStatus = 'OPEN' | 'PAID' | 'EXPIRED' | 'CANCELLED'
+
+export interface ReceiveRequestRecord {
+  readonly id: string
+  readonly accountId: string
+  readonly amountAtomic: bigint | null
+  readonly currency: string
+  readonly reference: string
+  readonly status: ReceiveRequestStatus
+  readonly createdAt: Date
+  readonly updatedAt: Date
+  readonly expiresAt: Date | null
+  readonly paidAt: Date | null
+  readonly matchedIncomingPaymentId: string | null
+}
+
+export interface IncomingPaymentRecord {
+  readonly id: string
+  readonly accountId: string
+  readonly signature: string
+  readonly amountAtomic: bigint
+  readonly currency: string
+  readonly sourceAddress: string | null
+  readonly reference: string | null
+  readonly tokenAccount: string
+  readonly settlementMint: string
+  readonly status: 'CONFIRMED'
+  readonly createdAt: Date
+  readonly confirmedAt: Date
+  readonly receiveRequestId: string | null
+}
+
+export interface ActiveAccountSettlement {
+  readonly accountId: string
+  readonly solanaPublicKey: string
+}
+
+export interface IncomingCursor {
+  readonly accountId: string
+  readonly rail: string
+  readonly address: string
+  readonly cursorSignature: string | null
+}
+
+export interface CreateReceiveRequestInput {
+  readonly id: string
+  readonly accountId: string
+  readonly amountAtomic?: bigint
+  readonly currency: string
+  readonly reference: string
+  readonly expiresAt?: Date
+}
+
+export interface CreateIncomingPaymentInput {
+  readonly id: string
+  readonly accountId: string
+  readonly signature: string
+  readonly amountAtomic: bigint
+  readonly currency: string
+  readonly sourceAddress?: string
+  readonly reference?: string
+  readonly tokenAccount: string
+  readonly settlementMint: string
+  readonly confirmedAt: Date
+}
+
+export interface ReceiveRepository {
+  createReceiveRequest(input: CreateReceiveRequestInput): Promise<ReceiveRequestRecord>
+  findReceiveRequestForOwner(accountId: string, id: string): Promise<ReceiveRequestRecord | null>
+  listReceiveRequests(accountId: string): Promise<readonly ReceiveRequestRecord[]>
+  matchIncomingPayment(input: {
+    readonly incomingPaymentId: string
+    readonly accountId: string
+    readonly amountAtomic: bigint
+    readonly reference: string | null
+  }): Promise<string | null>
+}
+
+export interface IncomingPaymentRepository {
+  listActiveAccountSettlements(): Promise<readonly ActiveAccountSettlement[]>
+  getIncomingCursor(accountId: string, rail: string, address: string): Promise<IncomingCursor | null>
+  saveIncomingCursor(input: { readonly accountId: string; readonly rail: string; readonly address: string; readonly cursorSignature: string }): Promise<void>
+  createIncomingPayment(input: CreateIncomingPaymentInput): Promise<{ readonly payment: IncomingPaymentRecord; readonly created: boolean }>
+  findIncomingPaymentForOwner(accountId: string, id: string): Promise<IncomingPaymentRecord | null>
+  listIncomingPayments(accountId: string): Promise<readonly IncomingPaymentRecord[]>
 }
 
 export interface PaymentAttemptRecord {
@@ -216,6 +309,8 @@ export interface CreatePaymentWithReservationInput {
   readonly destinationRail?: string
   readonly destinationType?: string
   readonly destinationReference?: string
+  readonly recipientManagedAccountId?: string
+  readonly originalPaymentId?: string
   readonly settledAtomic: bigint
 }
 
@@ -302,6 +397,13 @@ export interface PaymentRepository {
     paymentId: string,
   ): Promise<PaymentRecord | null>
   listPayments(ownerAccountId: string): Promise<readonly PaymentRecord[]>
+  findPaymentForRefund(accountId: string, paymentId: string): Promise<PaymentRecord | null>
+  createRefundWithReservation(input: CreateRefundWithReservationInput): Promise<CreatePaymentWithReservationResult>
+}
+
+export interface CreateRefundWithReservationInput extends CreatePaymentWithReservationInput {
+  readonly originalPaymentId: string
+  readonly refundInitiatorAccountId: string
 }
 
 export interface DatabaseClient
@@ -309,7 +411,9 @@ export interface DatabaseClient
     AccountRepository,
     RecipientRepository,
     PaymentRepository,
-    ReservationRepository {
+    ReservationRepository,
+    ReceiveRepository,
+    IncomingPaymentRepository {
   findAccountCustody(accountId: string): Promise<AccountCustodyRecord | null>
   checkReadiness(): Promise<void>
   disconnect(): Promise<void>
@@ -419,6 +523,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           ownerAccountId: input.ownerAccountId,
           displayName: input.displayName,
           type: input.type,
+          ...(input.managedAccountId === undefined
+            ? {}
+            : { managedAccountId: input.managedAccountId }),
           destinations: {
             create: {
               id: input.destination.id,
@@ -468,6 +575,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
               ? {}
               : { displayName: input.displayName }),
             ...(input.type === undefined ? {} : { type: input.type }),
+            ...(input.managedAccountId === undefined
+              ? {}
+              : { managedAccountId: input.managedAccountId }),
           },
         })
         if (result.count !== 1) {
@@ -561,6 +671,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ...(input.destinationReference === undefined
               ? {}
               : { destinationReference: input.destinationReference }),
+            ...(input.recipientManagedAccountId === undefined
+              ? {}
+              : { recipientManagedAccountId: input.recipientManagedAccountId }),
+            ...(input.originalPaymentId === undefined
+              ? {}
+              : { originalPaymentId: input.originalPaymentId }),
           },
         })
         await transaction.outgoingReservation.create({
@@ -577,6 +693,107 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             id: input.idempotencyId,
             ownerAccountId: input.ownerAccountId,
             operation: input.operation,
+            key: input.idempotencyKey,
+            requestHash: input.requestHash,
+            resourceId: payment.id,
+          },
+        })
+        return { payment: toPaymentRecord(payment), created: true }
+      })
+    },
+    async createRefundWithReservation(input): Promise<CreatePaymentWithReservationResult> {
+      return prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT id FROM "payments" WHERE id = ${input.originalPaymentId} FOR UPDATE
+        `
+        await transaction.$queryRaw`
+          SELECT id FROM "agent_accounts" WHERE id = ${input.payerAccountId} FOR UPDATE
+        `
+        const existingIdempotency = await transaction.idempotencyRecord.findUnique({
+          where: {
+            ownerAccountId_operation_key: {
+              ownerAccountId: input.ownerAccountId,
+              operation: 'REFUND',
+              key: input.idempotencyKey,
+            },
+          },
+        })
+        if (existingIdempotency !== null) {
+          if (existingIdempotency.requestHash !== input.requestHash) {
+            throw new ConflictError('Idempotency key was already used for another request')
+          }
+          return {
+            payment: toPaymentRecord(
+              await transaction.payment.findUniqueOrThrow({
+                where: { id: existingIdempotency.resourceId },
+              }),
+            ),
+            created: false,
+          }
+        }
+        const original = await transaction.payment.findUniqueOrThrow({
+          where: { id: input.originalPaymentId },
+        })
+        if (
+          original.status !== 'CONFIRMED' ||
+          original.recipientManagedAccountId !== input.refundInitiatorAccountId
+        ) {
+          throw new RecipientResolutionError('Original payment is not refundable by this account')
+        }
+        const refunds = await transaction.payment.aggregate({
+          where: {
+            originalPaymentId: input.originalPaymentId,
+            status: { not: 'FAILED' },
+          },
+          _sum: { amountAtomic: true },
+        })
+        const refundedAtomic = refunds._sum.amountAtomic ?? 0n
+        const activeReservations = await transaction.outgoingReservation.aggregate({
+          where: { ownerAccountId: input.ownerAccountId, status: 'ACTIVE' },
+          _sum: { amountAtomic: true },
+        })
+        const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
+        if (input.amountAtomic > input.settledAtomic - reservedAtomic) {
+          throw new InsufficientFundsError()
+        }
+        if (input.amountAtomic > original.amountAtomic - refundedAtomic) {
+          throw new ConflictError('Refund amount exceeds the original payment amount')
+        }
+        const payment = await transaction.payment.create({
+          data: {
+            id: input.paymentId,
+            payerAccountId: input.payerAccountId,
+            ...(input.payerPublicKey === undefined ? {} : { payerPublicKey: input.payerPublicKey }),
+            recipientId: input.recipientId,
+            kind: 'REFUND',
+            amountAtomic: input.amountAtomic,
+            currency: input.currency,
+            route: input.route,
+            ...(input.description === undefined ? {} : { description: input.description }),
+            ...(input.externalReference === undefined ? {} : { externalReference: input.externalReference }),
+            ...(input.destinationRail === undefined ? {} : { destinationRail: input.destinationRail }),
+            ...(input.destinationType === undefined ? {} : { destinationType: input.destinationType }),
+            ...(input.destinationReference === undefined ? {} : { destinationReference: input.destinationReference }),
+            ...(input.recipientManagedAccountId === undefined
+              ? {}
+              : { recipientManagedAccountId: input.recipientManagedAccountId }),
+            originalPaymentId: input.originalPaymentId,
+          },
+        })
+        await transaction.outgoingReservation.create({
+          data: {
+            id: input.reservationId,
+            paymentId: payment.id,
+            ownerAccountId: input.ownerAccountId,
+            amountAtomic: input.amountAtomic,
+            currency: input.currency,
+          },
+        })
+        await transaction.idempotencyRecord.create({
+          data: {
+            id: input.idempotencyId,
+            ownerAccountId: input.ownerAccountId,
+            operation: 'REFUND',
             key: input.idempotencyKey,
             requestHash: input.requestHash,
             resourceId: payment.id,
@@ -971,6 +1188,139 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
       return payments.map(toPaymentRecord)
     },
+    async findPaymentForRefund(accountId, paymentId): Promise<PaymentRecord | null> {
+      const payment = await prisma.payment.findFirst({ where: { id: paymentId } })
+      if (payment === null || payment.recipientManagedAccountId !== accountId) {
+        return null
+      }
+      return toPaymentRecord(payment)
+    },
+    async createReceiveRequest(input): Promise<ReceiveRequestRecord> {
+      const request = await prisma.receiveRequest.create({
+        data: {
+          id: input.id,
+          accountId: input.accountId,
+          ...(input.amountAtomic === undefined ? {} : { amountAtomic: input.amountAtomic }),
+          currency: input.currency,
+          reference: input.reference,
+          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+        },
+      })
+      return toReceiveRequestRecord(request)
+    },
+    async findReceiveRequestForOwner(accountId, id) {
+      const request = await prisma.receiveRequest.findFirst({ where: { id, accountId } })
+      return request === null ? null : toReceiveRequestRecord(request)
+    },
+    async listReceiveRequests(accountId) {
+      const requests = await prisma.receiveRequest.findMany({
+        where: { accountId },
+        orderBy: { createdAt: 'desc' },
+      })
+      return requests.map(toReceiveRequestRecord)
+    },
+    async matchIncomingPayment(input): Promise<string | null> {
+      return prisma.$transaction(async (transaction) => {
+        if (input.reference === null) {
+          return null
+        }
+        const request = await transaction.receiveRequest.findFirst({
+          where: {
+            accountId: input.accountId,
+            reference: input.reference,
+            status: 'OPEN',
+            OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
+          },
+          orderBy: { createdAt: 'asc' },
+        })
+        if (request === null) {
+          return null
+        }
+        const result = await transaction.receiveRequest.updateMany({
+          where: { id: request.id, status: 'OPEN' },
+          data: { status: 'PAID', paidAt: new Date(), matchedIncomingPaymentId: input.incomingPaymentId },
+        })
+        return result.count === 1 ? request.id : null
+      })
+    },
+    async listActiveAccountSettlements() {
+      const accounts = await prisma.agentAccount.findMany({
+        where: { status: 'ACTIVE' },
+        select: { id: true, solanaPublicKey: true },
+      })
+      return accounts.map((account) => ({
+        accountId: account.id,
+        solanaPublicKey: account.solanaPublicKey,
+      }))
+    },
+    async getIncomingCursor(accountId, rail, address) {
+      const cursor = await prisma.indexerCheckpoint.findUnique({
+        where: { accountId_rail_address: { accountId, rail, address } },
+      })
+      return cursor === null ? null : cursor
+    },
+    async saveIncomingCursor(input) {
+      await prisma.indexerCheckpoint.upsert({
+        where: { accountId_rail_address: { accountId: input.accountId, rail: input.rail, address: input.address } },
+        create: { id: `idx_${randomBytes(16).toString('hex')}`, ...input },
+        update: { cursorSignature: input.cursorSignature },
+      })
+    },
+    async createIncomingPayment(input) {
+      return prisma.$transaction(async (transaction) => {
+        const existing = await transaction.incomingPayment.findUnique({
+          where: { accountId_signature: { accountId: input.accountId, signature: input.signature } },
+        })
+        if (existing !== null) {
+          return { payment: toIncomingPaymentRecord(existing), created: false }
+        }
+        const incoming = await transaction.incomingPayment.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            signature: input.signature,
+            amountAtomic: input.amountAtomic,
+            currency: input.currency,
+            ...(input.sourceAddress === undefined ? {} : { sourceAddress: input.sourceAddress }),
+            ...(input.reference === undefined ? {} : { reference: input.reference }),
+            tokenAccount: input.tokenAccount,
+            settlementMint: input.settlementMint,
+            confirmedAt: input.confirmedAt,
+          },
+        })
+        const request = input.reference === undefined ? null : await transaction.receiveRequest.findFirst({
+          where: {
+            accountId: input.accountId,
+            reference: input.reference,
+            status: 'OPEN',
+            OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
+          },
+          orderBy: { createdAt: 'asc' },
+        })
+        if (request !== null) {
+          await transaction.receiveRequest.update({
+            where: { id: request.id },
+            data: { status: 'PAID', paidAt: input.confirmedAt, matchedIncomingPaymentId: incoming.id },
+          })
+          await transaction.incomingPayment.update({
+            where: { id: incoming.id },
+            data: { receiveRequestId: request.id },
+          })
+        }
+        return {
+          payment: toIncomingPaymentRecord(await transaction.incomingPayment.findUniqueOrThrow({ where: { id: incoming.id } })),
+          created: true,
+        }
+      })
+    },
+    async findIncomingPaymentForOwner(accountId, id) {
+      const payment = await prisma.incomingPayment.findFirst({ where: { id, accountId } })
+      return payment === null ? null : toIncomingPaymentRecord(payment)
+    },
+    async listIncomingPayments(accountId) {
+      const payments = await prisma.incomingPayment.findMany({ where: { accountId }, orderBy: { createdAt: 'desc' } })
+      return payments.map(toIncomingPaymentRecord)
+    },
     async checkReadiness(): Promise<void> {
       await prisma.$queryRaw`SELECT 1`
     },
@@ -983,6 +1333,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
 function toRecipientRecord(recipient: {
   id: string
   ownerAccountId: string
+  managedAccountId: string | null
   displayName: string
   type: string
   createdAt: Date
@@ -1000,6 +1351,7 @@ function toRecipientRecord(recipient: {
     ownerAccountId: recipient.ownerAccountId,
     displayName: recipient.displayName,
     type: recipient.type,
+    managedAccountId: recipient.managedAccountId,
     ownerStatus: recipient.ownerAccount.status,
     destinations: recipient.destinations.map((destination) => ({
       id: destination.id,
@@ -1033,7 +1385,43 @@ function toPaymentRecord(payment: {
   destinationRail: string | null
   destinationType: string | null
   destinationReference: string | null
+  recipientManagedAccountId: string | null
+  originalPaymentId: string | null
 }): PaymentRecord {
+  return payment
+}
+
+function toReceiveRequestRecord(request: {
+  id: string
+  accountId: string
+  amountAtomic: bigint | null
+  currency: string
+  reference: string
+  status: ReceiveRequestStatus
+  createdAt: Date
+  updatedAt: Date
+  expiresAt: Date | null
+  paidAt: Date | null
+  matchedIncomingPaymentId: string | null
+}): ReceiveRequestRecord {
+  return request
+}
+
+function toIncomingPaymentRecord(payment: {
+  id: string
+  accountId: string
+  signature: string
+  amountAtomic: bigint
+  currency: string
+  sourceAddress: string | null
+  reference: string | null
+  tokenAccount: string
+  settlementMint: string
+  status: 'CONFIRMED'
+  createdAt: Date
+  confirmedAt: Date
+  receiveRequestId: string | null
+}): IncomingPaymentRecord {
   return payment
 }
 

@@ -1,7 +1,8 @@
 import 'dotenv/config'
 
 import { createDatabaseClient } from '@agent-payment/db'
-import { createSolanaPaymentRail, createSolanaRail } from '@agent-payment/solana-rail'
+import { createSolanaIncomingReader, createSolanaPaymentRail, createSolanaRail } from '@agent-payment/solana-rail'
+import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
 import { ExternalRailError } from '@agent-payment/core'
 
 import { buildApp } from './app.js'
@@ -10,6 +11,9 @@ import { loadConfig, redactConfig } from './config.js'
 import { WalletSecretCipher } from './custody.js'
 import { PaymentService } from './payments.js'
 import { RecipientService } from './recipients.js'
+import { ReceiveService } from './receives.js'
+import { IncomingReconciliationService } from './incoming.js'
+import { TransactionService } from './transactions.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -23,6 +27,7 @@ async function startServer(): Promise<void> {
   const walletCipher = new WalletSecretCipher(config.walletMasterKey)
   const accountService = new AccountService(database, walletCipher, rail)
   const recipientService = new RecipientService(database)
+  const receiveService = new ReceiveService(database, rail)
   const payerSecretKeyProvider = async (accountId: string): Promise<Uint8Array> => {
     const custody = await database.findAccountCustody(accountId)
     if (custody === null) {
@@ -48,6 +53,15 @@ async function startServer(): Promise<void> {
     [paymentRail],
     payerSecretKeyProvider,
   )
+  const transactionService = new TransactionService(database)
+  const incomingReader = createSolanaIncomingReader({
+    rpc: createSolanaRpc(config.solanaRpcUrl as ClusterUrl),
+    readRail: rail,
+    rpcUrl: config.solanaRpcUrl,
+    expectedCluster: config.solanaCluster,
+    allowMainnet: config.allowMainnet,
+    settlementMint: config.solanaSettlementMint,
+  })
   const app = buildApp({
     config,
     readinessDependency: database,
@@ -57,7 +71,21 @@ async function startServer(): Promise<void> {
     recipientService,
     paymentService,
     reservationRepository: database,
+    receiveService,
+    transactionService,
   })
+  const incomingReconciliation = new IncomingReconciliationService(
+    database,
+    incomingReader,
+    { error: (data, message) => app.log.error(data, message) },
+  )
+
+  const reconciliationTimer = setInterval(() => {
+    void incomingReconciliation.runOnce().catch((error: unknown) => {
+      app.log.error({ errorCode: error instanceof Error ? error.name : 'UNKNOWN' }, 'Incoming reconciliation loop failed')
+    })
+  }, 5_000)
+  app.addHook('onClose', async () => clearInterval(reconciliationTimer))
 
   app.addHook('onClose', async () => {
     await database.disconnect()

@@ -16,6 +16,8 @@ import { serializePayment } from './payments.js'
 import type { PaymentService } from './payments.js'
 import { serializeRecipient } from './recipients.js'
 import type { RecipientService } from './recipients.js'
+import type { ReceiveService } from './receives.js'
+import type { TransactionService } from './transactions.js'
 
 export interface ReadinessDependency {
   checkReadiness(): Promise<void>
@@ -30,6 +32,8 @@ export interface BuildAppOptions {
   readonly recipientService?: RecipientService
   readonly paymentService?: PaymentService
   readonly reservationRepository?: ReservationRepository
+  readonly receiveService?: ReceiveService
+  readonly transactionService?: TransactionService
 }
 
 interface ErrorWithCode {
@@ -62,6 +66,7 @@ function getErrorStatusCode(error: ErrorWithCode): number {
     case 'UNSUPPORTED_CURRENCY':
     case 'RECIPIENT_RESOLUTION_FAILURE':
     case 'UNSUPPORTED_RAIL':
+    case 'REFUND_NOT_SUPPORTED':
     case 'VALIDATION_ERROR':
       return 422
     case 'EXTERNAL_RAIL_FAILURE':
@@ -191,7 +196,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       },
     )
 
-    app.post<{ Body: { currency: 'USD' } }>(
+    app.post<{
+      Body: { currency: 'USD'; amount?: string; reference?: string; expires_at?: string }
+    }>(
       '/v1/receives',
       {
         preHandler: async (request) => authenticateAgent(request, accountRepository),
@@ -199,7 +206,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           body: {
             type: 'object',
             additionalProperties: false,
-            properties: { currency: { type: 'string', const: 'USD' } },
+            properties: {
+              currency: { type: 'string', const: 'USD' },
+              amount: { type: 'string', minLength: 1 },
+              reference: { type: 'string', minLength: 1, maxLength: 255 },
+              expires_at: { type: 'string', minLength: 1 },
+            },
             required: ['currency'],
           },
         },
@@ -211,6 +223,18 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         const account = request.agentAccount
         if (account === null) {
           throw new AuthenticationError()
+        }
+        if (options.receiveService !== undefined) {
+          return options.receiveService.createReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            {
+              currency: request.body.currency,
+              ...(request.body.amount === undefined ? {} : { amount: request.body.amount }),
+              ...(request.body.reference === undefined ? {} : { reference: request.body.reference }),
+              ...(request.body.expires_at === undefined ? {} : { expiresAt: request.body.expires_at }),
+            },
+          )
         }
         return serializeReceiveDestination(
           await solanaRail.getReceiveDestination(account.account.solanaPublicKey),
@@ -225,6 +249,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         Body: {
           display_name: string
           type: string
+          managed_account_id?: string
           destination: { type: string; wallet_address: string }
         }
       }>(
@@ -238,6 +263,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               properties: {
                 display_name: { type: 'string', minLength: 1, maxLength: 120 },
                 type: { type: 'string', minLength: 1, maxLength: 64 },
+                managed_account_id: { type: 'string', minLength: 1, maxLength: 64 },
                 destination: {
                   type: 'object',
                   additionalProperties: false,
@@ -257,6 +283,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           const recipient = await recipientService.createRecipient(account.account.id, {
             displayName: request.body.display_name,
             type: request.body.type,
+            ...(request.body.managed_account_id === undefined
+              ? {}
+              : { managedAccountId: request.body.managed_account_id }),
             destination: {
               type: request.body.destination.type,
               walletAddress: request.body.destination.wallet_address,
@@ -299,6 +328,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         Body: {
           display_name?: string
           type?: string
+          managed_account_id?: string | null
           destination?: { id: string; type: string; wallet_address: string }
         }
       }>(
@@ -318,6 +348,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               properties: {
                 display_name: { type: 'string', minLength: 1, maxLength: 120 },
                 type: { type: 'string', minLength: 1, maxLength: 64 },
+                managed_account_id: { type: 'string', minLength: 1, maxLength: 64 },
                 destination: {
                   type: 'object',
                   additionalProperties: false,
@@ -344,6 +375,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                   ? {}
                   : { displayName: request.body.display_name }),
                 ...(request.body.type === undefined ? {} : { type: request.body.type }),
+                ...(request.body.managed_account_id === undefined
+                  ? {}
+                  : { managedAccountId: request.body.managed_account_id }),
                 ...(request.body.destination === undefined
                   ? {}
                   : {
@@ -403,6 +437,40 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         },
       )
 
+      app.post<{
+        Body: { original_payment_id: string; amount: string; currency: string }
+      }>(
+        '/v1/refunds',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: {
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                original_payment_id: { type: 'string', minLength: 1 },
+                amount: { type: 'string', minLength: 1 },
+                currency: { type: 'string', const: 'USD' },
+              },
+              required: ['original_payment_id', 'amount', 'currency'],
+            },
+            headers: paymentSchema.headers,
+          },
+        },
+        async (request, reply) => {
+          const result = await paymentService.createRefund(
+            requireAgentAccount(request),
+            {
+              originalPaymentId: request.body.original_payment_id,
+              amount: request.body.amount,
+              currency: request.body.currency,
+            },
+            getIdempotencyKey(request),
+          )
+          return reply.code(result.created ? 201 : 200).send(serializePayment(result.payment))
+        },
+      )
+
       app.post<{ Body: PaymentBody }>(
         '/v1/send',
         {
@@ -449,6 +517,26 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           return { payments: payments.map(serializePayment) }
         },
       )
+
+      if (options.transactionService !== undefined) {
+        app.get(
+          '/v1/transactions',
+          { preHandler: async (request) => authenticateAgent(request, accountRepository) },
+          async (request) => ({
+            transactions: await options.transactionService!.listTransactions(
+              requireAgentAccount(request).account.id,
+            ),
+          }),
+        )
+        app.get<{ Params: { transactionId: string } }>(
+          '/v1/transactions/:transactionId',
+          { preHandler: async (request) => authenticateAgent(request, accountRepository) },
+          async (request) => options.transactionService!.getTransaction(
+            requireAgentAccount(request).account.id,
+            request.params.transactionId,
+          ),
+        )
+      }
     }
   }
 

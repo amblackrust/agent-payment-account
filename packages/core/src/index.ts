@@ -8,6 +8,7 @@ export {
   InternalError,
   isDomainError,
   RecipientResolutionError,
+  RefundNotSupportedError,
   UnsupportedCurrencyError,
   UnsupportedRailError,
   ValidationError,

@@ -15,6 +15,7 @@ enum AgentAccountStatus {
 enum PaymentKind {
   PAY
   SEND
+  REFUND
 }
 
 enum PaymentStatus {
@@ -40,6 +41,17 @@ enum ReservationStatus {
   RELEASED
 }
 
+enum ReceiveRequestStatus {
+  OPEN
+  PAID
+  EXPIRED
+  CANCELLED
+}
+
+enum IncomingPaymentStatus {
+  CONFIRMED
+}
+
 model AgentAccount {
   id                    String                @id @db.VarChar(64)
   name                  String                @db.VarChar(120)
@@ -52,9 +64,13 @@ model AgentAccount {
   updatedAt             DateTime              @updatedAt @map("updated_at")
   credentials           ApiCredential[]
   recipients            Recipient[]
+  managedRecipients     Recipient[]           @relation("ManagedRecipients")
   outgoingPayments      Payment[]             @relation("PayerPayments")
+  incomingPayments      IncomingPayment[]
+  receiveRequests       ReceiveRequest[]
   idempotencyRecords    IdempotencyRecord[]
   outgoingReservations  OutgoingReservation[]
+  indexerCheckpoints    IndexerCheckpoint[]
 
   @@map("agent_accounts")
 }
@@ -74,17 +90,20 @@ model ApiCredential {
 }
 
 model Recipient {
-  id             String                 @id @db.VarChar(64)
-  ownerAccountId String                 @map("owner_account_id") @db.VarChar(64)
-  displayName    String                 @map("display_name") @db.VarChar(120)
-  type           String                 @db.VarChar(64)
-  createdAt      DateTime               @default(now()) @map("created_at")
-  updatedAt      DateTime               @updatedAt @map("updated_at")
-  ownerAccount   AgentAccount           @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
-  destinations   RecipientDestination[]
-  payments       Payment[]
+  id               String                 @id @db.VarChar(64)
+  ownerAccountId   String                 @map("owner_account_id") @db.VarChar(64)
+  managedAccountId String?                @map("managed_account_id") @db.VarChar(64)
+  displayName      String                 @map("display_name") @db.VarChar(120)
+  type             String                 @db.VarChar(64)
+  createdAt        DateTime               @default(now()) @map("created_at")
+  updatedAt        DateTime               @updatedAt @map("updated_at")
+  ownerAccount     AgentAccount           @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
+  managedAccount   AgentAccount?          @relation("ManagedRecipients", fields: [managedAccountId], references: [id], onDelete: Restrict)
+  destinations     RecipientDestination[]
+  payments         Payment[]
 
   @@index([ownerAccountId])
+  @@index([managedAccountId])
   @@map("recipients")
 }
 
@@ -103,30 +122,34 @@ model RecipientDestination {
 }
 
 model Payment {
-  id                 String               @id @db.VarChar(64)
-  payerAccountId     String               @map("payer_account_id") @db.VarChar(64)
-  payerPublicKey     String?              @map("payer_public_key") @db.VarChar(64)
-  recipientId        String               @map("recipient_id") @db.VarChar(64)
-  kind               PaymentKind
-  amountAtomic       BigInt               @map("amount_atomic")
-  currency           String               @db.VarChar(3)
-  status             PaymentStatus        @default(CREATED)
-  description        String?              @db.Text
-  externalReference  String?              @map("external_reference") @db.VarChar(255)
-  route              String?              @db.VarChar(64)
-  createdAt          DateTime             @default(now()) @map("created_at")
-  updatedAt          DateTime             @updatedAt @map("updated_at")
-  confirmedAt        DateTime?            @map("confirmed_at")
-  failedAt           DateTime?            @map("failed_at")
-  failureCode        String?              @map("failure_code") @db.VarChar(64)
-  failureMessageSafe String?              @map("failure_message_safe") @db.Text
-  destinationRail      String?              @map("destination_rail") @db.VarChar(64)
-  destinationType      String?              @map("destination_type") @db.VarChar(64)
-  destinationReference String?              @map("destination_reference") @db.VarChar(255)
-  payerAccount       AgentAccount         @relation("PayerPayments", fields: [payerAccountId], references: [id], onDelete: Restrict)
-  recipient          Recipient            @relation(fields: [recipientId], references: [id], onDelete: Restrict)
-  attempts           PaymentAttempt[]
-  reservation        OutgoingReservation?
+  id                        String               @id @db.VarChar(64)
+  payerAccountId            String               @map("payer_account_id") @db.VarChar(64)
+  payerPublicKey            String?              @map("payer_public_key") @db.VarChar(64)
+  recipientId               String               @map("recipient_id") @db.VarChar(64)
+  kind                      PaymentKind
+  amountAtomic              BigInt               @map("amount_atomic")
+  currency                  String               @db.VarChar(3)
+  status                    PaymentStatus        @default(CREATED)
+  description               String?              @db.Text
+  externalReference         String?              @map("external_reference") @db.VarChar(255)
+  route                     String?              @db.VarChar(64)
+  createdAt                 DateTime             @default(now()) @map("created_at")
+  updatedAt                 DateTime             @updatedAt @map("updated_at")
+  confirmedAt               DateTime?            @map("confirmed_at")
+  failedAt                  DateTime?            @map("failed_at")
+  failureCode               String?              @map("failure_code") @db.VarChar(64)
+  failureMessageSafe        String?              @map("failure_message_safe") @db.Text
+  destinationRail           String?              @map("destination_rail") @db.VarChar(64)
+  destinationType           String?              @map("destination_type") @db.VarChar(64)
+  destinationReference      String?              @map("destination_reference") @db.VarChar(255)
+  recipientManagedAccountId String?              @map("recipient_managed_account_id") @db.VarChar(64)
+  originalPaymentId         String?              @map("original_payment_id") @db.VarChar(64)
+  payerAccount              AgentAccount         @relation("PayerPayments", fields: [payerAccountId], references: [id], onDelete: Restrict)
+  recipient                 Recipient            @relation(fields: [recipientId], references: [id], onDelete: Restrict)
+  originalPayment           Payment?             @relation("PaymentRefunds", fields: [originalPaymentId], references: [id], onDelete: Restrict)
+  refunds                   Payment[]            @relation("PaymentRefunds")
+  attempts                  PaymentAttempt[]
+  reservation               OutgoingReservation?
 
   @@index([payerAccountId, createdAt])
   @@index([recipientId, createdAt])
@@ -134,26 +157,85 @@ model Payment {
   @@map("payments")
 }
 
+model ReceiveRequest {
+  id                       String               @id @db.VarChar(64)
+  accountId                String               @map("account_id") @db.VarChar(64)
+  amountAtomic             BigInt?              @map("amount_atomic")
+  currency                 String               @db.VarChar(3)
+  reference                String               @db.VarChar(255)
+  status                   ReceiveRequestStatus @default(OPEN)
+  createdAt                DateTime             @default(now()) @map("created_at")
+  updatedAt                DateTime             @updatedAt @map("updated_at")
+  expiresAt                DateTime?            @map("expires_at")
+  paidAt                   DateTime?            @map("paid_at")
+  matchedIncomingPaymentId String?              @unique @map("matched_incoming_payment_id") @db.VarChar(64)
+  account                  AgentAccount         @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  matchedIncomingPayment   IncomingPayment?     @relation("ReceiveMatch", fields: [matchedIncomingPaymentId], references: [id], onDelete: Restrict)
+  incomingPayments         IncomingPayment[]    @relation("ReceiveIncoming")
+
+  @@unique([accountId, reference])
+  @@index([accountId, status])
+  @@map("receive_requests")
+}
+
+model IncomingPayment {
+  id               String                @id @db.VarChar(64)
+  accountId        String                @map("account_id") @db.VarChar(64)
+  signature        String                @db.VarChar(128)
+  amountAtomic     BigInt                @map("amount_atomic")
+  currency         String                @db.VarChar(3)
+  sourceAddress    String?               @map("source_address") @db.VarChar(128)
+  reference        String?               @db.VarChar(255)
+  tokenAccount     String                @map("token_account") @db.VarChar(128)
+  settlementMint   String                @map("settlement_mint") @db.VarChar(128)
+  status           IncomingPaymentStatus @default(CONFIRMED)
+  createdAt        DateTime              @default(now()) @map("created_at")
+  confirmedAt      DateTime              @default(now()) @map("confirmed_at")
+  receiveRequestId String?               @map("receive_request_id") @db.VarChar(64)
+  account          AgentAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  receiveRequest   ReceiveRequest?       @relation("ReceiveIncoming", fields: [receiveRequestId], references: [id], onDelete: Restrict)
+  matchedByRequest ReceiveRequest?       @relation("ReceiveMatch")
+
+  @@index([accountId, createdAt])
+  @@index([accountId, receiveRequestId])
+  @@unique([accountId, signature])
+  @@map("incoming_payments")
+}
+
+model IndexerCheckpoint {
+  id              String       @id @db.VarChar(64)
+  accountId       String       @map("account_id") @db.VarChar(64)
+  rail            String       @db.VarChar(64)
+  address         String       @db.VarChar(128)
+  cursorSignature String?      @map("cursor_signature") @db.VarChar(128)
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+  account         AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@unique([accountId, rail, address])
+  @@map("indexer_checkpoints")
+}
+
 model PaymentAttempt {
-  id                    String               @id @db.VarChar(64)
-  paymentId             String               @map("payment_id") @db.VarChar(64)
-  attemptNumber         Int                  @map("attempt_number")
-  rail                  String               @db.VarChar(64)
-  status                PaymentAttemptStatus @default(CREATED)
-  railTransactionId     String?              @map("rail_transaction_id") @db.VarChar(255)
-  serializedPayloadSafe String?              @map("serialized_payload_safe") @db.Text
-  durablePayload        String?              @map("durable_payload") @db.Text
-  expectedExternalId    String?              @map("expected_external_id") @db.VarChar(255)
-  recoveryMetadata      String?              @map("recovery_metadata") @db.Text
-  confirmationMetadata  String?              @map("confirmation_metadata") @db.Text
-  legacySignedTransactionBase64 String?     @map("signed_transaction_base64") @db.Text
-  legacyExpectedSignature       String?     @map("expected_signature") @db.VarChar(128)
-  legacyBlockhash               String?     @map("blockhash") @db.VarChar(128)
-  legacyLastValidBlockHeight    BigInt?     @map("last_valid_block_height")
-  legacyConfirmedSlot           BigInt?     @map("confirmed_slot")
-  createdAt             DateTime             @default(now()) @map("created_at")
-  updatedAt             DateTime             @updatedAt @map("updated_at")
-  payment               Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  id                            String               @id @db.VarChar(64)
+  paymentId                     String               @map("payment_id") @db.VarChar(64)
+  attemptNumber                 Int                  @map("attempt_number")
+  rail                          String               @db.VarChar(64)
+  status                        PaymentAttemptStatus @default(CREATED)
+  railTransactionId             String?              @map("rail_transaction_id") @db.VarChar(255)
+  serializedPayloadSafe         String?              @map("serialized_payload_safe") @db.Text
+  durablePayload                String?              @map("durable_payload") @db.Text
+  expectedExternalId            String?              @map("expected_external_id") @db.VarChar(255)
+  recoveryMetadata              String?              @map("recovery_metadata") @db.Text
+  confirmationMetadata          String?              @map("confirmation_metadata") @db.Text
+  legacySignedTransactionBase64 String?              @map("signed_transaction_base64") @db.Text
+  legacyExpectedSignature       String?              @map("expected_signature") @db.VarChar(128)
+  legacyBlockhash               String?              @map("blockhash") @db.VarChar(128)
+  legacyLastValidBlockHeight    BigInt?              @map("last_valid_block_height")
+  legacyConfirmedSlot           BigInt?              @map("confirmed_slot")
+  createdAt                     DateTime             @default(now()) @map("created_at")
+  updatedAt                     DateTime             @updatedAt @map("updated_at")
+  payment                       Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
 
   @@unique([paymentId, attemptNumber])
   @@index([paymentId, createdAt])

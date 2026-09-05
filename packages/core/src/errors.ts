@@ -7,6 +7,7 @@ export const DOMAIN_ERROR_CODES = {
   UNSUPPORTED_RAIL: 'UNSUPPORTED_RAIL',
   CONFLICT: 'CONFLICT',
   EXTERNAL_RAIL: 'EXTERNAL_RAIL_FAILURE',
+  REFUND_NOT_SUPPORTED: 'REFUND_NOT_SUPPORTED',
   INTERNAL: 'INTERNAL_ERROR',
 } as const
 
@@ -107,6 +108,12 @@ export class ExternalRailError extends DomainError {
   ) {
     super(DOMAIN_ERROR_CODES.EXTERNAL_RAIL, message, details, cause)
     this.kind = kind
+  }
+}
+
+export class RefundNotSupportedError extends DomainError {
+  public constructor(message = 'Refund is not supported for this payment') {
+    super(DOMAIN_ERROR_CODES.REFUND_NOT_SUPPORTED, message)
   }
 }
 

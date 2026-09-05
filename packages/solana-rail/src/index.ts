@@ -8,6 +8,8 @@ export type {
   SolanaRail,
   SolanaRailOptions,
 } from './read.js'
+export { createSolanaIncomingReader } from './incoming.js'
+export type { IncomingTransfer, SolanaIncomingReader, SolanaIncomingReaderOptions } from './incoming.js'
 export { DEFAULT_RPC_TIMEOUT_MS, SolanaRailConfigurationError } from './read.js'
 export {
   createSolanaPaymentPreparationRail,

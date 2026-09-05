@@ -8,7 +8,7 @@ export interface RailRecipientDestination {
 }
 
 export interface RailPaymentRequest {
-  readonly operation: Extract<PaymentOperation, 'PAY' | 'SEND'>
+  readonly operation: Extract<PaymentOperation, 'PAY' | 'SEND' | 'REFUND'>
   readonly currency: Currency
   readonly amount: Money
   readonly payerAccountId: string
