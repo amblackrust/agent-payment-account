@@ -727,22 +727,29 @@ export class PaymentService {
       }
       if (executionCalled) {
         if (error instanceof ExternalRailError && error.kind === 'DETERMINISTIC') {
-          await this.tryFinalizeFailure(payment, attempt, error, requestId)
-          throw error
+          const finalized = await this.tryFinalizeFailure(
+            payment,
+            attempt,
+            error,
+            requestId,
+          )
+          if (finalized) throw error
+          throw pendingPaymentError(payment.id)
         }
         await this.tryMarkReconciling(payment, attempt, requestId)
-        throw new ExternalRailError(
-          'Payment execution outcome is ambiguous',
-          error,
-          'AMBIGUOUS',
-          { payment_id: payment.id },
-        )
+        throw pendingPaymentError(payment.id, error)
       }
-      if (isRetryablePreDurableFailure(error)) throw error
-      await this.tryFinalizeFailure(payment, attempt, error, requestId)
-      if (error instanceof InsufficientFundsError) {
-        throw error
+      if (isRetryablePreDurableFailure(error)) {
+        throw pendingPaymentError(payment.id, error)
       }
+      const finalized = await this.tryFinalizeFailure(
+        payment,
+        attempt,
+        error,
+        requestId,
+      )
+      if (!finalized) throw pendingPaymentError(payment.id, error)
+      if (error instanceof InsufficientFundsError) throw error
       throw error instanceof ExternalRailError
         ? error
         : new ExternalRailError('Payment rail execution failed')
@@ -902,7 +909,7 @@ export class PaymentService {
     attempt: PaymentAttemptRecord,
     error: unknown,
     requestId?: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const failureCode =
         error instanceof ExternalRailError ? error.code : 'EXTERNAL_RAIL_FAILURE'
@@ -922,10 +929,21 @@ export class PaymentService {
         failureCode,
         requestId,
       )
+      return true
     } catch {
       // A failed persistence transaction leaves the reservation recoverable.
+      return false
     }
   }
+}
+
+function pendingPaymentError(paymentId: string, cause?: unknown): ExternalRailError {
+  return new ExternalRailError(
+    'Payment outcome is pending; retry with the same idempotency key or poll the payment',
+    cause,
+    'AMBIGUOUS',
+    { payment_id: paymentId },
+  )
 }
 
 export function serializePayment(payment: PaymentRecord) {

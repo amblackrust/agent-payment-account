@@ -693,7 +693,7 @@ function mapHttpError(
     case 'REFUND_NOT_SUPPORTED':
       return new RefundNotSupportedError(message)
     case 'EXTERNAL_RAIL_FAILURE':
-      if (idempotencyKey !== undefined && paymentId !== undefined) {
+      if (idempotencyKey !== undefined && statusCode >= 500) {
         return new PaymentPendingError(
           idempotencyKey,
           'Payment rail outcome is unknown; poll the payment or retry with the same idempotency key',
