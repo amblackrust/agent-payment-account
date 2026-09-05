@@ -633,6 +633,7 @@ export class PaymentService {
         payment.status,
         'ROUTING',
       )
+      this.logTransition(payment, 'CREATED', 'ROUTING')
 
       const quote = await rail.quote(request)
       if (

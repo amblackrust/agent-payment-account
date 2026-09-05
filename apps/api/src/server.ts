@@ -151,7 +151,10 @@ async function startServer(): Promise<void> {
     await app.listen({ host: '0.0.0.0', port: config.port })
     app.log.info({ config: redactConfig(config) }, 'API started')
   } catch (error) {
-    app.log.error({ err: error }, 'API failed to start')
+    app.log.error(
+      { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
+      'API failed to start',
+    )
     await app.close()
     throw error
   }
