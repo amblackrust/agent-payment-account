@@ -49,9 +49,20 @@ export interface CreateAgentAccountInput {
   readonly keyPrefix: string
 }
 
+export interface AccountCustodyRecord {
+  readonly accountId: string
+  readonly solanaPublicKey: string
+  readonly encryptedSolanaSecret: string
+  readonly encryptionNonce: string
+  readonly encryptionAuthTag: string
+}
+
 export interface AccountRepository {
   createAgentAccount(input: CreateAgentAccountInput): Promise<StoredAgentAccount>
   findAccountByCredentialHash(keyHash: string): Promise<AuthenticatedAccount | null>
+  readonly findAccountCustody?: (
+    accountId: string,
+  ) => Promise<AccountCustodyRecord | null>
   markCredentialUsed(credentialId: string): Promise<void>
   revokeCredential(accountId: string, credentialId: string): Promise<boolean>
 }
@@ -128,9 +139,10 @@ export interface ReservationRepository {
 }
 
 export type PaymentKind = 'PAY' | 'SEND'
-export type PaymentStatus = 'CREATED' | 'ROUTING' | 'SUBMITTED' | 'CONFIRMED' | 'FAILED'
+export type PaymentStatus =
+  'CREATED' | 'ROUTING' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
 export type PaymentAttemptStatus =
-  'CREATED' | 'PREPARED' | 'SUBMITTED' | 'CONFIRMED' | 'FAILED'
+  'CREATED' | 'PREPARED' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
 export type ReservationStatus = 'ACTIVE' | 'RELEASED'
 
 export interface PaymentRecord {
@@ -160,6 +172,11 @@ export interface PaymentAttemptRecord {
   readonly status: PaymentAttemptStatus
   readonly railTransactionId: string | null
   readonly serializedPayloadSafe: string | null
+  readonly signedTransactionBase64: string | null
+  readonly expectedSignature: string | null
+  readonly blockhash: string | null
+  readonly lastValidBlockHeight: bigint | null
+  readonly confirmedSlot: bigint | null
   readonly createdAt: Date
   readonly updatedAt: Date
 }
@@ -209,6 +226,10 @@ export interface PaymentRepository {
     readonly rail: string
     readonly status: PaymentAttemptStatus
     readonly serializedPayloadSafe?: string
+    readonly signedTransactionBase64?: string
+    readonly expectedSignature?: string
+    readonly blockhash?: string
+    readonly lastValidBlockHeight?: bigint
   }): Promise<PaymentAttemptRecord>
   updatePaymentAttempt(
     attemptId: string,
@@ -217,8 +238,14 @@ export interface PaymentRepository {
     fields?: Readonly<{
       railTransactionId?: string | null
       serializedPayloadSafe?: string | null
+      signedTransactionBase64?: string | null
+      expectedSignature?: string | null
+      blockhash?: string | null
+      lastValidBlockHeight?: bigint | null
+      confirmedSlot?: bigint | null
     }>,
   ): Promise<PaymentAttemptRecord>
+  listPaymentAttempts(paymentId: string): Promise<readonly PaymentAttemptRecord[]>
   releaseReservation(paymentId: string): Promise<void>
   findPaymentForOwner(
     ownerAccountId: string,
@@ -233,6 +260,7 @@ export interface DatabaseClient
     RecipientRepository,
     PaymentRepository,
     ReservationRepository {
+  findAccountCustody(accountId: string): Promise<AccountCustodyRecord | null>
   checkReadiness(): Promise<void>
   disconnect(): Promise<void>
 }
@@ -299,6 +327,27 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           lastUsedAt: credential.lastUsedAt,
         },
       }
+    },
+    async findAccountCustody(accountId): Promise<AccountCustodyRecord | null> {
+      const account = await prisma.agentAccount.findUnique({
+        where: { id: accountId },
+        select: {
+          id: true,
+          solanaPublicKey: true,
+          encryptedSolanaSecret: true,
+          encryptionNonce: true,
+          encryptionAuthTag: true,
+        },
+      })
+      return account === null
+        ? null
+        : {
+            accountId: account.id,
+            solanaPublicKey: account.solanaPublicKey,
+            encryptedSolanaSecret: account.encryptedSolanaSecret,
+            encryptionNonce: account.encryptionNonce,
+            encryptionAuthTag: account.encryptionAuthTag,
+          }
     },
     async markCredentialUsed(credentialId): Promise<void> {
       await prisma.apiCredential.update({
@@ -536,6 +585,16 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           ...(input.serializedPayloadSafe === undefined
             ? {}
             : { serializedPayloadSafe: input.serializedPayloadSafe }),
+          ...(input.signedTransactionBase64 === undefined
+            ? {}
+            : { signedTransactionBase64: input.signedTransactionBase64 }),
+          ...(input.expectedSignature === undefined
+            ? {}
+            : { expectedSignature: input.expectedSignature }),
+          ...(input.blockhash === undefined ? {} : { blockhash: input.blockhash }),
+          ...(input.lastValidBlockHeight === undefined
+            ? {}
+            : { lastValidBlockHeight: input.lastValidBlockHeight }),
         },
       })
       return toPaymentAttemptRecord(attempt)
@@ -551,6 +610,19 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           ...(fields?.serializedPayloadSafe === undefined
             ? {}
             : { serializedPayloadSafe: fields.serializedPayloadSafe }),
+          ...(fields?.signedTransactionBase64 === undefined
+            ? {}
+            : { signedTransactionBase64: fields.signedTransactionBase64 }),
+          ...(fields?.expectedSignature === undefined
+            ? {}
+            : { expectedSignature: fields.expectedSignature }),
+          ...(fields?.blockhash === undefined ? {} : { blockhash: fields.blockhash }),
+          ...(fields?.lastValidBlockHeight === undefined
+            ? {}
+            : { lastValidBlockHeight: fields.lastValidBlockHeight }),
+          ...(fields?.confirmedSlot === undefined
+            ? {}
+            : { confirmedSlot: fields.confirmedSlot }),
         },
       })
       if (result.count !== 1) {
@@ -560,6 +632,13 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         where: { id: attemptId },
       })
       return toPaymentAttemptRecord(attempt)
+    },
+    async listPaymentAttempts(paymentId): Promise<readonly PaymentAttemptRecord[]> {
+      const attempts = await prisma.paymentAttempt.findMany({
+        where: { paymentId },
+        orderBy: { attemptNumber: 'asc' },
+      })
+      return attempts.map(toPaymentAttemptRecord)
     },
     async releaseReservation(paymentId): Promise<void> {
       await prisma.outgoingReservation.updateMany({
@@ -653,6 +732,11 @@ function toPaymentAttemptRecord(attempt: {
   status: PaymentAttemptStatus
   railTransactionId: string | null
   serializedPayloadSafe: string | null
+  signedTransactionBase64: string | null
+  expectedSignature: string | null
+  blockhash: string | null
+  lastValidBlockHeight: bigint | null
+  confirmedSlot: bigint | null
   createdAt: Date
   updatedAt: Date
 }): PaymentAttemptRecord {

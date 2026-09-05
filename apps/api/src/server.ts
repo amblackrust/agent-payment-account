@@ -1,10 +1,8 @@
 import 'dotenv/config'
 
 import { createDatabaseClient } from '@agent-payment/db'
-import {
-  createSolanaPaymentPreparationRail,
-  createSolanaRail,
-} from '@agent-payment/solana-rail'
+import { createSolanaPaymentRail, createSolanaRail } from '@agent-payment/solana-rail'
+import { ExternalRailError } from '@agent-payment/core'
 
 import { buildApp } from './app.js'
 import { AccountService } from './accounts.js'
@@ -22,17 +20,34 @@ async function startServer(): Promise<void> {
     allowMainnet: config.allowMainnet,
     settlementMint: config.solanaSettlementMint,
   })
-  const accountService = new AccountService(
-    database,
-    new WalletSecretCipher(config.walletMasterKey),
-    rail,
-  )
+  const walletCipher = new WalletSecretCipher(config.walletMasterKey)
+  const accountService = new AccountService(database, walletCipher, rail)
   const recipientService = new RecipientService(database)
-  // Task 04 will register the real execution rail. No successful fake rail is
-  // registered in production while this execution boundary is still read-only.
-  const paymentService = new PaymentService(database, rail, [
-    createSolanaPaymentPreparationRail(),
-  ])
+  const payerSecretKeyProvider = async (accountId: string): Promise<Uint8Array> => {
+    const custody = await database.findAccountCustody(accountId)
+    if (custody === null) {
+      throw new ExternalRailError('Payer account custody is unavailable')
+    }
+    const secret = walletCipher.decrypt({
+      ciphertext: custody.encryptedSolanaSecret,
+      nonce: custody.encryptionNonce,
+      authTag: custody.encryptionAuthTag,
+    })
+    return secret
+  }
+  const paymentRail = createSolanaPaymentRail({
+    rpcUrl: config.solanaRpcUrl,
+    expectedCluster: config.solanaCluster,
+    allowMainnet: config.allowMainnet,
+    settlementMint: config.solanaSettlementMint,
+    feePayerSecret: config.solanaFeePayerSecret,
+  })
+  const paymentService = new PaymentService(
+    database,
+    rail,
+    [paymentRail],
+    payerSecretKeyProvider,
+  )
   const app = buildApp({
     config,
     readinessDependency: database,

@@ -8,6 +8,7 @@ import {
   createPositiveMoney,
   ExternalRailError,
   formatMoney,
+  InsufficientFundsError,
   moneyFromAtomicUnits,
   selectPaymentRail,
   RecipientResolutionError,
@@ -16,6 +17,7 @@ import {
   type Money,
   type PaymentKind,
   type PaymentRail,
+  type RailPreparationContext,
   type RailPaymentRequest,
 } from '@agent-payment/core'
 import type {
@@ -45,6 +47,8 @@ export interface PaymentResult {
   readonly created: boolean
 }
 
+export type PayerSecretKeyProvider = (accountId: string) => Promise<Uint8Array>
+
 type PaymentStore = PaymentRepository & RecipientRepository & ReservationRepository
 
 export class PaymentService {
@@ -52,6 +56,7 @@ export class PaymentService {
     private readonly repository: PaymentStore,
     private readonly balanceReader: SettledBalanceReader,
     private readonly rails: readonly PaymentRail[],
+    private readonly payerSecretKeyProvider?: PayerSecretKeyProvider,
   ) {}
 
   public async createPayment(
@@ -122,7 +127,12 @@ export class PaymentService {
       return persisted
     }
 
-    return this.executePayment(persisted.payment, routed.rail, routed.request)
+    return this.executePayment(
+      persisted.payment,
+      routed.rail,
+      routed.request,
+      account.account.solanaPublicKey,
+    )
   }
 
   public async getPayment(
@@ -133,11 +143,67 @@ export class PaymentService {
     if (payment === null) {
       throw new ResourceNotFoundError('Payment not found')
     }
-    return payment
+    return this.reconcilePaymentIfNeeded(payment)
   }
 
   public listPayments(accountId: string): Promise<readonly PaymentRecord[]> {
     return this.repository.listPayments(accountId)
+  }
+
+  private async reconcilePaymentIfNeeded(
+    payment: PaymentRecord,
+  ): Promise<PaymentRecord> {
+    if (payment.status !== 'RECONCILING') {
+      return payment
+    }
+    const attempts = await this.repository.listPaymentAttempts(payment.id)
+    const attempt = attempts.at(-1)
+    if (attempt === undefined) {
+      return payment
+    }
+    const rail = this.rails.find((candidate) => candidate.name === attempt.rail)
+    const transactionId = attempt.railTransactionId ?? attempt.expectedSignature
+    if (rail?.getStatus === undefined || transactionId === null) {
+      return payment
+    }
+
+    const status = await rail.getStatus(transactionId)
+    if (status.status === 'SUBMITTED') {
+      return payment
+    }
+    if (status.status === 'CONFIRMED') {
+      await this.repository.updatePaymentAttempt(
+        attempt.id,
+        'RECONCILING',
+        'CONFIRMED',
+        {
+          railTransactionId: status.railTransactionId ?? transactionId,
+          ...(status.confirmedSlot === undefined
+            ? {}
+            : { confirmedSlot: status.confirmedSlot }),
+        },
+      )
+      const confirmedPayment = await this.repository.transitionPayment(
+        payment.id,
+        'RECONCILING',
+        'CONFIRMED',
+        { confirmedAt: new Date() },
+      )
+      await this.repository.releaseReservation(payment.id)
+      return confirmedPayment
+    }
+
+    await this.repository.updatePaymentAttempt(attempt.id, 'RECONCILING', 'FAILED')
+    await this.repository.transitionPayment(payment.id, 'RECONCILING', 'FAILED', {
+      failedAt: new Date(),
+      failureCode: 'EXTERNAL_RAIL_FAILURE',
+      failureMessageSafe: 'Payment rail execution failed',
+    })
+    await this.repository.releaseReservation(payment.id)
+    return (
+      (await this.repository.findPaymentForOwner(payment.payerAccountId, payment.id)) ??
+      payment
+    )
   }
 
   private async resolveRecipient(
@@ -200,6 +266,7 @@ export class PaymentService {
     payment: PaymentRecord,
     rail: PaymentRail,
     request: RailPaymentRequest,
+    payerPublicKey: string,
   ): Promise<PaymentResult> {
     let paymentStatus = payment.status
     let attemptStatus: StoredPaymentAttemptStatus = 'CREATED'
@@ -225,15 +292,40 @@ export class PaymentService {
       ) {
         throw new ExternalRailError('Payment rail returned an invalid quote')
       }
-      const prepared = await rail.prepare(request)
+      const preparationContext: RailPreparationContext = {
+        paymentId: payment.id,
+        payerAccountId: payment.payerAccountId,
+        payerPublicKey,
+        getPayerSecretKey: async () => {
+          if (this.payerSecretKeyProvider === undefined) {
+            throw new ExternalRailError('Payer custody is not configured')
+          }
+          return this.payerSecretKeyProvider(payment.payerAccountId)
+        },
+      }
+      const prepared = await rail.prepare(request, preparationContext)
       assertPaymentAttemptStatusTransition(attemptStatus, 'PREPARED')
+      const durableExecution = prepared.durableExecution
       await this.repository.updatePaymentAttempt(
         attempt.id,
         attemptStatus,
         'PREPARED',
-        prepared.payloadSafe === undefined
+        prepared.payloadSafe === undefined && durableExecution === undefined
           ? undefined
-          : { serializedPayloadSafe: prepared.payloadSafe },
+          : {
+              ...(prepared.payloadSafe === undefined
+                ? {}
+                : { serializedPayloadSafe: prepared.payloadSafe }),
+              ...(durableExecution === undefined
+                ? {}
+                : {
+                    signedTransactionBase64:
+                      durableExecution.serializedTransactionBase64,
+                    expectedSignature: durableExecution.expectedTransactionId,
+                    blockhash: durableExecution.blockhash,
+                    lastValidBlockHeight: durableExecution.lastValidBlockHeight,
+                  }),
+            },
       )
       attemptStatus = 'PREPARED'
 
@@ -269,9 +361,17 @@ export class PaymentService {
           attempt.id,
           attemptStatus,
           'CONFIRMED',
-          execution.railTransactionId === undefined
+          execution.railTransactionId === undefined &&
+            execution.confirmedSlot === undefined
             ? undefined
-            : { railTransactionId: execution.railTransactionId },
+            : {
+                ...(execution.railTransactionId === undefined
+                  ? {}
+                  : { railTransactionId: execution.railTransactionId }),
+                ...(execution.confirmedSlot === undefined
+                  ? {}
+                  : { confirmedSlot: execution.confirmedSlot }),
+              },
         )
         attemptStatus = 'CONFIRMED'
         assertPaymentStatusTransition(paymentStatus, 'CONFIRMED')
@@ -293,7 +393,25 @@ export class PaymentService {
       throw new ExternalRailError(
         'Payment rail returned an unsupported execution state',
       )
-    } catch {
+    } catch (error) {
+      if (
+        error instanceof ExternalRailError &&
+        error.kind === 'AMBIGUOUS' &&
+        attempt !== undefined
+      ) {
+        await this.markPaymentReconciling(
+          payment.id,
+          paymentStatus,
+          attempt.id,
+          attemptStatus,
+        )
+        throw new ExternalRailError(
+          'Payment execution outcome is ambiguous',
+          error,
+          'AMBIGUOUS',
+          { payment_id: payment.id },
+        )
+      }
       if (attempt === undefined) {
         assertPaymentStatusTransition(paymentStatus, 'FAILED')
         await this.repository.transitionPayment(payment.id, paymentStatus, 'FAILED', {
@@ -305,7 +423,32 @@ export class PaymentService {
       } else {
         await this.failPayment(payment.id, paymentStatus, attempt.id, attemptStatus)
       }
-      throw new ExternalRailError('Payment rail execution failed')
+      if (error instanceof InsufficientFundsError) {
+        throw error
+      }
+      throw error instanceof ExternalRailError
+        ? error
+        : new ExternalRailError('Payment rail execution failed')
+    }
+  }
+
+  private async markPaymentReconciling(
+    paymentId: string,
+    paymentStatus: PaymentRecord['status'],
+    attemptId: string,
+    attemptStatus: StoredPaymentAttemptStatus,
+  ): Promise<void> {
+    if (attemptStatus !== 'RECONCILING') {
+      assertPaymentAttemptStatusTransition(attemptStatus, 'RECONCILING')
+      await this.repository.updatePaymentAttempt(
+        attemptId,
+        attemptStatus,
+        'RECONCILING',
+      )
+    }
+    if (paymentStatus !== 'RECONCILING') {
+      assertPaymentStatusTransition(paymentStatus, 'RECONCILING')
+      await this.repository.transitionPayment(paymentId, paymentStatus, 'RECONCILING')
     }
   }
 

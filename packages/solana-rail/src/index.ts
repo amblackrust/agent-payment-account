@@ -9,4 +9,13 @@ export type {
   SolanaRailOptions,
 } from './read.js'
 export { DEFAULT_RPC_TIMEOUT_MS, SolanaRailConfigurationError } from './read.js'
-export { createSolanaPaymentPreparationRail, SOLANA_SPL_RAIL } from './payment.js'
+export {
+  createSolanaPaymentPreparationRail,
+  createSolanaPaymentRail,
+  createSolanaPaymentRailWithRpc,
+  SOLANA_SPL_RAIL,
+} from './payment.js'
+export type {
+  SolanaPaymentRailOptions,
+  SolanaPaymentRailWithRpcOptions,
+} from './payment.js'

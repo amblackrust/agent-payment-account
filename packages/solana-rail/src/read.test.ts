@@ -276,6 +276,7 @@ describe('Solana settlement read rail', () => {
     await expect(rail.getReceiveDestination(owner)).rejects.toMatchObject({
       code: 'EXTERNAL_RAIL_FAILURE',
       message: 'Solana RPC request timed out',
+      kind: 'RETRYABLE',
     })
   })
 

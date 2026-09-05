@@ -19,6 +19,8 @@ export interface SerializedDomainError {
   details?: Readonly<Record<string, string>>
 }
 
+export type RailFailureKind = 'DETERMINISTIC' | 'RETRYABLE' | 'AMBIGUOUS'
+
 export abstract class DomainError extends Error {
   public readonly code: DomainErrorCode
   public readonly details?: Readonly<Record<string, string>>
@@ -95,8 +97,16 @@ export class ConflictError extends DomainError {
 }
 
 export class ExternalRailError extends DomainError {
-  public constructor(message = 'External payment rail failed', cause?: unknown) {
-    super(DOMAIN_ERROR_CODES.EXTERNAL_RAIL, message, undefined, cause)
+  public readonly kind: RailFailureKind
+
+  public constructor(
+    message = 'External payment rail failed',
+    cause?: unknown,
+    kind: RailFailureKind = 'DETERMINISTIC',
+    details?: Readonly<Record<string, string>>,
+  ) {
+    super(DOMAIN_ERROR_CODES.EXTERNAL_RAIL, message, details, cause)
+    this.kind = kind
   }
 }
 

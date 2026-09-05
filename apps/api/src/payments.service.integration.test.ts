@@ -36,6 +36,29 @@ function railThatFails(): PaymentRail {
   }
 }
 
+function railThatHasAmbiguousExecution(): PaymentRail {
+  return {
+    ...railThatConfirms(),
+    prepare: async () => ({
+      rail: 'SOLANA_SPL',
+      payloadSafe: '{"kind":"prepared"}',
+      durableExecution: {
+        serializedTransactionBase64: 'signed-bytes',
+        expectedTransactionId: 'transaction-signature',
+        blockhash: 'blockhash',
+        lastValidBlockHeight: 100n,
+      },
+    }),
+    execute: async () => {
+      throw new ExternalRailError(
+        'transaction outcome is unknown',
+        undefined,
+        'AMBIGUOUS',
+      )
+    },
+  }
+}
+
 describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
   'PaymentService with PostgreSQL',
   () => {
@@ -142,6 +165,62 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           'retry-after-failure-key',
         )
         expect(successful.payment.status).toBe('CONFIRMED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('keeps an ambiguous execution in reconciliation with its reservation active', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'ambiguous recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+
+      try {
+        const service = new PaymentService(
+          database,
+          { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+          [railThatHasAmbiguousExecution()],
+        )
+        await expect(
+          service.createPayment(
+            account,
+            'SEND',
+            { recipientId: recipient.id, amount: '2.00', currency: 'USD' },
+            'ambiguous-payment-key',
+          ),
+        ).rejects.toMatchObject({
+          code: 'EXTERNAL_RAIL_FAILURE',
+          kind: 'AMBIGUOUS',
+          details: { payment_id: expect.any(String) },
+        })
+
+        const payment = await database.listPayments(account.account.id)
+        const attempts = await database.listPaymentAttempts(payment[0]?.id ?? '')
+        expect(payment[0]?.status).toBe('RECONCILING')
+        expect(attempts[0]?.status).toBe('RECONCILING')
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(200n)
+
+        const recovered = await service.getPayment(
+          account.account.id,
+          payment[0]?.id ?? '',
+        )
+        expect(recovered.status).toBe('CONFIRMED')
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(0n)
       } finally {
         await database.disconnect()
       }

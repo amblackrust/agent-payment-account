@@ -21,6 +21,7 @@ enum PaymentStatus {
   CREATED
   ROUTING
   SUBMITTED
+  RECONCILING
   CONFIRMED
   FAILED
 }
@@ -29,6 +30,7 @@ enum PaymentAttemptStatus {
   CREATED
   PREPARED
   SUBMITTED
+  RECONCILING
   CONFIRMED
   FAILED
 }
@@ -136,6 +138,11 @@ model PaymentAttempt {
   status                PaymentAttemptStatus @default(CREATED)
   railTransactionId     String?              @map("rail_transaction_id") @db.VarChar(255)
   serializedPayloadSafe String?              @map("serialized_payload_safe") @db.Text
+  signedTransactionBase64 String?            @map("signed_transaction_base64") @db.Text
+  expectedSignature     String?              @map("expected_signature") @db.VarChar(128)
+  blockhash             String?              @db.VarChar(128)
+  lastValidBlockHeight  BigInt?              @map("last_valid_block_height")
+  confirmedSlot         BigInt?              @map("confirmed_slot")
   createdAt             DateTime             @default(now()) @map("created_at")
   updatedAt             DateTime             @updatedAt @map("updated_at")
   payment               Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)

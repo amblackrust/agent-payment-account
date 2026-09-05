@@ -12,7 +12,11 @@ export {
   UnsupportedRailError,
   ValidationError,
 } from './errors.js'
-export type { DomainErrorCode, SerializedDomainError } from './errors.js'
+export type {
+  DomainErrorCode,
+  RailFailureKind,
+  SerializedDomainError,
+} from './errors.js'
 
 export {
   addMoney,
@@ -66,7 +70,9 @@ export type {
   PaymentRail,
   RailExecutionResult,
   RailExecutionStatus,
+  RailDurableExecution,
   RailPaymentRequest,
+  RailPreparationContext,
   RailPreparedPayment,
   RailRecipientDestination,
   RailQuote,

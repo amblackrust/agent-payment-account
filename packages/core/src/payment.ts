@@ -4,6 +4,7 @@ export const PaymentStatus = {
   CREATED: 'CREATED',
   ROUTING: 'ROUTING',
   SUBMITTED: 'SUBMITTED',
+  RECONCILING: 'RECONCILING',
   CONFIRMED: 'CONFIRMED',
   FAILED: 'FAILED',
 } as const
@@ -14,22 +15,32 @@ export type PaymentOperation = 'PAY' | 'SEND' | 'RECEIVE' | 'REFUND'
 export type PaymentKind = Extract<PaymentOperation, 'PAY' | 'SEND'>
 
 export type PaymentAttemptStatus =
-  'CREATED' | 'PREPARED' | 'SUBMITTED' | 'CONFIRMED' | 'FAILED'
+  'CREATED' | 'PREPARED' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
 
 const PAYMENT_ATTEMPT_TRANSITIONS: Readonly<
   Record<PaymentAttemptStatus, readonly PaymentAttemptStatus[]>
 > = {
   CREATED: ['PREPARED', 'FAILED'],
-  PREPARED: ['SUBMITTED', 'FAILED'],
-  SUBMITTED: ['CONFIRMED', 'FAILED'],
+  PREPARED: ['SUBMITTED', 'RECONCILING', 'FAILED'],
+  SUBMITTED: ['CONFIRMED', 'RECONCILING', 'FAILED'],
+  RECONCILING: ['CONFIRMED', 'FAILED'],
   CONFIRMED: [],
   FAILED: [],
 }
 
 const PAYMENT_TRANSITIONS: Readonly<Record<PaymentStatus, readonly PaymentStatus[]>> = {
   [PaymentStatus.CREATED]: [PaymentStatus.ROUTING, PaymentStatus.FAILED],
-  [PaymentStatus.ROUTING]: [PaymentStatus.SUBMITTED, PaymentStatus.FAILED],
-  [PaymentStatus.SUBMITTED]: [PaymentStatus.CONFIRMED, PaymentStatus.FAILED],
+  [PaymentStatus.ROUTING]: [
+    PaymentStatus.SUBMITTED,
+    PaymentStatus.RECONCILING,
+    PaymentStatus.FAILED,
+  ],
+  [PaymentStatus.SUBMITTED]: [
+    PaymentStatus.CONFIRMED,
+    PaymentStatus.RECONCILING,
+    PaymentStatus.FAILED,
+  ],
+  [PaymentStatus.RECONCILING]: [PaymentStatus.CONFIRMED, PaymentStatus.FAILED],
   [PaymentStatus.CONFIRMED]: [],
   [PaymentStatus.FAILED]: [],
 }

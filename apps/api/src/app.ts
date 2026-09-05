@@ -34,6 +34,7 @@ export interface BuildAppOptions {
 
 interface ErrorWithCode {
   readonly code?: string
+  readonly details?: Readonly<Record<string, string>>
   readonly statusCode?: number
   readonly validation?: unknown
 }
@@ -72,11 +73,12 @@ function getErrorStatusCode(error: ErrorWithCode): number {
 
 function getErrorResponse(error: ErrorWithCode & Error, statusCode: number) {
   const isInternal = statusCode >= 500
-  return {
+  const response = {
     statusCode,
     error: error.code ?? 'INTERNAL_ERROR',
     message: isInternal ? 'Internal Server Error' : error.message,
   }
+  return error.details === undefined ? response : { ...response, details: error.details }
 }
 
 export function buildApp(options: BuildAppOptions): FastifyInstance {

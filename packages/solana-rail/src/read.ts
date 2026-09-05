@@ -12,7 +12,7 @@ import {
   type Money,
 } from '@agent-payment/core'
 
-type SolanaRpc = ReturnType<typeof createSolanaRpc>
+export type SolanaRpc = ReturnType<typeof createSolanaRpc>
 
 export const DEFAULT_RPC_TIMEOUT_MS = 5_000
 
@@ -112,7 +112,11 @@ function toExternalRailError(error: unknown): ExternalRailError {
   if (error instanceof ExternalRailError) {
     return error
   }
-  return new ExternalRailError('Solana settlement rail is unavailable')
+  return new ExternalRailError(
+    'Solana settlement rail is unavailable',
+    undefined,
+    'RETRYABLE',
+  )
 }
 
 function identifyCluster(genesisHash: string): SolanaCluster | undefined {
@@ -182,14 +186,20 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
       timeout = setTimeout(() => {
         timedOut = true
         controller.abort()
-        reject(new ExternalRailError('Solana RPC request timed out'))
+        reject(
+          new ExternalRailError('Solana RPC request timed out', undefined, 'RETRYABLE'),
+        )
       }, timeoutMs)
     })
     try {
       return await Promise.race([operation(controller.signal), timeoutPromise])
     } catch (error) {
       if (timedOut || controller.signal.aborted) {
-        throw new ExternalRailError('Solana RPC request timed out')
+        throw new ExternalRailError(
+          'Solana RPC request timed out',
+          undefined,
+          'RETRYABLE',
+        )
       }
       throw toExternalRailError(error)
     } finally {
