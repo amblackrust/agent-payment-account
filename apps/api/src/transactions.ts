@@ -28,7 +28,9 @@ type TransactionStore = PaymentRepository &
 export class TransactionService {
   public constructor(private readonly repository: TransactionStore) {}
 
-  public async listTransactions(accountId: string): Promise<readonly TransactionResponse[]> {
+  public async listTransactions(
+    accountId: string,
+  ): Promise<readonly TransactionResponse[]> {
     const transactions: TransactionResponse[] = []
     let cursor: string | undefined
     do {
@@ -55,11 +57,7 @@ export class TransactionService {
     const recipientIds = payments
       .map((payment) => payment.recipientId)
       .filter((id): id is string => id !== null)
-    const recipients = await findRecipients(
-      this.repository,
-      accountId,
-      recipientIds,
-    )
+    const recipients = await findRecipients(this.repository, accountId, recipientIds)
     const displayNames = new Map(
       recipients.map((recipient) => [recipient.id, recipient.displayName]),
     )
@@ -135,7 +133,10 @@ function encodeCursor(cursor: TransactionCursor): string {
   return Buffer.from(JSON.stringify(cursor)).toString('base64url')
 }
 
-function compareTransactions(left: TransactionResponse, right: TransactionResponse): number {
+function compareTransactions(
+  left: TransactionResponse,
+  right: TransactionResponse,
+): number {
   const created = right.created_at.localeCompare(left.created_at)
   return created === 0 ? right.id.localeCompare(left.id) : created
 }

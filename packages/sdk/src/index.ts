@@ -238,7 +238,9 @@ class HttpResponseExternalServiceError extends ExternalServiceError {
 
 function parseContract<T>(
   value: unknown,
-  schema: { safeParse(input: unknown): { success: true; data: T } | { success: false } },
+  schema: {
+    safeParse(input: unknown): { success: true; data: T } | { success: false }
+  },
   message: string,
 ): T {
   const result = schema.safeParse(value)
@@ -512,10 +514,12 @@ export class AgentPaymentAccount {
     )
   }
 
-  public async listTransactionsPage(input: {
-    readonly limit?: number
-    readonly cursor?: string
-  } = {}): Promise<TransactionPage> {
+  public async listTransactionsPage(
+    input: {
+      readonly limit?: number
+      readonly cursor?: string
+    } = {},
+  ): Promise<TransactionPage> {
     const query = new URLSearchParams()
     if (input.limit !== undefined) query.set('limit', String(input.limit))
     if (input.cursor !== undefined) query.set('cursor', input.cursor)
@@ -666,8 +670,7 @@ function mapHttpError(
   const message = body.message
   const paymentId = body.details?.payment_id?.trim() || undefined
   const isAmbiguousMoneyError =
-    idempotencyKey !== undefined &&
-    (paymentId !== undefined || statusCode >= 500)
+    idempotencyKey !== undefined && (paymentId !== undefined || statusCode >= 500)
   switch (body.error) {
     case 'AUTHENTICATION_ERROR':
       return new AuthenticationError(message)

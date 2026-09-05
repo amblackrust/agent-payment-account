@@ -80,6 +80,7 @@ export class PaymentService {
     kind: PaymentKind,
     input: PaymentRequest,
     idempotencyKey: string,
+    requestId?: string,
   ): Promise<PaymentResult> {
     const money = createPositiveMoney(input.amount, input.currency)
     const normalizedKey = normalizeIdempotencyKey(idempotencyKey)
@@ -159,6 +160,7 @@ export class PaymentService {
       routed.rail,
       routed.request,
       account.account.solanaPublicKey,
+      requestId,
     )
   }
 
@@ -170,6 +172,7 @@ export class PaymentService {
       readonly currency: string
     },
     idempotencyKey: string,
+    requestId?: string,
   ): Promise<PaymentResult> {
     const money = createPositiveMoney(input.amount, input.currency)
     const normalizedKey = normalizeIdempotencyKey(idempotencyKey)
@@ -260,6 +263,7 @@ export class PaymentService {
       rail,
       request,
       account.account.solanaPublicKey,
+      requestId,
     )
   }
 
@@ -616,6 +620,7 @@ export class PaymentService {
     rail: PaymentRail,
     request: RailPaymentRequest,
     payerPublicKey: string,
+    requestId?: string,
   ): Promise<PaymentResult> {
     let attempt: PaymentAttemptRecord | undefined
     let executionCalled = false
@@ -633,7 +638,7 @@ export class PaymentService {
         payment.status,
         'ROUTING',
       )
-      this.logTransition(payment, 'CREATED', 'ROUTING')
+      this.logTransition(payment, 'CREATED', 'ROUTING', undefined, undefined, requestId)
 
       const quote = await rail.quote(request)
       if (
@@ -665,7 +670,12 @@ export class PaymentService {
       executionCalled = true
       const execution = await execute(prepared)
       return {
-        payment: await this.applyExecutionResult(payment, attempt, execution),
+        payment: await this.applyExecutionResult(
+          payment,
+          attempt,
+          execution,
+          requestId,
+        ),
         created: true,
       }
     } catch (error) {
@@ -674,10 +684,10 @@ export class PaymentService {
       }
       if (executionCalled) {
         if (error instanceof ExternalRailError && error.kind === 'DETERMINISTIC') {
-          await this.tryFinalizeFailure(payment, attempt, error)
+          await this.tryFinalizeFailure(payment, attempt, error, requestId)
           throw error
         }
-        await this.tryMarkReconciling(payment, attempt)
+        await this.tryMarkReconciling(payment, attempt, requestId)
         throw new ExternalRailError(
           'Payment execution outcome is ambiguous',
           error,
@@ -685,7 +695,7 @@ export class PaymentService {
           { payment_id: payment.id },
         )
       }
-      await this.tryFinalizeFailure(payment, attempt, error)
+      await this.tryFinalizeFailure(payment, attempt, error, requestId)
       if (error instanceof InsufficientFundsError) {
         throw error
       }
@@ -713,6 +723,7 @@ export class PaymentService {
     payment: PaymentRecord,
     attempt: PaymentAttemptRecord,
     execution: RailExecutionResult,
+    requestId?: string,
   ): Promise<PaymentRecord> {
     if (execution.status === 'CONFIRMED') {
       const finalized = await this.repository.finalizeConfirmedPayment({
@@ -732,6 +743,8 @@ export class PaymentService {
         payment.status,
         'CONFIRMED',
         execution.railTransactionId,
+        undefined,
+        requestId,
       )
       return finalized
     }
@@ -751,6 +764,7 @@ export class PaymentService {
         'FAILED',
         undefined,
         execution.failureCode ?? 'EXTERNAL_RAIL_FAILURE',
+        requestId,
       )
       return failed
     }
@@ -772,6 +786,8 @@ export class PaymentService {
         payment.status,
         'SUBMITTED',
         execution.railTransactionId,
+        undefined,
+        requestId,
       )
       return submitted
     }
@@ -784,7 +800,14 @@ export class PaymentService {
       expectedPaymentStatus: payment.status,
       expectedAttemptStatus: attempt.status,
     })
-    this.logTransition(payment, payment.status, 'RECONCILING')
+    this.logTransition(
+      payment,
+      payment.status,
+      'RECONCILING',
+      undefined,
+      undefined,
+      requestId,
+    )
     return reconciling
   }
 
@@ -794,6 +817,7 @@ export class PaymentService {
     toState: string,
     railTransactionId?: string,
     errorCode?: string,
+    requestId?: string,
   ): void {
     this.eventSink?.info(
       {
@@ -805,6 +829,7 @@ export class PaymentService {
         rail: payment.route,
         ...(railTransactionId === undefined ? {} : { railTransactionId }),
         ...(errorCode === undefined ? {} : { errorCode }),
+        ...(requestId === undefined ? {} : { requestId }),
       },
       'Payment lifecycle transition',
     )
@@ -813,9 +838,15 @@ export class PaymentService {
   private async tryMarkReconciling(
     payment: PaymentRecord,
     attempt: PaymentAttemptRecord,
+    requestId?: string,
   ): Promise<void> {
     try {
-      await this.applyExecutionResult(payment, attempt, { status: 'RECONCILING' })
+      await this.applyExecutionResult(
+        payment,
+        attempt,
+        { status: 'RECONCILING' },
+        requestId,
+      )
     } catch {
       // The original ambiguous error is safer than changing state without a DB commit.
     }
@@ -825,17 +856,27 @@ export class PaymentService {
     payment: PaymentRecord,
     attempt: PaymentAttemptRecord,
     error: unknown,
+    requestId?: string,
   ): Promise<void> {
     try {
+      const failureCode =
+        error instanceof ExternalRailError ? error.code : 'EXTERNAL_RAIL_FAILURE'
       await this.repository.finalizeFailedPayment({
         paymentId: payment.id,
         expectedPaymentStatus: payment.status,
         attemptId: attempt.id,
         expectedAttemptStatus: attempt.status,
-        failureCode:
-          error instanceof ExternalRailError ? error.code : 'EXTERNAL_RAIL_FAILURE',
+        failureCode,
         failureMessageSafe: 'Payment rail execution failed',
       })
+      this.logTransition(
+        payment,
+        payment.status,
+        'FAILED',
+        undefined,
+        failureCode,
+        requestId,
+      )
     } catch {
       // A failed persistence transaction leaves the reservation recoverable.
     }

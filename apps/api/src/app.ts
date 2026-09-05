@@ -447,6 +447,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             'PAY',
             toPaymentRequest(request.body),
             getIdempotencyKey(request),
+            request.id,
           )
           logPaymentResult(
             request,
@@ -489,6 +490,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               currency: request.body.currency,
             },
             getIdempotencyKey(request),
+            request.id,
           )
           logPaymentResult(
             request,
@@ -514,6 +516,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             'SEND',
             toPaymentRequest(request.body),
             getIdempotencyKey(request),
+            request.id,
           )
           logPaymentResult(
             request,

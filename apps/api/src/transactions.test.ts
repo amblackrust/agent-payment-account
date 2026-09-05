@@ -79,8 +79,11 @@ describe('transaction history pagination', () => {
     const repository = {
       listPaymentsPage: async (_accountId: string, limit: number, cursor?: never) =>
         page(payments, limit, cursor),
-      listIncomingPaymentsPage: async (_accountId: string, limit: number, cursor?: never) =>
-        page(incomingPayments, limit, cursor),
+      listIncomingPaymentsPage: async (
+        _accountId: string,
+        limit: number,
+        cursor?: never,
+      ) => page(incomingPayments, limit, cursor),
       findRecipientsForOwner: async () => [],
     }
     const service = new TransactionService(repository as never)

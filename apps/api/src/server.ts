@@ -113,10 +113,7 @@ async function startServer(): Promise<void> {
     clearInterval(reconciliationTimer)
     incomingReconciliation.stop()
     outgoingReconciliation.stop()
-    await Promise.all([
-      incomingReconciliation.drain(),
-      outgoingReconciliation.drain(),
-    ])
+    await Promise.all([incomingReconciliation.drain(), outgoingReconciliation.drain()])
   })
 
   app.addHook('onClose', async () => {
