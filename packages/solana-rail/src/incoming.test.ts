@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { Address } from '@solana/kit'
 import { moneyFromAtomicUnits } from '@agent-payment/core'
 import type { SolanaRpc, SolanaRail } from './read.js'
 import { createSolanaIncomingReader } from './incoming.js'
@@ -10,7 +11,9 @@ const mint = '11111111111111111111111111111111'
 
 function createReader(transaction: unknown) {
   const rpc = {
-    getSignaturesForAddress: () => ({ send: async () => [{ signature: 'sig-1', err: null, blockTime: 1_700_000_000 }] }),
+    getSignaturesForAddress: () => ({
+      send: async () => [{ signature: 'sig-1', err: null, blockTime: 1_700_000_000 }],
+    }),
     getTransaction: () => ({ send: async () => transaction }),
   } as unknown as SolanaRpc
   const rail: SolanaRail = {
@@ -41,18 +44,41 @@ describe('Solana incoming transfer reader', () => {
       meta: {
         err: null,
         preTokenBalances: [
-          { accountIndex: 2, mint, owner: sourceToken, uiTokenAmount: { amount: '5000000' } },
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '5000000' },
+          },
           { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } },
         ],
         postTokenBalances: [
-          { accountIndex: 2, mint, owner: sourceToken, uiTokenAmount: { amount: '3000000' } },
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '3000000' },
+          },
           { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '2000000' } },
         ],
       },
       transaction: {
         message: {
           accountKeys: ['11111111111111111111111111111111', tokenAccount, sourceToken],
-          instructions: [{ program: 'spl-memo', parsed: 'recv_reference' }],
+          instructions: [
+            {
+              program: 'spl-token',
+              parsed: {
+                type: 'transferChecked',
+                info: {
+                  source: sourceToken,
+                  destination: tokenAccount,
+                  tokenAmount: { amount: '2000000' },
+                },
+              },
+            },
+            { program: 'spl-memo', parsed: 'recv_reference' },
+          ],
         },
       },
     })
@@ -72,11 +98,315 @@ describe('Solana incoming transfer reader', () => {
       blockTime: null,
       meta: {
         err: null,
-        preTokenBalances: [{ accountIndex: 1, mint: 'So11111111111111111111111111111111111111112', owner, uiTokenAmount: { amount: '0' } }],
-        postTokenBalances: [{ accountIndex: 1, mint: 'So11111111111111111111111111111111111111112', owner, uiTokenAmount: { amount: '1000000' } }],
+        preTokenBalances: [
+          {
+            accountIndex: 1,
+            mint: 'So11111111111111111111111111111111111111112',
+            owner,
+            uiTokenAmount: { amount: '0' },
+          },
+        ],
+        postTokenBalances: [
+          {
+            accountIndex: 1,
+            mint: 'So11111111111111111111111111111111111111112',
+            owner,
+            uiTokenAmount: { amount: '1000000' },
+          },
+        ],
       },
       transaction: { message: { accountKeys: [tokenAccount] } },
     })
     await expect(reader.scan(owner)).resolves.toEqual([])
+  })
+
+  it('paginates beyond 1000 signatures and returns a high-water checkpoint', async () => {
+    const firstPage = Array.from({ length: 1000 }, (_, index) => ({
+      signature: `sig-${index}`,
+      err: null,
+      blockTime: null,
+    }))
+    const secondPage = [
+      { signature: 'incoming-after-backlog', err: null, blockTime: null },
+    ]
+    const validTransaction = {
+      blockTime: null,
+      meta: {
+        err: null,
+        preTokenBalances: [
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '5000000' },
+          },
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } },
+        ],
+        postTokenBalances: [
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '3000000' },
+          },
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '2000000' } },
+        ],
+      },
+      transaction: {
+        message: {
+          accountKeys: [owner, tokenAccount, sourceToken],
+          instructions: [
+            {
+              program: 'spl-token',
+              parsed: {
+                type: 'transfer',
+                info: {
+                  source: sourceToken,
+                  destination: tokenAccount,
+                  amount: '2000000',
+                },
+              },
+            },
+          ],
+        },
+      },
+    }
+    let pageCalls = 0
+    const rpc = {
+      getSignaturesForAddress: (_account: Address, config: { before?: string }) => ({
+        send: async () => {
+          pageCalls += 1
+          return config.before === undefined ? firstPage : secondPage
+        },
+      }),
+      getTransaction: (signature: string) => ({
+        send: async () =>
+          signature === 'incoming-after-backlog' ? validTransaction : null,
+      }),
+    } as unknown as SolanaRpc
+    const rail: SolanaRail = {
+      getReceiveDestination: async () => ({
+        owner,
+        tokenAccount,
+        settlementMint: mint,
+      }),
+      getSettlementBalance: async () => ({
+        currency: 'USD',
+        settled: moneyFromAtomicUnits(0n),
+        tokenAtomicUnits: 0n,
+        tokenDecimals: 6,
+        ata: tokenAccount,
+        ataStatus: 'PRESENT',
+      }),
+    }
+    const reader = createSolanaIncomingReader({
+      rpc,
+      readRail: rail,
+      rpcUrl: 'http://localhost:8899',
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+
+    const result = await reader.scanWithCursor!(owner, 'old-checkpoint')
+
+    expect(pageCalls).toBe(2)
+    expect(result.nextCursor).toBe('sig-0')
+    expect(result.transfers).toHaveLength(1)
+  })
+
+  it('stops at a checkpoint found on a later page and does not re-read irrelevant history', async () => {
+    const firstPage = Array.from({ length: 1000 }, (_, index) => ({
+      signature: `sig-${index}`,
+      err: null,
+      blockTime: null,
+    }))
+    const secondPage = [
+      { signature: 'newest-on-page-two', err: null, blockTime: null },
+      { signature: 'persisted-checkpoint', err: null, blockTime: null },
+      { signature: 'older', err: null, blockTime: null },
+    ]
+    let pageCalls = 0
+    const rpc = {
+      getSignaturesForAddress: (_account: Address, config: { before?: string }) => ({
+        send: async () => {
+          pageCalls += 1
+          return config.before === undefined ? firstPage : secondPage
+        },
+      }),
+      getTransaction: () => ({ send: async () => null }),
+    } as unknown as SolanaRpc
+    const rail: SolanaRail = {
+      getReceiveDestination: async () => ({
+        owner,
+        tokenAccount,
+        settlementMint: mint,
+      }),
+      getSettlementBalance: async () => ({
+        currency: 'USD',
+        settled: moneyFromAtomicUnits(0n),
+        tokenAtomicUnits: 0n,
+        tokenDecimals: 6,
+        ata: tokenAccount,
+        ataStatus: 'PRESENT',
+      }),
+    }
+    const reader = createSolanaIncomingReader({
+      rpc,
+      readRail: rail,
+      rpcUrl: 'http://localhost:8899',
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+
+    const result = await reader.scanWithCursor!(owner, 'persisted-checkpoint')
+
+    expect(pageCalls).toBe(2)
+    expect(result.nextCursor).toBe('sig-0')
+    expect(result.transfers).toEqual([])
+  })
+
+  it('does not classify self-transfer or mintTo balance changes as incoming', async () => {
+    const rpc = {
+      getSignaturesForAddress: () => ({
+        send: async () => [
+          { signature: 'self', err: null, blockTime: null },
+          { signature: 'mint', err: null, blockTime: null },
+        ],
+      }),
+      getTransaction: (signature: string) => ({
+        send: async () => ({
+          blockTime: null,
+          meta: {
+            err: null,
+            preTokenBalances:
+              signature === 'self'
+                ? [
+                    {
+                      accountIndex: 2,
+                      mint,
+                      owner,
+                      uiTokenAmount: { amount: '5000000' },
+                    },
+                    { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } },
+                  ]
+                : [{ accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } }],
+            postTokenBalances:
+              signature === 'self'
+                ? [
+                    {
+                      accountIndex: 2,
+                      mint,
+                      owner,
+                      uiTokenAmount: { amount: '3000000' },
+                    },
+                    {
+                      accountIndex: 1,
+                      mint,
+                      owner,
+                      uiTokenAmount: { amount: '2000000' },
+                    },
+                  ]
+                : [
+                    {
+                      accountIndex: 1,
+                      mint,
+                      owner,
+                      uiTokenAmount: { amount: '2000000' },
+                    },
+                  ],
+          },
+          transaction: {
+            message: {
+              accountKeys: [owner, tokenAccount, sourceToken],
+              instructions:
+                signature === 'self'
+                  ? [
+                      {
+                        program: 'spl-token',
+                        parsed: {
+                          type: 'transfer',
+                          info: {
+                            source: sourceToken,
+                            destination: tokenAccount,
+                            amount: '2000000',
+                          },
+                        },
+                      },
+                    ]
+                  : [
+                      {
+                        program: 'spl-token',
+                        parsed: { type: 'mintTo', info: { account: tokenAccount } },
+                      },
+                    ],
+            },
+          },
+        }),
+      }),
+    } as unknown as SolanaRpc
+    const rail: SolanaRail = {
+      getReceiveDestination: async () => ({
+        owner,
+        tokenAccount,
+        settlementMint: mint,
+      }),
+      getSettlementBalance: async () => ({
+        currency: 'USD',
+        settled: moneyFromAtomicUnits(0n),
+        tokenAtomicUnits: 0n,
+        tokenDecimals: 6,
+        ata: tokenAccount,
+        ataStatus: 'PRESENT',
+      }),
+    }
+    const reader = createSolanaIncomingReader({
+      rpc,
+      readRail: rail,
+      rpcUrl: 'http://localhost:8899',
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+
+    await expect(reader.scan(owner)).resolves.toEqual([])
+  })
+
+  it('bounds signature RPC reads and returns an external rail failure on timeout', async () => {
+    const rpc = {
+      getSignaturesForAddress: () => ({
+        send: () => new Promise<never>(() => undefined),
+      }),
+    } as unknown as SolanaRpc
+    const rail: SolanaRail = {
+      getReceiveDestination: async () => ({
+        owner,
+        tokenAccount,
+        settlementMint: mint,
+      }),
+      getSettlementBalance: async () => ({
+        currency: 'USD',
+        settled: moneyFromAtomicUnits(0n),
+        tokenAtomicUnits: 0n,
+        tokenDecimals: 6,
+        ata: tokenAccount,
+        ataStatus: 'PRESENT',
+      }),
+    }
+    const reader = createSolanaIncomingReader({
+      rpc,
+      readRail: rail,
+      rpcUrl: 'http://localhost:8899',
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+      rpcTimeoutMs: 5,
+    })
+
+    await expect(reader.scan(owner)).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
+      kind: 'RETRYABLE',
+    })
   })
 })

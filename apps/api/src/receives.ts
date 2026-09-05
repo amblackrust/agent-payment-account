@@ -5,10 +5,7 @@ import {
   moneyFromAtomicUnits,
   ValidationError,
 } from '@agent-payment/core'
-import type {
-  ReceiveRepository,
-  ReceiveRequestRecord,
-} from '@agent-payment/db'
+import type { ReceiveRepository, ReceiveRequestRecord } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 
 export interface CreateReceiveRequest {
@@ -22,6 +19,7 @@ export class ReceiveService {
   public constructor(
     private readonly repository: ReceiveRepository,
     private readonly rail: SolanaRail,
+    private readonly now: () => number = Date.now,
   ) {}
 
   public async createReceiveRequest(
@@ -29,16 +27,21 @@ export class ReceiveService {
     owner: string,
     input: CreateReceiveRequest,
   ) {
-    const amount = input.amount === undefined
-      ? undefined
-      : createPositiveMoney(input.amount, input.currency)
+    const amount =
+      input.amount === undefined
+        ? undefined
+        : createPositiveMoney(input.amount, input.currency)
     const id = createReceiveId()
     const reference = input.reference?.trim() || id
     if (reference.length > 255) {
       throw new ValidationError('Receive reference must contain at most 255 characters')
     }
-    const expiresAt = input.expiresAt === undefined ? undefined : new Date(input.expiresAt)
-    if (expiresAt !== undefined && Number.isNaN(expiresAt.getTime())) {
+    const expiresAt =
+      input.expiresAt === undefined ? undefined : new Date(input.expiresAt)
+    if (
+      expiresAt !== undefined &&
+      (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= this.now())
+    ) {
       throw new ValidationError('Receive expiration must be a valid date')
     }
     const destination = await this.rail.getReceiveDestination(owner)
@@ -61,9 +64,10 @@ function serializeReceiveRequest(
   return {
     id: request.id,
     account_id: request.accountId,
-    amount: request.amountAtomic === null
-      ? null
-      : formatMoney(moneyFromAtomicUnits(request.amountAtomic)),
+    amount:
+      request.amountAtomic === null
+        ? null
+        : formatMoney(moneyFromAtomicUnits(request.amountAtomic)),
     currency: request.currency,
     reference: request.reference,
     status: request.status,

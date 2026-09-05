@@ -68,6 +68,7 @@ export interface AccountRepository {
   ) => Promise<AccountCustodyRecord | null>
   markCredentialUsed(credentialId: string): Promise<void>
   revokeCredential(accountId: string, credentialId: string): Promise<boolean>
+  readonly findAccountPublicKey?: (accountId: string) => Promise<string | null>
 }
 
 export interface RecipientDestinationRecord {
@@ -155,7 +156,7 @@ export interface PaymentRecord {
   readonly id: string
   readonly payerAccountId: string
   readonly payerPublicKey: string | null
-  readonly recipientId: string
+  readonly recipientId: string | null
   readonly kind: PaymentKind
   readonly amountAtomic: bigint
   readonly currency: string
@@ -174,6 +175,8 @@ export interface PaymentRecord {
   readonly destinationReference: string | null
   readonly recipientManagedAccountId: string | null
   readonly originalPaymentId: string | null
+  readonly counterpartyAccountId: string | null
+  readonly counterpartyAddress: string | null
 }
 
 export type ReceiveRequestStatus = 'OPEN' | 'PAID' | 'EXPIRED' | 'CANCELLED'
@@ -244,7 +247,10 @@ export interface CreateIncomingPaymentInput {
 
 export interface ReceiveRepository {
   createReceiveRequest(input: CreateReceiveRequestInput): Promise<ReceiveRequestRecord>
-  findReceiveRequestForOwner(accountId: string, id: string): Promise<ReceiveRequestRecord | null>
+  findReceiveRequestForOwner(
+    accountId: string,
+    id: string,
+  ): Promise<ReceiveRequestRecord | null>
   listReceiveRequests(accountId: string): Promise<readonly ReceiveRequestRecord[]>
   matchIncomingPayment(input: {
     readonly incomingPaymentId: string
@@ -252,14 +258,29 @@ export interface ReceiveRepository {
     readonly amountAtomic: bigint
     readonly reference: string | null
   }): Promise<string | null>
+  expireOpenReceiveRequests(accountId: string, now: Date): Promise<void>
 }
 
 export interface IncomingPaymentRepository {
   listActiveAccountSettlements(): Promise<readonly ActiveAccountSettlement[]>
-  getIncomingCursor(accountId: string, rail: string, address: string): Promise<IncomingCursor | null>
-  saveIncomingCursor(input: { readonly accountId: string; readonly rail: string; readonly address: string; readonly cursorSignature: string }): Promise<void>
-  createIncomingPayment(input: CreateIncomingPaymentInput): Promise<{ readonly payment: IncomingPaymentRecord; readonly created: boolean }>
-  findIncomingPaymentForOwner(accountId: string, id: string): Promise<IncomingPaymentRecord | null>
+  getIncomingCursor(
+    accountId: string,
+    rail: string,
+    address: string,
+  ): Promise<IncomingCursor | null>
+  saveIncomingCursor(input: {
+    readonly accountId: string
+    readonly rail: string
+    readonly address: string
+    readonly cursorSignature: string
+  }): Promise<void>
+  createIncomingPayment(
+    input: CreateIncomingPaymentInput,
+  ): Promise<{ readonly payment: IncomingPaymentRecord; readonly created: boolean }>
+  findIncomingPaymentForOwner(
+    accountId: string,
+    id: string,
+  ): Promise<IncomingPaymentRecord | null>
   listIncomingPayments(accountId: string): Promise<readonly IncomingPaymentRecord[]>
 }
 
@@ -300,7 +321,7 @@ export interface CreatePaymentWithReservationInput {
   readonly requestHash: string
   readonly payerAccountId: string
   readonly payerPublicKey?: string
-  readonly recipientId: string
+  readonly recipientId: string | null
   readonly amountAtomic: bigint
   readonly currency: string
   readonly description?: string
@@ -311,6 +332,8 @@ export interface CreatePaymentWithReservationInput {
   readonly destinationReference?: string
   readonly recipientManagedAccountId?: string
   readonly originalPaymentId?: string
+  readonly counterpartyAccountId?: string
+  readonly counterpartyAddress?: string
   readonly settledAtomic: bigint
 }
 
@@ -397,8 +420,13 @@ export interface PaymentRepository {
     paymentId: string,
   ): Promise<PaymentRecord | null>
   listPayments(ownerAccountId: string): Promise<readonly PaymentRecord[]>
-  findPaymentForRefund(accountId: string, paymentId: string): Promise<PaymentRecord | null>
-  createRefundWithReservation(input: CreateRefundWithReservationInput): Promise<CreatePaymentWithReservationResult>
+  findPaymentForRefund(
+    accountId: string,
+    paymentId: string,
+  ): Promise<PaymentRecord | null>
+  createRefundWithReservation(
+    input: CreateRefundWithReservationInput,
+  ): Promise<CreatePaymentWithReservationResult>
 }
 
 export interface CreateRefundWithReservationInput extends CreatePaymentWithReservationInput {
@@ -415,6 +443,7 @@ export interface DatabaseClient
     ReceiveRepository,
     IncomingPaymentRepository {
   findAccountCustody(accountId: string): Promise<AccountCustodyRecord | null>
+  findAccountPublicKey(accountId: string): Promise<string | null>
   checkReadiness(): Promise<void>
   disconnect(): Promise<void>
 }
@@ -515,6 +544,13 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         data: { revokedAt: new Date() },
       })
       return result.count === 1
+    },
+    async findAccountPublicKey(accountId): Promise<string | null> {
+      const account = await prisma.agentAccount.findFirst({
+        where: { id: accountId, status: 'ACTIVE' },
+        select: { solanaPublicKey: true },
+      })
+      return account?.solanaPublicKey ?? null
     },
     async createRecipient(input): Promise<RecipientRecord> {
       const recipient = await prisma.recipient.create({
@@ -677,6 +713,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ...(input.originalPaymentId === undefined
               ? {}
               : { originalPaymentId: input.originalPaymentId }),
+            ...(input.counterpartyAccountId === undefined
+              ? {}
+              : { counterpartyAccountId: input.counterpartyAccountId }),
+            ...(input.counterpartyAddress === undefined
+              ? {}
+              : { counterpartyAddress: input.counterpartyAddress }),
           },
         })
         await transaction.outgoingReservation.create({
@@ -701,7 +743,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         return { payment: toPaymentRecord(payment), created: true }
       })
     },
-    async createRefundWithReservation(input): Promise<CreatePaymentWithReservationResult> {
+    async createRefundWithReservation(
+      input,
+    ): Promise<CreatePaymentWithReservationResult> {
       return prisma.$transaction(async (transaction) => {
         await transaction.$queryRaw`
           SELECT id FROM "payments" WHERE id = ${input.originalPaymentId} FOR UPDATE
@@ -720,7 +764,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         })
         if (existingIdempotency !== null) {
           if (existingIdempotency.requestHash !== input.requestHash) {
-            throw new ConflictError('Idempotency key was already used for another request')
+            throw new ConflictError(
+              'Idempotency key was already used for another request',
+            )
           }
           return {
             payment: toPaymentRecord(
@@ -738,7 +784,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           original.status !== 'CONFIRMED' ||
           original.recipientManagedAccountId !== input.refundInitiatorAccountId
         ) {
-          throw new RecipientResolutionError('Original payment is not refundable by this account')
+          throw new RecipientResolutionError(
+            'Original payment is not refundable by this account',
+          )
         }
         const refunds = await transaction.payment.aggregate({
           where: {
@@ -753,31 +801,49 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           _sum: { amountAtomic: true },
         })
         const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
-        if (input.amountAtomic > input.settledAtomic - reservedAtomic) {
-          throw new InsufficientFundsError()
-        }
         if (input.amountAtomic > original.amountAtomic - refundedAtomic) {
           throw new ConflictError('Refund amount exceeds the original payment amount')
+        }
+        if (input.amountAtomic > input.settledAtomic - reservedAtomic) {
+          throw new InsufficientFundsError()
         }
         const payment = await transaction.payment.create({
           data: {
             id: input.paymentId,
             payerAccountId: input.payerAccountId,
-            ...(input.payerPublicKey === undefined ? {} : { payerPublicKey: input.payerPublicKey }),
-            recipientId: input.recipientId,
+            ...(input.payerPublicKey === undefined
+              ? {}
+              : { payerPublicKey: input.payerPublicKey }),
+            recipientId: null,
             kind: 'REFUND',
             amountAtomic: input.amountAtomic,
             currency: input.currency,
             route: input.route,
-            ...(input.description === undefined ? {} : { description: input.description }),
-            ...(input.externalReference === undefined ? {} : { externalReference: input.externalReference }),
-            ...(input.destinationRail === undefined ? {} : { destinationRail: input.destinationRail }),
-            ...(input.destinationType === undefined ? {} : { destinationType: input.destinationType }),
-            ...(input.destinationReference === undefined ? {} : { destinationReference: input.destinationReference }),
+            ...(input.description === undefined
+              ? {}
+              : { description: input.description }),
+            ...(input.externalReference === undefined
+              ? {}
+              : { externalReference: input.externalReference }),
+            ...(input.destinationRail === undefined
+              ? {}
+              : { destinationRail: input.destinationRail }),
+            ...(input.destinationType === undefined
+              ? {}
+              : { destinationType: input.destinationType }),
+            ...(input.destinationReference === undefined
+              ? {}
+              : { destinationReference: input.destinationReference }),
             ...(input.recipientManagedAccountId === undefined
               ? {}
               : { recipientManagedAccountId: input.recipientManagedAccountId }),
             originalPaymentId: input.originalPaymentId,
+            ...(input.counterpartyAccountId === undefined
+              ? {}
+              : { counterpartyAccountId: input.counterpartyAccountId }),
+            ...(input.counterpartyAddress === undefined
+              ? {}
+              : { counterpartyAddress: input.counterpartyAddress }),
           },
         })
         await transaction.outgoingReservation.create({
@@ -1200,7 +1266,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         data: {
           id: input.id,
           accountId: input.accountId,
-          ...(input.amountAtomic === undefined ? {} : { amountAtomic: input.amountAtomic }),
+          ...(input.amountAtomic === undefined
+            ? {}
+            : { amountAtomic: input.amountAtomic }),
           currency: input.currency,
           reference: input.reference,
           ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
@@ -1209,7 +1277,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       return toReceiveRequestRecord(request)
     },
     async findReceiveRequestForOwner(accountId, id) {
-      const request = await prisma.receiveRequest.findFirst({ where: { id, accountId } })
+      const request = await prisma.receiveRequest.findFirst({
+        where: { id, accountId },
+      })
       return request === null ? null : toReceiveRequestRecord(request)
     },
     async listReceiveRequests(accountId) {
@@ -1219,11 +1289,25 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
       return requests.map(toReceiveRequestRecord)
     },
+    async expireOpenReceiveRequests(accountId, now) {
+      await prisma.receiveRequest.updateMany({
+        where: { accountId, status: 'OPEN', expiresAt: { lte: now } },
+        data: { status: 'EXPIRED' },
+      })
+    },
     async matchIncomingPayment(input): Promise<string | null> {
       return prisma.$transaction(async (transaction) => {
         if (input.reference === null) {
           return null
         }
+        await transaction.receiveRequest.updateMany({
+          where: {
+            accountId: input.accountId,
+            status: 'OPEN',
+            expiresAt: { lte: new Date() },
+          },
+          data: { status: 'EXPIRED' },
+        })
         const request = await transaction.receiveRequest.findFirst({
           where: {
             accountId: input.accountId,
@@ -1239,7 +1323,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         }
         const result = await transaction.receiveRequest.updateMany({
           where: { id: request.id, status: 'OPEN' },
-          data: { status: 'PAID', paidAt: new Date(), matchedIncomingPaymentId: input.incomingPaymentId },
+          data: {
+            status: 'PAID',
+            paidAt: new Date(),
+            matchedIncomingPaymentId: input.incomingPaymentId,
+          },
         })
         return result.count === 1 ? request.id : null
       })
@@ -1262,7 +1350,13 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     },
     async saveIncomingCursor(input) {
       await prisma.indexerCheckpoint.upsert({
-        where: { accountId_rail_address: { accountId: input.accountId, rail: input.rail, address: input.address } },
+        where: {
+          accountId_rail_address: {
+            accountId: input.accountId,
+            rail: input.rail,
+            address: input.address,
+          },
+        },
         create: { id: `idx_${randomBytes(16).toString('hex')}`, ...input },
         update: { cursorSignature: input.cursorSignature },
       })
@@ -1270,7 +1364,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     async createIncomingPayment(input) {
       return prisma.$transaction(async (transaction) => {
         const existing = await transaction.incomingPayment.findUnique({
-          where: { accountId_signature: { accountId: input.accountId, signature: input.signature } },
+          where: {
+            accountId_signature: {
+              accountId: input.accountId,
+              signature: input.signature,
+            },
+          },
         })
         if (existing !== null) {
           return { payment: toIncomingPaymentRecord(existing), created: false }
@@ -1282,27 +1381,46 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             signature: input.signature,
             amountAtomic: input.amountAtomic,
             currency: input.currency,
-            ...(input.sourceAddress === undefined ? {} : { sourceAddress: input.sourceAddress }),
+            ...(input.sourceAddress === undefined
+              ? {}
+              : { sourceAddress: input.sourceAddress }),
             ...(input.reference === undefined ? {} : { reference: input.reference }),
             tokenAccount: input.tokenAccount,
             settlementMint: input.settlementMint,
             confirmedAt: input.confirmedAt,
           },
         })
-        const request = input.reference === undefined ? null : await transaction.receiveRequest.findFirst({
+        await transaction.receiveRequest.updateMany({
           where: {
             accountId: input.accountId,
-            reference: input.reference,
             status: 'OPEN',
-            AND: [{ OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] }],
-            OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
+            expiresAt: { lte: input.confirmedAt },
           },
-          orderBy: { createdAt: 'asc' },
+          data: { status: 'EXPIRED' },
         })
+        const request =
+          input.reference === undefined
+            ? null
+            : await transaction.receiveRequest.findFirst({
+                where: {
+                  accountId: input.accountId,
+                  reference: input.reference,
+                  status: 'OPEN',
+                  AND: [
+                    { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+                  ],
+                  OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
+                },
+                orderBy: { createdAt: 'asc' },
+              })
         if (request !== null) {
           await transaction.receiveRequest.update({
             where: { id: request.id },
-            data: { status: 'PAID', paidAt: input.confirmedAt, matchedIncomingPaymentId: incoming.id },
+            data: {
+              status: 'PAID',
+              paidAt: input.confirmedAt,
+              matchedIncomingPaymentId: incoming.id,
+            },
           })
           await transaction.incomingPayment.update({
             where: { id: incoming.id },
@@ -1310,17 +1428,26 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           })
         }
         return {
-          payment: toIncomingPaymentRecord(await transaction.incomingPayment.findUniqueOrThrow({ where: { id: incoming.id } })),
+          payment: toIncomingPaymentRecord(
+            await transaction.incomingPayment.findUniqueOrThrow({
+              where: { id: incoming.id },
+            }),
+          ),
           created: true,
         }
       })
     },
     async findIncomingPaymentForOwner(accountId, id) {
-      const payment = await prisma.incomingPayment.findFirst({ where: { id, accountId } })
+      const payment = await prisma.incomingPayment.findFirst({
+        where: { id, accountId },
+      })
       return payment === null ? null : toIncomingPaymentRecord(payment)
     },
     async listIncomingPayments(accountId) {
-      const payments = await prisma.incomingPayment.findMany({ where: { accountId }, orderBy: { createdAt: 'desc' } })
+      const payments = await prisma.incomingPayment.findMany({
+        where: { accountId },
+        orderBy: { createdAt: 'desc' },
+      })
       return payments.map(toIncomingPaymentRecord)
     },
     async checkReadiness(): Promise<void> {
@@ -1370,7 +1497,7 @@ function toPaymentRecord(payment: {
   id: string
   payerAccountId: string
   payerPublicKey: string | null
-  recipientId: string
+  recipientId: string | null
   kind: PaymentKind
   amountAtomic: bigint
   currency: string
@@ -1389,6 +1516,8 @@ function toPaymentRecord(payment: {
   destinationReference: string | null
   recipientManagedAccountId: string | null
   originalPaymentId: string | null
+  counterpartyAccountId: string | null
+  counterpartyAddress: string | null
 }): PaymentRecord {
   return payment
 }

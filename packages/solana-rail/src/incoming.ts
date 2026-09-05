@@ -1,8 +1,5 @@
 import { address, type Address } from '@solana/kit'
-import {
-  ExternalRailError,
-  type Money,
-} from '@agent-payment/core'
+import { ExternalRailError, type Money } from '@agent-payment/core'
 import type { SolanaRpc, SolanaRail, SolanaRailOptions } from './read.js'
 
 export interface IncomingTransfer {
@@ -16,7 +13,17 @@ export interface IncomingTransfer {
 }
 
 export interface SolanaIncomingReader {
-  scan(owner: string, cursorSignature?: string | null): Promise<readonly IncomingTransfer[]>
+  scan(
+    owner: string,
+    cursorSignature?: string | null,
+  ): Promise<readonly IncomingTransfer[]>
+  readonly scanWithCursor?: (
+    owner: string,
+    cursorSignature?: string | null,
+  ) => Promise<{
+    readonly transfers: readonly IncomingTransfer[]
+    readonly nextCursor: string | null
+  }>
 }
 
 interface SignatureInfo {
@@ -39,7 +46,7 @@ interface ParsedInstruction {
 }
 
 interface TransactionResponse {
-  readonly blockTime: number | null
+  readonly blockTime: number | bigint | null
   readonly meta: {
     readonly err: unknown
     readonly preTokenBalances?: readonly TokenBalance[]
@@ -56,12 +63,20 @@ interface TransactionResponse {
 interface IndexingRpc {
   getSignaturesForAddress(
     account: Address,
-    config: { readonly limit: number },
-  ): { send(options?: { readonly abortSignal?: AbortSignal }): Promise<readonly SignatureInfo[]> }
+    config: { readonly limit: number; readonly before?: string },
+  ): {
+    send(options?: {
+      readonly abortSignal?: AbortSignal
+    }): Promise<readonly SignatureInfo[]>
+  }
   getTransaction(
     transactionSignature: string,
     config: Readonly<Record<string, unknown>>,
-  ): { send(options?: { readonly abortSignal?: AbortSignal }): Promise<TransactionResponse | null> }
+  ): {
+    send(options?: {
+      readonly abortSignal?: AbortSignal
+    }): Promise<TransactionResponse | null>
+  }
 }
 
 const MEMO_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
@@ -76,113 +91,275 @@ export function createSolanaIncomingReader(
 ): SolanaIncomingReader {
   const rpc = options.rpc as unknown as IndexingRpc
   const settlementMint = options.settlementMint
+  const timeoutMs = options.rpcTimeoutMs ?? 5_000
+
+  async function withRpcTimeout<T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController()
+    let timer: NodeJS.Timeout | undefined
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort()
+        reject(
+          new ExternalRailError(
+            'Incoming Solana RPC request timed out',
+            undefined,
+            'RETRYABLE',
+          ),
+        )
+      }, timeoutMs)
+    })
+    try {
+      return await Promise.race([operation(controller.signal), timeout])
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new ExternalRailError(
+          'Incoming Solana RPC request timed out',
+          undefined,
+          'RETRYABLE',
+        )
+      }
+      throw new ExternalRailError(
+        'Incoming Solana reconciliation is unavailable',
+        error,
+        'RETRYABLE',
+      )
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
 
   return {
     async scan(owner, cursorSignature = null) {
+      return (await this.scanWithCursor!(owner, cursorSignature)).transfers
+    },
+    async scanWithCursor(owner, cursorSignature = null) {
       const destination = await options.readRail.getReceiveDestination(owner)
-      const tokenDecimals = (await options.readRail.getSettlementBalance(owner)).tokenDecimals
-      let signatures: readonly SignatureInfo[]
-      try {
-        signatures = await rpc
-          .getSignaturesForAddress(address(destination.tokenAccount), { limit: 1000 })
-          .send()
-      } catch (error) {
-        throw new ExternalRailError('Incoming Solana reconciliation is unavailable', error, 'RETRYABLE')
-      }
+      const tokenDecimals = (await options.readRail.getSettlementBalance(owner))
+        .tokenDecimals
+      const history = await collectHistory(
+        rpc,
+        address(destination.tokenAccount),
+        cursorSignature,
+        withRpcTimeout,
+      )
       const transfers: IncomingTransfer[] = []
-      for (const item of signatures) {
-        if (item.err !== null || item.signature === cursorSignature) {
+      for (const item of [...history.signatures].reverse()) {
+        if (item.err !== null) {
           continue
         }
-        const transaction = await fetchTransaction(rpc, item.signature)
-        if (transaction === null || transaction.meta === null || transaction.meta.err !== null) {
+        const transaction = await fetchTransaction(rpc, item.signature, withRpcTimeout)
+        if (
+          transaction === null ||
+          transaction.meta === null ||
+          transaction.meta.err !== null
+        ) {
           continue
         }
-        const delta = getIncomingDelta(transaction, owner, destination.tokenAccount, settlementMint)
-        if (delta <= 0n) {
+        const transfer = getExternalIncomingTransfer(
+          transaction,
+          owner,
+          destination.tokenAccount,
+          settlementMint,
+        )
+        if (transfer === undefined || transfer.amount <= 0n) {
           continue
         }
-        const amount = tokenAmountToUsd(delta, tokenDecimals)
+        const amount = tokenAmountToUsd(transfer.amount, tokenDecimals)
         if (amount.atomicUnits <= 0n) {
           continue
         }
         transfers.push({
           signature: item.signature,
           amount,
-          sourceAddress: getSourceAddress(transaction, owner, destination.tokenAccount, settlementMint),
+          sourceAddress: transfer.sourceAddress,
           reference: getMemo(transaction),
           tokenAccount: destination.tokenAccount,
           settlementMint,
-          confirmedAt: transaction.blockTime === null
-            ? new Date()
-            : new Date(Number(transaction.blockTime) * 1000),
+          confirmedAt:
+            transaction.blockTime === null
+              ? new Date()
+              : new Date(Number(transaction.blockTime) * 1000),
         })
       }
-      return transfers
+      return { transfers, nextCursor: history.nextCursor }
     },
   }
 }
 
-async function fetchTransaction(rpc: IndexingRpc, signature: string): Promise<TransactionResponse | null> {
-  try {
-    return await rpc.getTransaction(signature, {
-      encoding: 'jsonParsed',
-      commitment: 'confirmed',
-      maxSupportedTransactionVersion: 0,
-    }).send()
-  } catch (error) {
-    throw new ExternalRailError('Incoming Solana reconciliation is unavailable', error, 'RETRYABLE')
+async function fetchTransaction(
+  rpc: IndexingRpc,
+  transactionSignature: string,
+  withRpcTimeout: <T>(operation: (signal: AbortSignal) => Promise<T>) => Promise<T>,
+): Promise<TransactionResponse | null> {
+  return withRpcTimeout((abortSignal) =>
+    rpc
+      .getTransaction(transactionSignature, {
+        encoding: 'jsonParsed',
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+      })
+      .send({ abortSignal }),
+  )
+}
+
+async function collectHistory(
+  rpc: IndexingRpc,
+  account: Address,
+  cursorSignature: string | null,
+  withRpcTimeout: <T>(operation: (signal: AbortSignal) => Promise<T>) => Promise<T>,
+): Promise<{
+  readonly signatures: readonly SignatureInfo[]
+  readonly nextCursor: string | null
+}> {
+  const signatures: SignatureInfo[] = []
+  let before: string | undefined
+  let firstSignature: string | undefined
+  while (true) {
+    const page = await withRpcTimeout((abortSignal) =>
+      rpc
+        .getSignaturesForAddress(account, {
+          limit: 1000,
+          ...(before === undefined ? {} : { before }),
+        })
+        .send({ abortSignal }),
+    )
+    if (page.length === 0) break
+    firstSignature ??= page[0]?.signature
+    let reachedCursor = false
+    for (const item of page) {
+      if (cursorSignature !== null && item.signature === cursorSignature) {
+        reachedCursor = true
+        break
+      }
+      signatures.push(item)
+    }
+    if (reachedCursor || page.length < 1000) break
+    const last = page.at(-1)
+    if (last === undefined) break
+    before = last.signature
+  }
+  return {
+    signatures,
+    nextCursor: firstSignature ?? cursorSignature,
   }
 }
 
-function getIncomingDelta(
+function getExternalIncomingTransfer(
   transaction: TransactionResponse,
   owner: string,
   tokenAccount: string,
   mint: string,
-): bigint {
+): { readonly amount: bigint; readonly sourceAddress: string | undefined } | undefined {
   const before = new Map<number, bigint>()
+  const preBalances = new Map<number, TokenBalance>()
   for (const balance of transaction.meta?.preTokenBalances ?? []) {
-    if (balance.mint === mint && balance.owner === owner) {
+    if (balance.mint === mint) {
       before.set(balance.accountIndex, BigInt(balance.uiTokenAmount.amount))
+      preBalances.set(balance.accountIndex, balance)
     }
   }
-  let delta = 0n
+  let destinationDelta = 0n
   for (const balance of transaction.meta?.postTokenBalances ?? []) {
-    if (balance.mint !== mint || balance.owner !== owner) {
+    if (
+      balance.mint !== mint ||
+      balance.owner !== owner ||
+      !isDestinationAccount(transaction, balance.accountIndex, tokenAccount)
+    ) {
       continue
     }
     const after = BigInt(balance.uiTokenAmount.amount)
     const change = after - (before.get(balance.accountIndex) ?? 0n)
-    if (change > 0n && isDestinationAccount(transaction, balance.accountIndex, tokenAccount)) {
-      delta += change
+    if (change > 0n) {
+      destinationDelta += change
     }
   }
-  return delta
+  if (destinationDelta <= 0n) return undefined
+  const externalTransfers: {
+    readonly amount: bigint
+    readonly sourceAddress: string
+  }[] = []
+  for (const instruction of transaction.transaction.message.instructions ?? []) {
+    const parsed = getParsedTransfer(instruction)
+    if (parsed === undefined || parsed.destination !== tokenAccount) continue
+    const sourceIndex = findAccountIndex(transaction, parsed.source)
+    if (sourceIndex === undefined) continue
+    const sourceBalance = preBalances.get(sourceIndex)
+    if (sourceBalance?.owner === undefined || sourceBalance.owner === owner) continue
+    const sourceAfter =
+      getBalance(transaction.meta?.postTokenBalances, sourceIndex) ?? 0n
+    const sourceBefore = BigInt(sourceBalance.uiTokenAmount.amount)
+    if (sourceBefore <= sourceAfter || parsed.amount === undefined) continue
+    if (sourceBefore - sourceAfter !== parsed.amount) continue
+    externalTransfers.push({
+      amount: parsed.amount,
+      sourceAddress: sourceBalance.owner,
+    })
+  }
+  const transferredAmount = externalTransfers.reduce(
+    (total, transfer) => total + transfer.amount,
+    0n,
+  )
+  const firstTransfer = externalTransfers[0]
+  return firstTransfer === undefined || transferredAmount !== destinationDelta
+    ? undefined
+    : { amount: transferredAmount, sourceAddress: firstTransfer.sourceAddress }
 }
 
-function getSourceAddress(
+function getParsedTransfer(instruction: ParsedInstruction):
+  | {
+      readonly source: string
+      readonly destination: string
+      readonly amount: bigint | undefined
+    }
+  | undefined {
+  if (
+    instruction.program !== 'spl-token' ||
+    instruction.parsed === null ||
+    typeof instruction.parsed !== 'object'
+  ) {
+    return undefined
+  }
+  const parsed = instruction.parsed as {
+    readonly type?: unknown
+    readonly info?: unknown
+  }
+  if (parsed.type !== 'transfer' && parsed.type !== 'transferChecked') return undefined
+  if (parsed.info === null || typeof parsed.info !== 'object') return undefined
+  const info = parsed.info as {
+    readonly source?: unknown
+    readonly destination?: unknown
+    readonly amount?: unknown
+    readonly tokenAmount?: { readonly amount?: unknown }
+  }
+  const rawAmount = info.amount ?? info.tokenAmount?.amount
+  let amount: bigint | undefined
+  try {
+    amount = rawAmount === undefined ? undefined : BigInt(String(rawAmount))
+  } catch {
+    return undefined
+  }
+  return typeof info.source === 'string' && typeof info.destination === 'string'
+    ? { source: info.source, destination: info.destination, amount }
+    : undefined
+}
+
+function findAccountIndex(
   transaction: TransactionResponse,
-  owner: string,
-  tokenAccount: string,
-  mint: string,
-): string | undefined {
-  const pre = new Map<number, TokenBalance>()
-  for (const balance of transaction.meta?.preTokenBalances ?? []) {
-    if (balance.mint === mint && balance.owner !== owner) {
-      pre.set(balance.accountIndex, balance)
-    }
-  }
-  for (const balance of transaction.meta?.postTokenBalances ?? []) {
-    const previous = pre.get(balance.accountIndex)
-    if (previous === undefined || balance.mint !== mint) {
-      continue
-    }
-    if (BigInt(previous.uiTokenAmount.amount) > BigInt(balance.uiTokenAmount.amount)) {
-      return previous.owner
-    }
-  }
-  return undefined
+  value: string,
+): number | undefined {
+  return transaction.transaction.message.accountKeys?.findIndex(
+    (key) => (typeof key === 'string' ? key : key.pubkey) === value,
+  )
+}
+
+function getBalance(
+  balances: readonly TokenBalance[] | undefined,
+  accountIndex: number,
+): bigint | undefined {
+  const balance = balances?.find((candidate) => candidate.accountIndex === accountIndex)
+  return balance === undefined ? undefined : BigInt(balance.uiTokenAmount.amount)
 }
 
 function isDestinationAccount(
@@ -196,7 +373,10 @@ function isDestinationAccount(
 
 function getMemo(transaction: TransactionResponse): string | undefined {
   for (const instruction of transaction.transaction.message.instructions ?? []) {
-    if (instruction.programId !== MEMO_PROGRAM_ID && instruction.program !== 'spl-memo') {
+    if (
+      instruction.programId !== MEMO_PROGRAM_ID &&
+      instruction.program !== 'spl-memo'
+    ) {
       continue
     }
     if (typeof instruction.parsed === 'string' && instruction.parsed.length <= 255) {
@@ -212,7 +392,15 @@ function getMemo(transaction: TransactionResponse): string | undefined {
 
 function tokenAmountToUsd(tokenAtomicUnits: bigint, decimals: number): Money {
   if (decimals >= 2) {
-    return { currency: 'USD', atomicUnits: (tokenAtomicUnits / 10n ** BigInt(decimals - 2)) as Money['atomicUnits'] }
+    return {
+      currency: 'USD',
+      atomicUnits: (tokenAtomicUnits /
+        10n ** BigInt(decimals - 2)) as Money['atomicUnits'],
+    }
   }
-  return { currency: 'USD', atomicUnits: (tokenAtomicUnits * 10n ** BigInt(2 - decimals)) as Money['atomicUnits'] }
+  return {
+    currency: 'USD',
+    atomicUnits: (tokenAtomicUnits *
+      10n ** BigInt(2 - decimals)) as Money['atomicUnits'],
+  }
 }

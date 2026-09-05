@@ -226,16 +226,122 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           signature: first.payment.signature,
           amountAtomic: first.payment.amountAtomic,
           currency: first.payment.currency,
-          ...(first.payment.sourceAddress === null ? {} : { sourceAddress: first.payment.sourceAddress }),
-          ...(first.payment.reference === null ? {} : { reference: first.payment.reference }),
+          ...(first.payment.sourceAddress === null
+            ? {}
+            : { sourceAddress: first.payment.sourceAddress }),
+          ...(first.payment.reference === null
+            ? {}
+            : { reference: first.payment.reference }),
           tokenAccount: first.payment.tokenAccount,
           settlementMint: first.payment.settlementMint,
           confirmedAt: new Date(),
         })
         expect(first.created).toBe(true)
         expect(duplicate.created).toBe(false)
-        expect((await database.findReceiveRequestForOwner(accountId, receiveId))?.status).toBe('PAID')
-        expect((await database.listIncomingPayments(accountId))).toHaveLength(1)
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
+        ).toBe('PAID')
+        expect(await database.listIncomingPayments(accountId)).toHaveLength(1)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('expires receive requests and keeps late or unmatched incoming payments in history', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
+      const confirmedAt = new Date()
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'receive-expiry-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.createReceiveRequest({
+          id: receiveId,
+          accountId,
+          amountAtomic: 100n,
+          currency: 'USD',
+          reference: 'expired-reference',
+          expiresAt: new Date(confirmedAt.getTime() - 1_000),
+        })
+
+        await database.expireOpenReceiveRequests(accountId, confirmedAt)
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
+        ).toBe('EXPIRED')
+
+        const lateIncoming = await database.createIncomingPayment({
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          accountId,
+          signature: `late-${randomUUID()}`,
+          amountAtomic: 100n,
+          currency: 'USD',
+          sourceAddress: 'external-wallet',
+          reference: 'expired-reference',
+          tokenAccount: 'destination-token-account',
+          settlementMint: 'settlement-mint',
+          confirmedAt,
+        })
+
+        expect(lateIncoming.created).toBe(true)
+        expect(lateIncoming.payment.receiveRequestId).toBeNull()
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
+        ).toBe('EXPIRED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('keeps distinct incoming signatures distinct even when amounts match', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'incoming-dedup-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        const common = {
+          accountId,
+          amountAtomic: 100n,
+          currency: 'USD',
+          tokenAccount: 'destination-token-account',
+          settlementMint: 'settlement-mint',
+          confirmedAt: new Date(),
+        }
+        const first = await database.createIncomingPayment({
+          ...common,
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          signature: `signature-${randomUUID()}`,
+        })
+        const second = await database.createIncomingPayment({
+          ...common,
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          signature: `signature-${randomUUID()}`,
+        })
+
+        expect(first.created).toBe(true)
+        expect(second.created).toBe(true)
+        expect(await database.listIncomingPayments(accountId)).toHaveLength(2)
       } finally {
         await database.disconnect()
       }
