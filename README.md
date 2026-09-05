@@ -1,6 +1,6 @@
-# Agent Payment Account
+# Mux
 
-Agent Payment Account is a developer-facing financial runtime for AI agents.
+Mux is a developer-facing financial runtime for AI agents.
 It gives an application a persistent custodial account, normalized money
 operations, balance reads, receive instructions, transaction history, and a
 TypeScript SDK. The agent works with account, recipient, amount, currency, pay,
