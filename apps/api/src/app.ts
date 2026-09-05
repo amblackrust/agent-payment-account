@@ -83,7 +83,9 @@ function getErrorResponse(error: ErrorWithCode & Error, statusCode: number) {
     error: error.code ?? 'INTERNAL_ERROR',
     message: isInternal ? 'Internal Server Error' : error.message,
   }
-  return error.details === undefined ? response : { ...response, details: error.details }
+  return error.details === undefined
+    ? response
+    : { ...response, details: error.details }
 }
 
 export function buildApp(options: BuildAppOptions): FastifyInstance {
@@ -99,6 +101,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         'headers.x-admin-api-key',
       ],
     },
+  })
+
+  app.addHook('onSend', async (request, reply) => {
+    reply.header('x-request-id', request.id)
   })
 
   app.get(
@@ -197,7 +203,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     )
 
     app.post<{
-      Body: { currency: 'USD'; amount?: string; reference?: string; expires_at?: string }
+      Body: {
+        currency: 'USD'
+        amount?: string
+        reference?: string
+        expires_at?: string
+      }
     }>(
       '/v1/receives',
       {
@@ -230,9 +241,15 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             account.account.solanaPublicKey,
             {
               currency: request.body.currency,
-              ...(request.body.amount === undefined ? {} : { amount: request.body.amount }),
-              ...(request.body.reference === undefined ? {} : { reference: request.body.reference }),
-              ...(request.body.expires_at === undefined ? {} : { expiresAt: request.body.expires_at }),
+              ...(request.body.amount === undefined
+                ? {}
+                : { amount: request.body.amount }),
+              ...(request.body.reference === undefined
+                ? {}
+                : { reference: request.body.reference }),
+              ...(request.body.expires_at === undefined
+                ? {}
+                : { expiresAt: request.body.expires_at }),
             },
           )
         }
@@ -431,6 +448,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             toPaymentRequest(request.body),
             getIdempotencyKey(request),
           )
+          logPaymentResult(
+            request,
+            requireAgentAccount(request).account.id,
+            'PAY',
+            result.payment,
+          )
           return reply
             .code(result.created ? 201 : 200)
             .send(serializePayment(result.payment))
@@ -467,7 +490,15 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             },
             getIdempotencyKey(request),
           )
-          return reply.code(result.created ? 201 : 200).send(serializePayment(result.payment))
+          logPaymentResult(
+            request,
+            requireAgentAccount(request).account.id,
+            'REFUND',
+            result.payment,
+          )
+          return reply
+            .code(result.created ? 201 : 200)
+            .send(serializePayment(result.payment))
         },
       )
 
@@ -483,6 +514,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             'SEND',
             toPaymentRequest(request.body),
             getIdempotencyKey(request),
+          )
+          logPaymentResult(
+            request,
+            requireAgentAccount(request).account.id,
+            'SEND',
+            result.payment,
           )
           return reply
             .code(result.created ? 201 : 200)
@@ -521,7 +558,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       if (options.transactionService !== undefined) {
         app.get(
           '/v1/transactions',
-          { preHandler: async (request) => authenticateAgent(request, accountRepository) },
+          {
+            preHandler: async (request) =>
+              authenticateAgent(request, accountRepository),
+          },
           async (request) => ({
             transactions: await options.transactionService!.listTransactions(
               requireAgentAccount(request).account.id,
@@ -530,11 +570,15 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         )
         app.get<{ Params: { transactionId: string } }>(
           '/v1/transactions/:transactionId',
-          { preHandler: async (request) => authenticateAgent(request, accountRepository) },
-          async (request) => options.transactionService!.getTransaction(
-            requireAgentAccount(request).account.id,
-            request.params.transactionId,
-          ),
+          {
+            preHandler: async (request) =>
+              authenticateAgent(request, accountRepository),
+          },
+          async (request) =>
+            options.transactionService!.getTransaction(
+              requireAgentAccount(request).account.id,
+              request.params.transactionId,
+            ),
         )
       }
     }
@@ -557,19 +601,29 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         },
       },
     },
-    async (_request, reply) => {
+    async (request, reply) => {
       try {
         await options.readinessDependency.checkReadiness()
         return { status: 'ok' }
       } catch {
-        app.log.error('Readiness check failed')
+        request.log.error({ errorCode: 'READINESS_FAILURE' }, 'Readiness check failed')
         return reply.code(503).send({ status: 'not_ready' })
       }
     },
   )
 
-  app.setErrorHandler((error: Error & ErrorWithCode, _request, reply) => {
+  app.setErrorHandler((error: Error & ErrorWithCode, request, reply) => {
     const statusCode = getErrorStatusCode(error)
+    request.log.error(
+      {
+        errorCode: error.code ?? 'INTERNAL_ERROR',
+        statusCode,
+        ...(error.details?.payment_id === undefined
+          ? {}
+          : { paymentId: error.details.payment_id }),
+      },
+      'API request failed',
+    )
     return reply.code(statusCode).send(getErrorResponse(error, statusCode))
   })
 
@@ -610,4 +664,26 @@ function toPaymentRequest(body: PaymentBody) {
       ? {}
       : { externalReference: body.external_reference }),
   }
+}
+
+function logPaymentResult(
+  request: Parameters<typeof authenticateAgent>[0],
+  accountId: string,
+  operation: 'PAY' | 'SEND' | 'REFUND',
+  payment: {
+    readonly id: string
+    readonly status: string
+    readonly route: string | null
+  },
+): void {
+  request.log.info(
+    {
+      paymentId: payment.id,
+      accountId,
+      operation,
+      state: payment.status,
+      rail: payment.route,
+    },
+    'Money operation state observed',
+  )
 }

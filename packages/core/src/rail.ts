@@ -71,8 +71,8 @@ export interface PaymentRail {
     context?: RailPreparationContext,
   ): Promise<RailPreparedPayment>
   /**
-   * Execution is optional while a rail is only registered through its
-   * preparation boundary. Task 04 will provide the Solana implementation.
+   * Execution is optional for a preparation-only rail registration.
+   * A production rail may implement it when its safe execution boundary exists.
    */
   readonly execute?: (prepared: RailPreparedPayment) => Promise<RailExecutionResult>
   readonly recover?: (

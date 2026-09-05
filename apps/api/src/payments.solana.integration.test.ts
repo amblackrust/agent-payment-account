@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import {
+  address,
   createClient,
   generateKeyPairSigner,
   getBase16Decoder,
@@ -210,19 +211,9 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
     it('reconciles a managed recipient and performs a real reverse refund', async () => {
       const client = await createClient().use(surfpool({ surfnet: { offline: true } }))
       const database = createDatabaseClient(databaseUrl as string)
-      const payer = await generateKeyPairSigner(true)
-      const recipient = await generateKeyPairSigner(true)
       const feePayer = await generateKeyPairSigner(true)
       const mint = await generateKeyPairSigner(true)
-      const payerSecret = await exportSecret(payer)
-      const recipientSecret = await exportSecret(recipient)
       const cipher = new WalletSecretCipher(masterKey)
-      const payerEncrypted = cipher.encrypt(payerSecret)
-      const recipientEncrypted = cipher.encrypt(recipientSecret)
-      const payerKey = id('payer-key')
-      const recipientKey = id('recipient-key')
-      const payerId = id('acct')
-      const recipientId = id('acct')
       const receiveReference = id('receive-reference')
       let app: ReturnType<typeof buildApp> | undefined
 
@@ -245,54 +236,6 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
             owner: TOKEN_PROGRAM_ADDRESS,
           })
           .send()
-        await client.cheatcodes
-          .setTokenAccount(payer.address, mint.address, { amount: 2_000_000n })
-          .send()
-
-        await database.createAgentAccount({
-          id: payerId,
-          name: 'surfpool-payer',
-          solanaPublicKey: payer.address,
-          encryptedSolanaSecret: payerEncrypted.ciphertext,
-          encryptionNonce: payerEncrypted.nonce,
-          encryptionAuthTag: payerEncrypted.authTag,
-          credentialId: id('cred'),
-          keyHash: hashApiKey(payerKey),
-          keyPrefix: 'apa_integration',
-        })
-        await database.createAgentAccount({
-          id: recipientId,
-          name: 'surfpool-recipient',
-          solanaPublicKey: recipient.address,
-          encryptedSolanaSecret: recipientEncrypted.ciphertext,
-          encryptionNonce: recipientEncrypted.nonce,
-          encryptionAuthTag: recipientEncrypted.authTag,
-          credentialId: id('cred'),
-          keyHash: hashApiKey(recipientKey),
-          keyPrefix: 'apa_integration',
-        })
-        const payerAccount = await database.findAccountByCredentialHash(
-          hashApiKey(payerKey),
-        )
-        const recipientAccount = await database.findAccountByCredentialHash(
-          hashApiKey(recipientKey),
-        )
-        if (payerAccount === null || recipientAccount === null) {
-          throw new Error('Surfpool accounts were not created')
-        }
-        const recipientRecord = await database.createRecipient({
-          id: id('rcpt'),
-          ownerAccountId: payerId,
-          managedAccountId: recipientId,
-          displayName: 'managed surfpool recipient',
-          type: 'AGENT',
-          destination: {
-            id: id('dest'),
-            rail: 'SOLANA_SPL',
-            type: 'SOLANA_SPL',
-            walletAddress: recipient.address,
-          },
-        })
         const readRail = createSolanaRailWithRpc({
           rpc: client.rpc as never,
           expectedCluster: 'localnet',
@@ -338,22 +281,74 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           throw new Error('Fastify did not expose its listener address')
         }
         const baseUrl = `http://127.0.0.1:${listenerAddress.port}`
+        const payerBootstrap = await createAccountThroughApi(
+          baseUrl,
+          testConfig.adminApiKey,
+          'surfpool-payer',
+        )
+        const recipientBootstrap = await createAccountThroughApi(
+          baseUrl,
+          testConfig.adminApiKey,
+          'surfpool-recipient',
+        )
+        const payerId = payerBootstrap.id
+        const recipientId = recipientBootstrap.id
+        const payerKey = payerBootstrap.api_key
+        const recipientKey = recipientBootstrap.api_key
+        await client.cheatcodes
+          .setTokenAccount(
+            address(payerBootstrap.receive.settlement.owner),
+            mint.address,
+            {
+              amount: 2_000_000n,
+            },
+          )
+          .send()
         const payerSdk = new AgentPaymentAccount({ baseUrl, apiKey: payerKey })
         const recipientSdk = new AgentPaymentAccount({ baseUrl, apiKey: recipientKey })
+        const recipientResponse = await fetch(`${baseUrl}/v1/recipients`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${payerKey}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            display_name: 'managed surfpool recipient',
+            type: 'AGENT',
+            managed_account_id: recipientId,
+            destination: {
+              type: 'SOLANA_SPL',
+              wallet_address: recipientBootstrap.receive.settlement.owner,
+            },
+          }),
+        })
+        expect(recipientResponse.status).toBe(201)
+        const recipientRecord = (await recipientResponse.json()) as { id: string }
         expect((await recipientSdk.getBalance()).settled).toBe('0.00')
         expect((await payerSdk.getBalance()).settled).toBe('2.00')
         const receiveRequest = await recipientSdk.receive({
           amount: '1.25',
           reference: receiveReference,
         })
+        const secondReceiveReference = id('send-reference')
+        const originalIdempotencyKey = id('idem')
         const original = await payerSdk.pay(
           {
             recipientId: recipientRecord.id,
             amount: '1.25',
             externalReference: receiveRequest.reference,
           },
-          id('idem'),
+          originalIdempotencyKey,
         )
+        const secondPayment = await payerSdk.send(
+          {
+            recipientId: recipientRecord.id,
+            amount: '0.25',
+            externalReference: secondReceiveReference,
+          },
+          id('send-idem'),
+        )
+        expect(secondPayment.status).toBe('CONFIRMED')
         expect((await payerSdk.getPayment(original.id)).status).toBe('CONFIRMED')
         const incomingReader = createSolanaIncomingReader({
           rpc: client.rpc as never,
@@ -363,8 +358,13 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           allowMainnet: false,
           settlementMint: mint.address,
         })
+        const secondReceiveRequest = await recipientSdk.receive({
+          amount: '0.25',
+          reference: secondReceiveReference,
+        })
+        expect(secondReceiveRequest.status).toBe('OPEN')
         const [recipientAtaBeforeScan] = await findAssociatedTokenPda({
-          owner: recipient.address,
+          owner: address(recipientBootstrap.receive.settlement.owner),
           tokenProgram: TOKEN_PROGRAM_ADDRESS,
           mint: mint.address,
         })
@@ -391,25 +391,28 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await reconciler.runOnce()
         const incoming = await database.listIncomingPayments(recipientId)
         expect(original.status).toBe('CONFIRMED')
-        expect(incoming).toHaveLength(1)
-        expect(incoming[0]?.amountAtomic).toBe(125n)
+        expect(incoming).toHaveLength(2)
+        const originalIncoming = incoming.find(
+          (payment) => payment.reference === receiveReference,
+        )
+        expect(originalIncoming?.amountAtomic).toBe(125n)
         const matched = await database.findReceiveRequestForOwner(
           recipientId,
-          incoming[0]?.receiveRequestId ?? '',
+          originalIncoming?.receiveRequestId ?? '',
         )
         expect(matched?.status).toBe('PAID')
         const incomingHistory = await recipientSdk.listTransactions()
         expect(incomingHistory).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
-              id: incoming[0]?.id,
+              id: originalIncoming?.id,
               direction: 'INCOMING',
               kind: 'RECEIVE',
               counterparty: {
                 recipientId: null,
                 displayName: null,
                 accountId: null,
-                address: payer.address,
+                address: payerBootstrap.receive.settlement.owner,
               },
             }),
           ]),
@@ -422,7 +425,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           },
         )
         await restartedReconciler.runOnce()
-        expect(await database.listIncomingPayments(recipientId)).toHaveLength(1)
+        expect(await database.listIncomingPayments(recipientId)).toHaveLength(2)
 
         const refund = await recipientSdk.refund(
           { originalPaymentId: original.id, amount: '1.25' },
@@ -430,12 +433,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         )
         expect(refund.status).toBe('CONFIRMED')
         const [payerAta] = await findAssociatedTokenPda({
-          owner: payer.address,
+          owner: address(payerBootstrap.receive.settlement.owner),
           tokenProgram: TOKEN_PROGRAM_ADDRESS,
           mint: mint.address,
         })
         const [recipientAta] = await findAssociatedTokenPda({
-          owner: recipient.address,
+          owner: address(recipientBootstrap.receive.settlement.owner),
           tokenProgram: TOKEN_PROGRAM_ADDRESS,
           mint: mint.address,
         })
@@ -445,12 +448,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           recipientAta,
         )
         expect(payerTokenAfterRefund.exists && payerTokenAfterRefund.data.amount).toBe(
-          2_000_000n,
+          1_750_000n,
         )
         expect(
           recipientTokenAfterRefund.exists && recipientTokenAfterRefund.data.amount,
-        ).toBe(0n)
-        expect(await database.listIncomingPayments(recipientId)).toHaveLength(1)
+        ).toBe(250_000n)
+        expect(await database.listIncomingPayments(recipientId)).toHaveLength(2)
         const recipientHistory = await recipientSdk.listTransactions()
         const refundHistory = recipientHistory.find(
           (transaction) => transaction.id === refund.id,
@@ -460,13 +463,23 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           kind: 'REFUND',
           counterparty: {
             accountId: payerId,
-            address: payer.address,
+            address: payerBootstrap.receive.settlement.owner,
             recipientId: null,
           },
         })
         expect((await recipientSdk.getPayment(refund.id)).status).toBe('CONFIRMED')
-        expect((await payerSdk.getBalance()).settled).toBe('2.00')
-        expect((await recipientSdk.getBalance()).settled).toBe('0.00')
+        expect((await payerSdk.getBalance()).settled).toBe('1.75')
+        expect((await recipientSdk.getBalance()).settled).toBe('0.25')
+        const replay = await payerSdk.pay(
+          {
+            recipientId: recipientRecord.id,
+            amount: '1.25',
+            externalReference: receiveRequest.reference,
+          },
+          originalIdempotencyKey,
+        )
+        expect(replay.id).toBe(original.id)
+        expect(await database.listPayments(payerId)).toHaveLength(2)
         await expect(
           recipientSdk.refund(
             { originalPaymentId: original.id, amount: '0.01' },
@@ -474,8 +487,6 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           ),
         ).rejects.toBeInstanceOf(SdkConflictError)
       } finally {
-        payerSecret.fill(0)
-        recipientSecret.fill(0)
         await app?.close()
         client.surfnet.stop()
         await database.disconnect()
@@ -483,3 +494,34 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
     })
   },
 )
+
+interface AccountBootstrapResponse {
+  readonly id: string
+  readonly api_key: string
+  readonly receive: {
+    readonly settlement: {
+      readonly owner: string
+      readonly token_account: string
+      readonly mint: string
+    }
+  }
+}
+
+async function createAccountThroughApi(
+  baseUrl: string,
+  adminApiKey: string,
+  name: string,
+): Promise<AccountBootstrapResponse> {
+  const response = await fetch(`${baseUrl}/v1/accounts`, {
+    method: 'POST',
+    headers: {
+      'x-admin-api-key': adminApiKey,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ name }),
+  })
+  if (!response.ok) {
+    throw new Error(`Account bootstrap failed with HTTP ${response.status}`)
+  }
+  return (await response.json()) as AccountBootstrapResponse
+}

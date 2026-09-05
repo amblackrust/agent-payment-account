@@ -1,4 +1,13 @@
 # End-to-end tests
 
-System-level tests will be added when the product runtime has account and payment flows.
-Task 01 intentionally contains no money-moving or fake payment endpoint.
+The required product E2E lives with the API and Solana rail integration tests so
+it can share the real PostgreSQL and offline Surfpool setup. Run it with:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/agent_payment_account \
+  pnpm test:solana
+```
+
+The scenario uses the public HTTP API and SDK, real SPL transfers, durable
+reconciliation, and real refund execution. It does not use demo fixtures or a
+fake production rail.

@@ -28,6 +28,7 @@ describe('API foundation', () => {
 
     expect(health.statusCode).toBe(200)
     expect(health.json()).toEqual({ status: 'ok' })
+    expect(health.headers['x-request-id']).toBeTruthy()
     expect(readiness.statusCode).toBe(200)
     expect(readiness.json()).toEqual({ status: 'ok' })
     await app.close()

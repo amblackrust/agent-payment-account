@@ -1,7 +1,11 @@
 import 'dotenv/config'
 
 import { createDatabaseClient } from '@agent-payment/db'
-import { createSolanaIncomingReader, createSolanaPaymentRail, createSolanaRail } from '@agent-payment/solana-rail'
+import {
+  createSolanaIncomingReader,
+  createSolanaPaymentRail,
+  createSolanaRail,
+} from '@agent-payment/solana-rail'
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
 import { ExternalRailError } from '@agent-payment/core'
 
@@ -82,13 +86,40 @@ async function startServer(): Promise<void> {
 
   const reconciliationTimer = setInterval(() => {
     void incomingReconciliation.runOnce().catch((error: unknown) => {
-      app.log.error({ errorCode: error instanceof Error ? error.name : 'UNKNOWN' }, 'Incoming reconciliation loop failed')
+      app.log.error(
+        { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
+        'Incoming reconciliation loop failed',
+      )
     })
   }, 5_000)
   app.addHook('onClose', async () => clearInterval(reconciliationTimer))
 
   app.addHook('onClose', async () => {
     await database.disconnect()
+  })
+
+  let shutdownPromise: Promise<void> | undefined
+  const shutdown = (signal: string): Promise<void> => {
+    if (shutdownPromise !== undefined) return shutdownPromise
+    shutdownPromise = app
+      .close()
+      .then(() => {
+        app.log.info({ signal }, 'API shutdown complete')
+      })
+      .catch((error: unknown) => {
+        app.log.error(
+          { signal, errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
+          'API shutdown failed',
+        )
+        process.exitCode = 1
+      })
+    return shutdownPromise
+  }
+  process.once('SIGTERM', () => {
+    void shutdown('SIGTERM')
+  })
+  process.once('SIGINT', () => {
+    void shutdown('SIGINT')
   })
 
   try {
