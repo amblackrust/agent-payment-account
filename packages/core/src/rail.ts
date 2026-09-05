@@ -48,6 +48,10 @@ export interface PaymentRail {
   canRoute(request: RailPaymentRequest): boolean
   quote(request: RailPaymentRequest): Promise<RailQuote>
   prepare(request: RailPaymentRequest): Promise<RailPreparedPayment>
-  execute(prepared: RailPreparedPayment): Promise<RailExecutionResult>
-  getStatus(railTransactionId: string): Promise<RailStatusResult>
+  /**
+   * Execution is optional while a rail is only registered through its
+   * preparation boundary. Task 04 will provide the Solana implementation.
+   */
+  readonly execute?: (prepared: RailPreparedPayment) => Promise<RailExecutionResult>
+  readonly getStatus?: (railTransactionId: string) => Promise<RailStatusResult>
 }

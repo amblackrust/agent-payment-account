@@ -1,6 +1,11 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { AuthenticationError, formatMoney, ValidationError } from '@agent-payment/core'
-import type { AccountRepository } from '@agent-payment/db'
+import {
+  AuthenticationError,
+  formatMoney,
+  moneyFromAtomicUnits,
+  ValidationError,
+} from '@agent-payment/core'
+import type { AccountRepository, ReservationRepository } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 
 import type { AppConfig } from './config.js'
@@ -24,6 +29,7 @@ export interface BuildAppOptions {
   readonly solanaRail?: SolanaRail
   readonly recipientService?: RecipientService
   readonly paymentService?: PaymentService
+  readonly reservationRepository?: ReservationRepository
 }
 
 interface ErrorWithCode {
@@ -163,11 +169,22 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         const balance = await solanaRail.getSettlementBalance(
           account.account.solanaPublicKey,
         )
+        const pendingAtomic =
+          options.reservationRepository === undefined
+            ? 0n
+            : await options.reservationRepository.getActiveOutgoingReservationAtomic(
+                account.account.id,
+                balance.currency,
+              )
+        const availableAtomic =
+          balance.settled.atomicUnits > pendingAtomic
+            ? balance.settled.atomicUnits - pendingAtomic
+            : 0n
         return {
           currency: balance.currency,
           settled: formatMoney(balance.settled),
-          pending_outgoing: '0.00',
-          available: formatMoney(balance.settled),
+          pending_outgoing: formatMoney(moneyFromAtomicUnits(pendingAtomic)),
+          available: formatMoney(moneyFromAtomicUnits(availableAtomic)),
         }
       },
     )

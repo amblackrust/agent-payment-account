@@ -70,8 +70,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         ).createPayment(account, 'PAY', input, 'payment-key')
         const second = await new PaymentService(
           database,
-          { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
-          [railThatConfirms()],
+          {
+            getSettlementBalance: async () => {
+              throw new Error('balance reader must not be called on replay')
+            },
+          },
+          [],
         ).createPayment(account, 'PAY', { ...input, amount: '1.2' }, 'payment-key')
 
         expect(first.created).toBe(true)
@@ -83,8 +87,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await expect(
           new PaymentService(
             database,
-            { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
-            [railThatConfirms()],
+            {
+              getSettlementBalance: async () => {
+                throw new Error('balance reader must not be called on conflict')
+              },
+            },
+            [],
           ).createPayment(account, 'PAY', { ...input, amount: '1.21' }, 'payment-key'),
         ).rejects.toThrow(ConflictError)
       } finally {
@@ -134,6 +142,123 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           'retry-after-failure-key',
         )
         expect(successful.payment.status).toBe('CONFIRMED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('serializes competing full-balance service requests and does not execute the rejected one', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'concurrency recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+      let executions = 0
+      const submittingRail: PaymentRail = {
+        ...railThatConfirms(),
+        execute: async () => {
+          executions += 1
+          return { status: 'SUBMITTED', railTransactionId: 'submitted-tx' }
+        },
+      }
+      const service = new PaymentService(
+        database,
+        { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+        [submittingRail],
+      )
+
+      try {
+        const results = await Promise.allSettled([
+          service.createPayment(
+            account,
+            'SEND',
+            { recipientId: recipient.id, amount: '10.00', currency: 'USD' },
+            'competing-key-1',
+          ),
+          service.createPayment(
+            account,
+            'SEND',
+            { recipientId: recipient.id, amount: '10.00', currency: 'USD' },
+            'competing-key-2',
+          ),
+        ])
+        const fulfilled = results.filter((result) => result.status === 'fulfilled')
+        const rejected = results.filter((result) => result.status === 'rejected')
+
+        expect(fulfilled).toHaveLength(1)
+        expect(rejected).toHaveLength(1)
+        expect(executions).toBe(1)
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(1000n)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('deduplicates concurrent identical service requests into one logical payment', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'duplicate recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+      let executions = 0
+      const rail: PaymentRail = {
+        ...railThatConfirms(),
+        execute: async () => {
+          executions += 1
+          return { status: 'SUBMITTED', railTransactionId: 'duplicate-tx' }
+        },
+      }
+      const service = new PaymentService(
+        database,
+        { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+        [rail],
+      )
+
+      try {
+        const results = await Promise.all([
+          service.createPayment(
+            account,
+            'PAY',
+            { recipientId: recipient.id, amount: '10.00', currency: 'USD' },
+            'identical-key',
+          ),
+          service.createPayment(
+            account,
+            'PAY',
+            { recipientId: recipient.id, amount: '10.00', currency: 'USD' },
+            'identical-key',
+          ),
+        ])
+
+        expect(results.map((result) => result.payment.id)).toEqual([
+          results[0]?.payment.id,
+          results[0]?.payment.id,
+        ])
+        expect(results.filter((result) => result.created)).toHaveLength(1)
+        expect(executions).toBe(1)
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(1000n)
       } finally {
         await database.disconnect()
       }

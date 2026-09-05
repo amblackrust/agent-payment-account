@@ -1,5 +1,9 @@
 import { PrismaPg } from '@prisma/adapter-pg'
-import { ConflictError, InsufficientFundsError } from '@agent-payment/core'
+import {
+  ConflictError,
+  InsufficientFundsError,
+  RecipientResolutionError,
+} from '@agent-payment/core'
 import { PrismaClient } from './generated/client/client.js'
 
 export type AgentAccountStatus = 'ACTIVE' | 'DISABLED'
@@ -106,6 +110,23 @@ export interface RecipientRepository {
   updateRecipient(input: UpdateRecipientInput): Promise<RecipientRecord | null>
 }
 
+export interface IdempotencyReplay {
+  readonly requestHash: string
+  readonly payment: PaymentRecord
+}
+
+export interface ReservationRepository {
+  findIdempotencyReplay(
+    ownerAccountId: string,
+    operation: PaymentKind,
+    key: string,
+  ): Promise<IdempotencyReplay | null>
+  getActiveOutgoingReservationAtomic(
+    ownerAccountId: string,
+    currency: string,
+  ): Promise<bigint>
+}
+
 export type PaymentKind = 'PAY' | 'SEND'
 export type PaymentStatus = 'CREATED' | 'ROUTING' | 'SUBMITTED' | 'CONFIRMED' | 'FAILED'
 export type PaymentAttemptStatus =
@@ -207,7 +228,11 @@ export interface PaymentRepository {
 }
 
 export interface DatabaseClient
-  extends AccountRepository, RecipientRepository, PaymentRepository {
+  extends
+    AccountRepository,
+    RecipientRepository,
+    PaymentRepository,
+    ReservationRepository {
   checkReadiness(): Promise<void>
   disconnect(): Promise<void>
 }
@@ -328,6 +353,15 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     },
     async updateRecipient(input): Promise<RecipientRecord | null> {
       return prisma.$transaction(async (transaction) => {
+        if (input.destination !== undefined) {
+          const destination = await transaction.recipientDestination.findFirst({
+            where: { id: input.destination.id, recipientId: input.id },
+            select: { id: true },
+          })
+          if (destination === null) {
+            throw new RecipientResolutionError('Recipient destination was not found')
+          }
+        }
         const result = await transaction.recipient.updateMany({
           where: { id: input.id, ownerAccountId: input.ownerAccountId },
           data: {
@@ -350,7 +384,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             },
           })
           if (destinationResult.count !== 1) {
-            return null
+            throw new RecipientResolutionError('Recipient destination was not found')
           }
         }
         const recipient = await transaction.recipient.findFirst({
@@ -439,6 +473,32 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         })
         return { payment: toPaymentRecord(payment), created: true }
       })
+    },
+    async findIdempotencyReplay(
+      ownerAccountId,
+      operation,
+      key,
+    ): Promise<IdempotencyReplay | null> {
+      const record = await prisma.idempotencyRecord.findUnique({
+        where: { ownerAccountId_operation_key: { ownerAccountId, operation, key } },
+      })
+      if (record === null) {
+        return null
+      }
+      const payment = await prisma.payment.findUniqueOrThrow({
+        where: { id: record.resourceId },
+      })
+      return { requestHash: record.requestHash, payment: toPaymentRecord(payment) }
+    },
+    async getActiveOutgoingReservationAtomic(
+      ownerAccountId,
+      currency,
+    ): Promise<bigint> {
+      const result = await prisma.outgoingReservation.aggregate({
+        where: { ownerAccountId, currency, status: 'ACTIVE' },
+        _sum: { amountAtomic: true },
+      })
+      return result._sum.amountAtomic ?? 0n
     },
     async transitionPayment(paymentId, currentStatus, nextStatus, fields) {
       const result = await prisma.payment.updateMany({

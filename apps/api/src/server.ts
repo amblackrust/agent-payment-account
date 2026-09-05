@@ -1,7 +1,10 @@
 import 'dotenv/config'
 
 import { createDatabaseClient } from '@agent-payment/db'
-import { createSolanaRail } from '@agent-payment/solana-rail'
+import {
+  createSolanaPaymentPreparationRail,
+  createSolanaRail,
+} from '@agent-payment/solana-rail'
 
 import { buildApp } from './app.js'
 import { AccountService } from './accounts.js'
@@ -27,7 +30,9 @@ async function startServer(): Promise<void> {
   const recipientService = new RecipientService(database)
   // Task 04 will register the real execution rail. No successful fake rail is
   // registered in production while this execution boundary is still read-only.
-  const paymentService = new PaymentService(database, rail, [])
+  const paymentService = new PaymentService(database, rail, [
+    createSolanaPaymentPreparationRail(),
+  ])
   const app = buildApp({
     config,
     readinessDependency: database,
@@ -36,6 +41,7 @@ async function startServer(): Promise<void> {
     solanaRail: rail,
     recipientService,
     paymentService,
+    reservationRepository: database,
   })
 
   app.addHook('onClose', async () => {

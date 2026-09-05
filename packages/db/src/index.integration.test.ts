@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 
-import { ConflictError } from '@agent-payment/core'
+import { ConflictError, RecipientResolutionError } from '@agent-payment/core'
 import { createDatabaseClient } from './index.js'
 
 const databaseUrl = process.env.DATABASE_URL?.trim()
@@ -124,6 +124,60 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await expect(
           database.createPaymentWithReservation(competingInput),
         ).rejects.toThrow('Insufficient funds')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('rolls back every recipient field when the destination target is invalid', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const recipientId = `rcpt_${randomUUID().replaceAll('-', '')}`
+      const destinationId = `dest_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'recipient-atomic-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.createRecipient({
+          id: recipientId,
+          ownerAccountId: accountId,
+          displayName: 'original name',
+          type: 'BUSINESS',
+          destination: {
+            id: destinationId,
+            rail: 'SOLANA_SPL',
+            type: 'SOLANA_SPL',
+            walletAddress: 'original-wallet',
+          },
+        })
+
+        await expect(
+          database.updateRecipient({
+            id: recipientId,
+            ownerAccountId: accountId,
+            displayName: 'must not persist',
+            destination: {
+              id: `dest_${randomUUID().replaceAll('-', '')}`,
+              rail: 'SOLANA_SPL',
+              type: 'SOLANA_SPL',
+              walletAddress: 'new-wallet',
+            },
+          }),
+        ).rejects.toThrow(RecipientResolutionError)
+
+        const recipient = await database.findRecipientForOwner(accountId, recipientId)
+        expect(recipient?.displayName).toBe('original name')
+        expect(recipient?.destinations[0]?.walletAddress).toBe('original-wallet')
       } finally {
         await database.disconnect()
       }

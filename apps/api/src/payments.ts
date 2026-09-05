@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import {
   assertPaymentAttemptStatusTransition,
   assertPaymentStatusTransition,
+  ConflictError,
   createPaymentAttemptId,
   createPaymentId,
   createPositiveMoney,
@@ -24,6 +25,7 @@ import type {
   PaymentRepository,
   RecipientRecord,
   RecipientRepository,
+  ReservationRepository,
 } from '@agent-payment/db'
 
 export interface SettledBalanceReader {
@@ -43,7 +45,7 @@ export interface PaymentResult {
   readonly created: boolean
 }
 
-type PaymentStore = PaymentRepository & RecipientRepository
+type PaymentStore = PaymentRepository & RecipientRepository & ReservationRepository
 
 export class PaymentService {
   public constructor(
@@ -66,6 +68,27 @@ export class PaymentService {
       'External reference',
       255,
     )
+    const requestHash = hashCanonicalRequest({
+      operation: kind,
+      recipient_id: input.recipientId,
+      amount: formatMoney(money),
+      currency: money.currency,
+      ...(description === undefined ? {} : { description }),
+      ...(externalReference === undefined
+        ? {}
+        : { external_reference: externalReference }),
+    })
+    const replay = await this.repository.findIdempotencyReplay(
+      account.account.id,
+      kind,
+      normalizedKey,
+    )
+    if (replay !== null) {
+      if (replay.requestHash !== requestHash) {
+        throw new ConflictError('Idempotency key was already used for another request')
+      }
+      return { payment: replay.payment, created: false }
+    }
     const recipient = await this.resolveRecipient(account.account.id, input.recipientId)
     const routed = this.routePayment(
       account,
@@ -78,17 +101,6 @@ export class PaymentService {
     const balance = await this.balanceReader.getSettlementBalance(
       account.account.solanaPublicKey,
     )
-    const requestHash = hashCanonicalRequest({
-      operation: kind,
-      recipient_id: recipient.id,
-      amount: formatMoney(money),
-      currency: money.currency,
-      ...(description === undefined ? {} : { description }),
-      ...(externalReference === undefined
-        ? {}
-        : { external_reference: externalReference }),
-    })
-
     const persisted = await this.repository.createPaymentWithReservation({
       paymentId: createPaymentId(),
       reservationId: createPrefixedId('resv'),
@@ -225,14 +237,32 @@ export class PaymentService {
       )
       attemptStatus = 'PREPARED'
 
+      const execute = rail.execute
+      if (execute === undefined) {
+        return {
+          payment: await this.getPayment(payment.payerAccountId, payment.id),
+          created: true,
+        }
+      }
+
+      const execution = await execute(prepared)
+      if (execution.status === 'FAILED') {
+        throw new ExternalRailError('Payment rail reported a failed execution')
+      }
+      assertPaymentAttemptStatusTransition(attemptStatus, 'SUBMITTED')
+      await this.repository.updatePaymentAttempt(
+        attempt.id,
+        attemptStatus,
+        'SUBMITTED',
+        execution.railTransactionId === undefined
+          ? undefined
+          : { railTransactionId: execution.railTransactionId },
+      )
+      attemptStatus = 'SUBMITTED'
       assertPaymentStatusTransition(paymentStatus, 'SUBMITTED')
       await this.repository.transitionPayment(payment.id, paymentStatus, 'SUBMITTED')
       paymentStatus = 'SUBMITTED'
-      assertPaymentAttemptStatusTransition(attemptStatus, 'SUBMITTED')
-      await this.repository.updatePaymentAttempt(attempt.id, attemptStatus, 'SUBMITTED')
-      attemptStatus = 'SUBMITTED'
 
-      const execution = await rail.execute(prepared)
       if (execution.status === 'CONFIRMED') {
         assertPaymentAttemptStatusTransition(attemptStatus, 'CONFIRMED')
         await this.repository.updatePaymentAttempt(
@@ -255,20 +285,14 @@ export class PaymentService {
         return { payment: confirmedPayment, created: true }
       }
       if (execution.status === 'SUBMITTED') {
-        await this.repository.updatePaymentAttempt(
-          attempt.id,
-          attemptStatus,
-          'SUBMITTED',
-          execution.railTransactionId === undefined
-            ? undefined
-            : { railTransactionId: execution.railTransactionId },
-        )
         return {
           payment: await this.getPayment(payment.payerAccountId, payment.id),
           created: true,
         }
       }
-      throw new ExternalRailError('Payment rail reported a failed execution')
+      throw new ExternalRailError(
+        'Payment rail returned an unsupported execution state',
+      )
     } catch {
       if (attempt === undefined) {
         assertPaymentStatusTransition(paymentStatus, 'FAILED')
