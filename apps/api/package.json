@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@agent-payment/contracts": "workspace:*",
     "@agent-payment/core": "workspace:*",
     "@agent-payment/db": "workspace:*",
     "@agent-payment/solana-rail": "workspace:*",

@@ -1,4 +1,5 @@
 import { formatMoney, moneyFromAtomicUnits } from '@agent-payment/core'
+import type { TransactionResponse } from '@agent-payment/contracts'
 import type {
   IncomingPaymentRepository,
   PaymentRecord,
@@ -66,7 +67,10 @@ export class TransactionService {
 function serializeOutgoing(
   payment: PaymentRecord,
   recipientDisplayName: string | undefined,
-) {
+): TransactionResponse {
+  if (payment.currency !== 'USD') {
+    throw new Error('Unsupported transaction currency')
+  }
   return {
     id: payment.id,
     direction: 'OUTGOING' as const,
@@ -97,7 +101,10 @@ function serializeIncoming(payment: {
   status: 'CONFIRMED'
   createdAt: Date
   confirmedAt: Date
-}) {
+}): TransactionResponse {
+  if (payment.currency !== 'USD') {
+    throw new Error('Unsupported transaction currency')
+  }
   return {
     id: payment.id,
     direction: 'INCOMING' as const,
@@ -105,7 +112,12 @@ function serializeIncoming(payment: {
     amount: formatMoney(moneyFromAtomicUnits(payment.amountAtomic, payment.currency)),
     currency: payment.currency,
     status: payment.status,
-    counterparty: { address: payment.sourceAddress },
+    counterparty: {
+      recipient_id: null,
+      display_name: null,
+      account_id: null,
+      address: payment.sourceAddress,
+    },
     created_at: payment.createdAt.toISOString(),
     updated_at: payment.confirmedAt.toISOString(),
     confirmed_at: payment.confirmedAt.toISOString(),

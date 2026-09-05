@@ -8,6 +8,8 @@ import {
   InsufficientFundsError,
   PaymentPendingError,
   RecipientError,
+  RefundNotSupportedError,
+  UnsupportedRailError,
   ValidationError,
   type Payment,
 } from './index.js'
@@ -285,12 +287,97 @@ describe('AgentPaymentAccount SDK', () => {
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',
         apiKey: 'key',
+        fetch: response('UNSUPPORTED_RAIL', 422),
+      }).pay({ recipientId: 'rcpt_test', amount: '1.20' }, 'rail-key'),
+    ).rejects.toBeInstanceOf(UnsupportedRailError)
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'key',
+        fetch: response('REFUND_NOT_SUPPORTED', 422),
+      }).refund(
+        { originalPaymentId: 'pay_external', amount: '1.20' },
+        'refund-key',
+      ),
+    ).rejects.toBeInstanceOf(RefundNotSupportedError)
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'key',
+        fetch: response('FST_ERR_VALIDATION', 400),
+      }).pay({ recipientId: 'rcpt_test', amount: '1.20' }, 'validation-key'),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', statusCode: 400 })
+
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'key',
         fetch: async () => jsonResponse({ settled: '1.2' }),
       }).getBalance(),
     ).rejects.toBeInstanceOf(ExternalServiceError)
     expect(
       () => new AgentPaymentAccount({ baseUrl: 'not a url', apiKey: 'key' }),
     ).toThrow(ValidationError)
+  })
+
+  it('preserves the idempotency key and payment id for an ambiguous rail failure', async () => {
+    let paymentLookup = 0
+    const account = new AgentPaymentAccount({
+      baseUrl: 'https://payments.example.test',
+      apiKey: 'agent-secret',
+      fetch: async (input) => {
+        const path = new URL(String(input)).pathname
+        if (path === '/v1/payments/pay_reconciling') {
+          paymentLookup += 1
+          return jsonResponse({ ...payment, id: 'pay_reconciling', status: 'RECONCILING' })
+        }
+        return jsonResponse(
+          {
+            error: 'EXTERNAL_RAIL_FAILURE',
+            message: 'Payment outcome is unknown',
+            details: { payment_id: 'pay_reconciling' },
+          },
+          502,
+        )
+      },
+    })
+
+    const error = await account
+      .pay({ recipientId: 'rcpt_test', amount: '1.20' }, 'ambiguous-key')
+      .catch((value: unknown) => value)
+    expect(error).toBeInstanceOf(PaymentPendingError)
+    expect(error).toMatchObject({
+      idempotencyKey: 'ambiguous-key',
+      paymentId: 'pay_reconciling',
+    })
+    await expect(account.getPayment('pay_reconciling')).resolves.toMatchObject({
+      id: 'pay_reconciling',
+      status: 'RECONCILING',
+    })
+    expect(paymentLookup).toBe(1)
+  })
+
+  it('treats invalid money POST responses and unknown 5xx responses as pending', async () => {
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'agent-secret',
+        fetch: async () => new Response('{not-json', { status: 201 }),
+      }).send({ recipientId: 'rcpt_test', amount: '1.20' }, 'invalid-json-key'),
+    ).rejects.toMatchObject({
+      code: 'PAYMENT_PENDING',
+      idempotencyKey: 'invalid-json-key',
+    })
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'agent-secret',
+        fetch: async () => jsonResponse({ error: 'INTERNAL_ERROR' }, 500),
+      }).send({ recipientId: 'rcpt_test', amount: '1.20' }, 'unknown-5xx-key'),
+    ).rejects.toMatchObject({
+      code: 'PAYMENT_PENDING',
+      idempotencyKey: 'unknown-5xx-key',
+    })
   })
 
   it('does not retry receive without an idempotency contract', async () => {

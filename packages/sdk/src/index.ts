@@ -1,3 +1,18 @@
+import {
+  apiErrorResponseSchema,
+  balanceResponseSchema,
+  paymentResponseSchema,
+  receiveResponseSchema,
+  transactionListResponseSchema,
+  transactionResponseSchema,
+  type ApiErrorResponse,
+  type BalanceResponse,
+  type PaymentResponse,
+  type ReceiveResponse,
+  type TransactionListResponse,
+  type TransactionResponse,
+} from '@agent-payment/contracts'
+
 export type Currency = 'USD'
 
 export type PaymentKind = 'PAY' | 'SEND' | 'REFUND'
@@ -115,6 +130,7 @@ export type SdkErrorCode =
   | 'RECIPIENT_ERROR'
   | 'UNSUPPORTED_RAIL'
   | 'CONFLICT'
+  | 'REFUND_NOT_SUPPORTED'
   | 'PAYMENT_PENDING'
   | 'EXTERNAL_SERVICE_ERROR'
 
@@ -143,8 +159,8 @@ export class AuthenticationError extends SdkError {
 }
 
 export class ValidationError extends SdkError {
-  public constructor(message = 'Request validation failed') {
-    super('VALIDATION_ERROR', message, 422)
+  public constructor(message = 'Request validation failed', statusCode = 422) {
+    super('VALIDATION_ERROR', message, statusCode)
     this.name = 'ValidationError'
   }
 }
@@ -177,16 +193,26 @@ export class ConflictError extends SdkError {
   }
 }
 
+export class RefundNotSupportedError extends SdkError {
+  public constructor(message = 'Refund is not supported for this payment') {
+    super('REFUND_NOT_SUPPORTED', message, 422)
+    this.name = 'RefundNotSupportedError'
+  }
+}
+
 export class PaymentPendingError extends SdkError {
   public readonly idempotencyKey: string
+  public readonly paymentId?: string
 
   public constructor(
     idempotencyKey: string,
     message = 'Payment outcome is pending; poll the payment or retry with the same idempotency key',
+    paymentId?: string,
   ) {
     super('PAYMENT_PENDING', message)
     this.name = 'PaymentPendingError'
     this.idempotencyKey = idempotencyKey
+    if (paymentId !== undefined) this.paymentId = paymentId
   }
 }
 
@@ -201,182 +227,117 @@ export class ExternalServiceError extends SdkError {
   }
 }
 
-interface ApiErrorBody {
-  readonly error?: unknown
-  readonly message?: unknown
-}
-
-const PAYMENT_STATUSES: readonly PaymentStatus[] = [
-  'CREATED',
-  'ROUTING',
-  'SUBMITTED',
-  'RECONCILING',
-  'CONFIRMED',
-  'FAILED',
-]
-const PAYMENT_KINDS: readonly PaymentKind[] = ['PAY', 'SEND', 'REFUND']
-const RECEIVE_STATUSES = ['OPEN', 'PAID', 'EXPIRED', 'CANCELLED'] as const
-const MONEY_PATTERN = /^(0|[1-9][0-9]*)\.[0-9]{2}$/u
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function requiredString(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new ExternalServiceError(`API response is missing a valid ${field}`)
-  }
-  return value
-}
-
-function nullableString(value: unknown, field: string): string | null {
-  if (value !== null && typeof value !== 'string') {
-    throw new ExternalServiceError(`API response contains an invalid ${field}`)
-  }
-  return value
-}
-
-function moneyString(value: unknown, field: string): string {
-  const result = requiredString(value, field)
-  if (!MONEY_PATTERN.test(result)) {
-    throw new ExternalServiceError(`API response contains a non-canonical ${field}`)
-  }
-  return result
-}
-
-function enumValue<T extends string>(
+function parseContract<T>(
   value: unknown,
-  values: readonly T[],
-  field: string,
+  schema: { safeParse(input: unknown): { success: true; data: T } | { success: false } },
+  message: string,
 ): T {
-  if (typeof value !== 'string' || !values.includes(value as T)) {
-    throw new ExternalServiceError(`API response contains an invalid ${field}`)
-  }
-  return value as T
+  const result = schema.safeParse(value)
+  if (!result.success) throw new ExternalServiceError(message)
+  return result.data
 }
 
 function parseBalance(value: unknown): Balance {
-  if (!isRecord(value)) {
-    throw new ExternalServiceError('API returned an invalid balance response')
-  }
+  const response = parseContract<BalanceResponse>(
+    value,
+    balanceResponseSchema,
+    'API returned an invalid balance response',
+  )
   return {
-    currency: enumValue(value.currency, ['USD'], 'currency'),
-    settled: moneyString(value.settled, 'settled balance'),
-    pendingOutgoing: moneyString(value.pending_outgoing, 'pending balance'),
-    available: moneyString(value.available, 'available balance'),
+    currency: response.currency,
+    settled: response.settled,
+    pendingOutgoing: response.pending_outgoing,
+    available: response.available,
   }
 }
 
 function parsePayment(value: unknown): Payment {
-  if (!isRecord(value)) {
-    throw new ExternalServiceError('API returned an invalid payment response')
-  }
+  const response = parseContract<PaymentResponse>(
+    value,
+    paymentResponseSchema,
+    'API returned an invalid payment response',
+  )
   return {
-    id: requiredString(value.id, 'payment id'),
-    recipientId: nullableString(value.recipient_id, 'recipient id'),
-    kind: enumValue(value.kind, PAYMENT_KINDS, 'payment kind'),
-    amount: moneyString(value.amount, 'payment amount'),
-    currency: enumValue(value.currency, ['USD'], 'currency'),
-    status: enumValue(value.status, PAYMENT_STATUSES, 'payment status'),
-    description: nullableString(value.description, 'description'),
-    externalReference: nullableString(value.external_reference, 'external reference'),
-    route: nullableString(value.route, 'route'),
-    createdAt: requiredString(value.created_at, 'created_at'),
-    updatedAt: requiredString(value.updated_at, 'updated_at'),
-    confirmedAt: nullableString(value.confirmed_at, 'confirmed_at'),
-    failedAt: nullableString(value.failed_at, 'failed_at'),
-    failureCode: nullableString(value.failure_code, 'failure_code'),
-    failureMessage: nullableString(value.failure_message, 'failure_message'),
-    originalPaymentId: nullableString(value.original_payment_id, 'original_payment_id'),
+    id: response.id,
+    recipientId: response.recipient_id,
+    kind: response.kind,
+    amount: response.amount,
+    currency: response.currency,
+    status: response.status,
+    description: response.description,
+    externalReference: response.external_reference,
+    route: response.route,
+    createdAt: response.created_at,
+    updatedAt: response.updated_at,
+    confirmedAt: response.confirmed_at,
+    failedAt: response.failed_at,
+    failureCode: response.failure_code,
+    failureMessage: response.failure_message,
+    originalPaymentId: response.original_payment_id,
   }
 }
 
 function parseReceive(value: unknown): ReceiveRequest {
-  if (!isRecord(value)) {
-    throw new ExternalServiceError('API returned an invalid receive response')
-  }
-  const destination = value.destination
-  const settlement = value.settlement
-  if (!isRecord(destination) || !isRecord(settlement)) {
-    throw new ExternalServiceError('API response is missing receive settlement details')
-  }
+  const response = parseContract<ReceiveResponse>(
+    value,
+    receiveResponseSchema,
+    'API returned an invalid receive response',
+  )
   return {
-    id: requiredString(value.id, 'receive id'),
-    accountId: requiredString(value.account_id, 'account id'),
-    amount: value.amount === null ? null : moneyString(value.amount, 'receive amount'),
-    currency: enumValue(value.currency, ['USD'], 'currency'),
-    reference: requiredString(value.reference, 'receive reference'),
-    status: enumValue(value.status, RECEIVE_STATUSES, 'receive status'),
-    createdAt: requiredString(value.created_at, 'created_at'),
-    expiresAt: nullableString(value.expires_at, 'expires_at'),
-    paidAt: nullableString(value.paid_at, 'paid_at'),
+    id: response.id,
+    accountId: response.account_id,
+    amount: response.amount,
+    currency: response.currency,
+    reference: response.reference,
+    status: response.status,
+    createdAt: response.created_at,
+    expiresAt: response.expires_at,
+    paidAt: response.paid_at,
     destination: {
-      type: enumValue(
-        destination.type,
-        ['external_transfer_target'],
-        'destination type',
-      ),
-      reference: requiredString(destination.reference, 'destination reference'),
+      type: response.destination.type,
+      reference: response.destination.reference,
     },
     settlement: {
-      owner: requiredString(settlement.owner, 'settlement owner'),
-      tokenAccount: requiredString(
-        settlement.token_account,
-        'settlement token account',
-      ),
-      mint: requiredString(settlement.mint, 'settlement mint'),
+      owner: response.settlement.owner,
+      tokenAccount: response.settlement.token_account,
+      mint: response.settlement.mint,
     },
-  }
-}
-
-function parseCounterparty(value: unknown): Counterparty {
-  if (!isRecord(value)) {
-    throw new ExternalServiceError('API response is missing counterparty')
-  }
-  return {
-    recipientId: nullableString(value.recipient_id, 'counterparty recipient id'),
-    displayName: nullableString(value.display_name, 'counterparty display name'),
-    accountId: nullableString(value.account_id, 'counterparty account id'),
-    address: nullableString(value.address, 'counterparty address'),
   }
 }
 
 function parseTransaction(value: unknown): Transaction {
-  if (!isRecord(value)) {
-    throw new ExternalServiceError('API returned an invalid transaction response')
-  }
+  const response = parseContract<TransactionResponse>(
+    value,
+    transactionResponseSchema,
+    'API returned an invalid transaction response',
+  )
   return {
-    id: requiredString(value.id, 'transaction id'),
-    direction: enumValue(
-      value.direction,
-      ['INCOMING', 'OUTGOING'],
-      'transaction direction',
-    ),
-    kind: enumValue(value.kind, [...PAYMENT_KINDS, 'RECEIVE'], 'transaction kind'),
-    amount: moneyString(value.amount, 'transaction amount'),
-    currency: enumValue(value.currency, ['USD'], 'currency'),
-    status: enumValue(
-      value.status,
-      [...PAYMENT_STATUSES, 'CONFIRMED'],
-      'transaction status',
-    ),
-    counterparty: parseCounterparty(value.counterparty),
-    createdAt: requiredString(value.created_at, 'created_at'),
-    updatedAt: requiredString(value.updated_at, 'updated_at'),
-    confirmedAt: nullableString(value.confirmed_at, 'confirmed_at'),
-    signature: nullableString(value.signature, 'signature'),
+    id: response.id,
+    direction: response.direction,
+    kind: response.kind,
+    amount: response.amount,
+    currency: response.currency,
+    status: response.status,
+    counterparty: {
+      recipientId: response.counterparty.recipient_id,
+      displayName: response.counterparty.display_name,
+      accountId: response.counterparty.account_id,
+      address: response.counterparty.address,
+    },
+    createdAt: response.created_at,
+    updatedAt: response.updated_at,
+    confirmedAt: response.confirmed_at,
+    signature: response.signature,
   }
 }
 
-function parseList<T>(
-  value: unknown,
-  key: string,
-  parser: (item: unknown) => T,
-): readonly T[] {
-  if (!isRecord(value) || !Array.isArray(value[key])) {
-    throw new ExternalServiceError(`API response is missing ${key}`)
-  }
-  return value[key].map(parser)
+function parseTransactionList(value: unknown): readonly Transaction[] {
+  const response = parseContract<TransactionListResponse>(
+    value,
+    transactionListResponseSchema,
+    'API returned an invalid transaction list response',
+  )
+  return response.transactions.map(parseTransaction)
 }
 
 function generatedIdempotencyKey(): string {
@@ -391,6 +352,10 @@ function generatedIdempotencyKey(): string {
   const bytes = new Uint8Array(16)
   globalThis.crypto.getRandomValues(bytes)
   return `sdk_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function normalizeIdempotencyKey(value: string | undefined): string {
@@ -483,12 +448,12 @@ export class AgentPaymentAccount {
     input: PaymentInput,
     options?: string | IdempotencyOptions,
   ): Promise<Payment> {
-    return parsePayment(
-      await this.postMoney(
-        '/v1/pay',
-        toApiPaymentInput(input),
-        unwrapIdempotencyOptions(options),
-      ),
+    const idempotencyKey = unwrapIdempotencyOptions(options)
+    return this.postMoney(
+      '/v1/pay',
+      toApiPaymentInput(input),
+      idempotencyKey,
+      parsePayment,
     )
   }
 
@@ -496,12 +461,12 @@ export class AgentPaymentAccount {
     input: PaymentInput,
     options?: string | IdempotencyOptions,
   ): Promise<Payment> {
-    return parsePayment(
-      await this.postMoney(
-        '/v1/send',
-        toApiPaymentInput(input),
-        unwrapIdempotencyOptions(options),
-      ),
+    const idempotencyKey = unwrapIdempotencyOptions(options)
+    return this.postMoney(
+      '/v1/send',
+      toApiPaymentInput(input),
+      idempotencyKey,
+      parsePayment,
     )
   }
 
@@ -520,12 +485,12 @@ export class AgentPaymentAccount {
     input: RefundInput,
     options?: string | IdempotencyOptions,
   ): Promise<Payment> {
-    return parsePayment(
-      await this.postMoney(
-        '/v1/refunds',
-        toApiRefundInput(input),
-        unwrapIdempotencyOptions(options),
-      ),
+    const idempotencyKey = unwrapIdempotencyOptions(options)
+    return this.postMoney(
+      '/v1/refunds',
+      toApiRefundInput(input),
+      idempotencyKey,
+      parsePayment,
     )
   }
 
@@ -536,19 +501,25 @@ export class AgentPaymentAccount {
   }
 
   public async listTransactions(): Promise<readonly Transaction[]> {
-    return parseList(
-      await this.request('/v1/transactions', 'GET'),
-      'transactions',
-      parseTransaction,
-    )
+    return parseTransactionList(await this.request('/v1/transactions', 'GET'))
   }
 
-  private async postMoney(
+  private async postMoney<T>(
     path: string,
     body: unknown,
     idempotencyKey: string,
-  ): Promise<unknown> {
-    return this.request(path, 'POST', body, idempotencyKey)
+    parser: (value: unknown) => T,
+  ): Promise<T> {
+    const response = await this.request(path, 'POST', body, idempotencyKey)
+    try {
+      return parser(response)
+    } catch {
+      throw new PaymentPendingError(
+        idempotencyKey,
+        'Payment response could not be validated; outcome is unknown',
+        undefined,
+      )
+    }
   }
 
   private async request(
@@ -579,14 +550,35 @@ export class AgentPaymentAccount {
           })
           const payload = await readJson(response)
           if (!response.ok) {
-            throw mapHttpError(response.status, payload)
+            throw mapHttpError(response.status, payload, idempotencyKey)
           }
           return payload
         } finally {
           clearTimeout(timeout)
         }
       } catch (error) {
-        if (error instanceof SdkError) throw error
+        if (error instanceof SdkError) {
+          if (
+            method === 'POST' &&
+            idempotencyKey !== undefined &&
+            error.code === 'EXTERNAL_SERVICE_ERROR' &&
+            attempt + 1 < attempts
+          ) {
+            lastTransportError = error
+            continue
+          }
+          if (
+            method === 'POST' &&
+            idempotencyKey !== undefined &&
+            error.code === 'EXTERNAL_SERVICE_ERROR'
+          ) {
+            throw new PaymentPendingError(
+              idempotencyKey,
+              'Payment response could not be read; outcome is unknown',
+            )
+          }
+          throw error
+        }
         lastTransportError = error
         if (attempt + 1 >= attempts) break
       }
@@ -629,14 +621,23 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-function mapHttpError(statusCode: number, payload: unknown): SdkError {
-  const body = isRecord(payload) ? (payload as ApiErrorBody) : {}
-  const message = typeof body.message === 'string' ? body.message : undefined
+function mapHttpError(
+  statusCode: number,
+  payload: unknown,
+  idempotencyKey?: string,
+): SdkError {
+  const parsed = apiErrorResponseSchema.safeParse(payload)
+  const body: ApiErrorResponse = parsed.success ? parsed.data : {}
+  const message = body.message
+  const paymentId = body.details?.payment_id?.trim() || undefined
+  const isAmbiguousMoneyError =
+    idempotencyKey !== undefined &&
+    (paymentId !== undefined || statusCode >= 500)
   switch (body.error) {
     case 'AUTHENTICATION_ERROR':
       return new AuthenticationError(message)
     case 'VALIDATION_ERROR':
-      return new ValidationError(message)
+      return new ValidationError(message, statusCode)
     case 'INSUFFICIENT_FUNDS':
       return new InsufficientFundsError(message)
     case 'RECIPIENT_RESOLUTION_FAILURE':
@@ -645,12 +646,30 @@ function mapHttpError(statusCode: number, payload: unknown): SdkError {
       return new UnsupportedRailError(message)
     case 'CONFLICT':
       return new ConflictError(message)
+    case 'REFUND_NOT_SUPPORTED':
+      return new RefundNotSupportedError(message)
     case 'EXTERNAL_RAIL_FAILURE':
+      if (idempotencyKey !== undefined && paymentId !== undefined) {
+        return new PaymentPendingError(
+          idempotencyKey,
+          'Payment rail outcome is unknown; poll the payment or retry with the same idempotency key',
+          paymentId,
+        )
+      }
       return new ExternalServiceError('Payment rail is unavailable', statusCode)
     default:
+      if (isAmbiguousMoneyError) {
+        return new PaymentPendingError(
+          idempotencyKey,
+          'Payment service outcome is unknown; poll the payment or retry with the same idempotency key',
+          paymentId,
+        )
+      }
       if (statusCode === 401) return new AuthenticationError(message)
       if (statusCode === 409) return new ConflictError(message)
-      if (statusCode >= 400 && statusCode < 500) return new ValidationError(message)
+      if (statusCode >= 400 && statusCode < 500) {
+        return new ValidationError(message, statusCode)
+      }
       return new ExternalServiceError('Payment service is unavailable', statusCode)
   }
 }

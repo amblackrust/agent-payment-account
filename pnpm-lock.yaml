@@ -44,6 +44,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@agent-payment/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@agent-payment/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -79,6 +82,12 @@ importers:
         specifier: 4.23.13
         version: 4.23.13
 
+  packages/contracts:
+    dependencies:
+      zod:
+        specifier: 4.5.4
+        version: 4.5.4
+
   packages/core: {}
 
   packages/db:
@@ -107,6 +116,10 @@ importers:
         version: 7.10.0(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@5.9.3)
 
   packages/sdk:
+    dependencies:
+      '@agent-payment/contracts':
+        specifier: workspace:*
+        version: link:../contracts
     devDependencies:
       fastify:
         specifier: 5.12.3

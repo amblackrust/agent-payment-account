@@ -68,30 +68,6 @@ async function exportSecret(signer: KeyPairSigner): Promise<Uint8Array> {
   return secret
 }
 
-async function appFetch(
-  app: ReturnType<typeof buildApp>,
-  input: URL | RequestInfo,
-  init?: RequestInit,
-): Promise<Response> {
-  const headers = new Headers(init?.headers)
-  const inputUrl =
-    typeof input === 'string'
-      ? input
-      : input instanceof URL
-        ? input.toString()
-        : input.url
-  const response = await app.inject({
-    method: (init?.method ?? 'GET') as 'GET' | 'POST',
-    url: new URL(inputUrl).pathname,
-    headers: Object.fromEntries(headers.entries()),
-    ...(init?.body === undefined ? {} : { payload: JSON.parse(String(init.body)) }),
-  })
-  return new Response(response.body, {
-    status: response.statusCode,
-    headers: { 'content-type': 'application/json' },
-  })
-}
-
 describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
   'PaymentService with the real Solana SPL rail',
   () => {
@@ -356,16 +332,16 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           receiveService: new ReceiveService(database, readRail),
           transactionService: new TransactionService(database),
         })
-        const payerSdk = new AgentPaymentAccount({
-          baseUrl: 'http://surfpool.local',
-          apiKey: payerKey,
-          fetch: appFetch.bind(undefined, app),
-        })
-        const recipientSdk = new AgentPaymentAccount({
-          baseUrl: 'http://surfpool.local',
-          apiKey: recipientKey,
-          fetch: appFetch.bind(undefined, app),
-        })
+        await app.listen({ host: '127.0.0.1', port: 0 })
+        const listenerAddress = app.server.address()
+        if (listenerAddress === null || typeof listenerAddress === 'string') {
+          throw new Error('Fastify did not expose its listener address')
+        }
+        const baseUrl = `http://127.0.0.1:${listenerAddress.port}`
+        const payerSdk = new AgentPaymentAccount({ baseUrl, apiKey: payerKey })
+        const recipientSdk = new AgentPaymentAccount({ baseUrl, apiKey: recipientKey })
+        expect((await recipientSdk.getBalance()).settled).toBe('0.00')
+        expect((await payerSdk.getBalance()).settled).toBe('2.00')
         const receiveRequest = await recipientSdk.receive({
           amount: '1.25',
           reference: receiveReference,
@@ -378,6 +354,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           },
           id('idem'),
         )
+        expect((await payerSdk.getPayment(original.id)).status).toBe('CONFIRMED')
         const incomingReader = createSolanaIncomingReader({
           rpc: client.rpc as never,
           readRail,
@@ -421,6 +398,22 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           incoming[0]?.receiveRequestId ?? '',
         )
         expect(matched?.status).toBe('PAID')
+        const incomingHistory = await recipientSdk.listTransactions()
+        expect(incomingHistory).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              id: incoming[0]?.id,
+              direction: 'INCOMING',
+              kind: 'RECEIVE',
+              counterparty: {
+                recipientId: null,
+                displayName: null,
+                accountId: null,
+                address: payer.address,
+              },
+            }),
+          ]),
+        )
         const restartedReconciler = new IncomingReconciliationService(
           database,
           incomingReader,
@@ -458,9 +451,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           recipientTokenAfterRefund.exists && recipientTokenAfterRefund.data.amount,
         ).toBe(0n)
         expect(await database.listIncomingPayments(recipientId)).toHaveLength(1)
-        const recipientHistory = await new TransactionService(
-          database,
-        ).listTransactions(recipientId)
+        const recipientHistory = await recipientSdk.listTransactions()
         const refundHistory = recipientHistory.find(
           (transaction) => transaction.id === refund.id,
         )
@@ -468,11 +459,14 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           direction: 'OUTGOING',
           kind: 'REFUND',
           counterparty: {
-            account_id: payerId,
+            accountId: payerId,
             address: payer.address,
-            recipient_id: null,
+            recipientId: null,
           },
         })
+        expect((await recipientSdk.getPayment(refund.id)).status).toBe('CONFIRMED')
+        expect((await payerSdk.getBalance()).settled).toBe('2.00')
+        expect((await recipientSdk.getBalance()).settled).toBe('0.00')
         await expect(
           recipientSdk.refund(
             { originalPaymentId: original.id, amount: '0.01' },

@@ -1,5 +1,5 @@
 {
-  "name": "@agent-payment/sdk",
+  "name": "@agent-payment/contracts",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -17,9 +17,6 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@agent-payment/contracts": "workspace:*"
-  },
-  "devDependencies": {
-    "fastify": "5.12.3"
+    "zod": "4.5.4"
   }
 }
