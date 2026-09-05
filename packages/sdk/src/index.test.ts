@@ -143,8 +143,12 @@ async function createLocalApi() {
     original_payment_id: 'pay_original',
   }))
   app.post('/v1/receives', async () => receive)
+  app.get('/v1/receives/:receiveId', async () => receive)
   app.get('/v1/payments/:paymentId', async () => payment)
-  app.get('/v1/transactions', async () => ({ transactions: [transaction], next_cursor: null }))
+  app.get('/v1/transactions', async () => ({
+    transactions: [transaction],
+    next_cursor: null,
+  }))
   return { app, requests }
 }
 
@@ -167,6 +171,10 @@ describe('AgentPaymentAccount SDK', () => {
       await expect(account.receive()).resolves.toMatchObject({
         id: 'recv_test',
         destination: { reference: 'token-account' },
+      })
+      await expect(account.getReceive('recv_test')).resolves.toMatchObject({
+        id: 'recv_test',
+        status: 'OPEN',
       })
       await expect(
         account.pay(
@@ -295,10 +303,7 @@ describe('AgentPaymentAccount SDK', () => {
         baseUrl: 'https://payments.example.test',
         apiKey: 'key',
         fetch: response('REFUND_NOT_SUPPORTED', 422),
-      }).refund(
-        { originalPaymentId: 'pay_external', amount: '1.20' },
-        'refund-key',
-      ),
+      }).refund({ originalPaymentId: 'pay_external', amount: '1.20' }, 'refund-key'),
     ).rejects.toBeInstanceOf(RefundNotSupportedError)
     await expect(
       new AgentPaymentAccount({
@@ -339,7 +344,11 @@ describe('AgentPaymentAccount SDK', () => {
         const path = new URL(String(input)).pathname
         if (path === '/v1/payments/pay_reconciling') {
           paymentLookup += 1
-          return jsonResponse({ ...payment, id: 'pay_reconciling', status: 'RECONCILING' })
+          return jsonResponse({
+            ...payment,
+            id: 'pay_reconciling',
+            status: 'RECONCILING',
+          })
         }
         return jsonResponse(
           {

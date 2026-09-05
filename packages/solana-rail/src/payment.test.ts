@@ -207,6 +207,17 @@ async function createPreparedRail(
 }
 
 describe('Solana payment rail', () => {
+  it('rejects malformed fee-payer credentials during rail construction', () => {
+    expect(() =>
+      createSolanaPaymentRailWithRpc({
+        rpc: createMockRpc(new Map()),
+        expectedCluster: 'localnet',
+        allowMainnet: false,
+        settlementMint: mint,
+        feePayerSecret: 'not-a-secret',
+      }),
+    ).toThrow('fee payer secret')
+  })
   it('keeps the Task 03 preparation-only route free of execution', async () => {
     const rail = createSolanaPaymentPreparationRail()
     expect(rail.execute).toBeUndefined()

@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  assertPaymentStatusTransition,
   ConflictError,
   createPaymentAttemptId,
   createPaymentId,
@@ -294,8 +293,6 @@ export class PaymentService {
     if (payment.status === 'CONFIRMED' || payment.status === 'FAILED') {
       return payment
     }
-    const attempts = await this.repository.listPaymentAttempts(payment.id)
-    let attempt = attempts.at(-1)
     const rail = this.rails.find((candidate) => candidate.name === payment.route)
     const request = this.createPersistedRailRequest(payment)
     if (
@@ -306,27 +303,26 @@ export class PaymentService {
       return payment
     }
 
-    if (payment.status === 'CREATED') {
-      payment = await this.repository.transitionPayment(
-        payment.id,
-        'CREATED',
-        'ROUTING',
-      )
-      this.logTransition(payment, 'CREATED', 'ROUTING')
-    }
+    payment = await this.ensurePaymentRouting(payment)
 
     const context = this.createPreparationContext(payment)
-    if (attempt === undefined) {
-      const initialAttempt = await this.repository.getOrCreatePaymentAttempt({
+    let attempt = (
+      await this.repository.getOrCreatePaymentAttempt({
         id: createPaymentAttemptId(),
         paymentId: payment.id,
         rail: rail.name,
         status: 'CREATED',
       })
-      attempt = initialAttempt.attempt
-    }
+    ).attempt
     if (attempt.status === 'CREATED') {
-      const prepared = await rail.prepare(request, context)
+      let prepared: RailPreparedPayment
+      try {
+        prepared = await rail.prepare(request, context)
+      } catch (error) {
+        if (isRetryablePreDurableFailure(error)) return payment
+        await this.tryFinalizeFailure(payment, attempt, error)
+        return this.reloadPayment(payment)
+      }
       try {
         attempt = await this.repository.updatePaymentAttempt(
           attempt.id,
@@ -354,7 +350,17 @@ export class PaymentService {
       attempt.status === 'CONFIRMED' ||
       attempt.status === 'FAILED'
     ) {
-      return payment
+      return this.reloadPayment(payment)
+    }
+
+    if (attempt.status === 'PREPARED') {
+      if (rail.execute === undefined) return payment
+      const claim = await this.repository.claimPaymentAttemptExecution(attempt.id)
+      attempt = claim.attempt
+      if (!claim.claimed) {
+        return this.recoverPersistedPayment(await this.reloadPayment(payment))
+      }
+      return this.executeClaimedAttempt(payment, attempt, prepared, rail)
     }
 
     let recovery: RailRecoveryResult
@@ -375,6 +381,29 @@ export class PaymentService {
       )
     }
     return this.finalizeRecoveredResult(payment, attempt, recovery)
+  }
+
+  private async ensurePaymentRouting(payment: PaymentRecord): Promise<PaymentRecord> {
+    if (payment.status !== 'CREATED') return payment
+    try {
+      const routed = await this.repository.transitionPayment(
+        payment.id,
+        'CREATED',
+        'ROUTING',
+      )
+      this.logTransition(payment, 'CREATED', 'ROUTING')
+      return routed
+    } catch (error) {
+      if (!(error instanceof ConflictError)) throw error
+      return this.reloadPayment(payment)
+    }
+  }
+
+  private async reloadPayment(payment: PaymentRecord): Promise<PaymentRecord> {
+    return (
+      (await this.repository.findPaymentForOwner(payment.payerAccountId, payment.id)) ??
+      payment
+    )
   }
 
   private async applyRecoveredExecutionResult(
@@ -399,19 +428,24 @@ export class PaymentService {
     }
   }
 
-  private async executeRecoveredAttempt(
+  private async executeClaimedAttempt(
     payment: PaymentRecord,
     attempt: PaymentAttemptRecord,
     prepared: RailPreparedPayment,
     rail: PaymentRail,
   ): Promise<PaymentRecord> {
     try {
+      if (rail.execute === undefined) return payment
       return await this.applyRecoveredExecutionResult(
         payment,
         attempt,
-        await this.executeRail(prepared, rail),
+        await rail.execute(prepared),
       )
-    } catch {
+    } catch (error) {
+      if (error instanceof ExternalRailError && error.kind === 'DETERMINISTIC') {
+        await this.tryFinalizeFailure(payment, attempt, error)
+        return this.reloadPayment(payment)
+      }
       // The attempt already has durable recovery material. Any local failure
       // after this point may follow a network send, so it must stay recoverable.
       await this.tryMarkReconciling(payment, attempt)
@@ -597,19 +631,15 @@ export class PaymentService {
     let executionCalled = false
 
     try {
-      attempt = await this.repository.createPaymentAttempt({
-        id: createPaymentAttemptId(),
-        paymentId: payment.id,
-        rail: rail.name,
-        status: 'CREATED',
-      })
-      assertPaymentStatusTransition(payment.status, 'ROUTING')
-      payment = await this.repository.transitionPayment(
-        payment.id,
-        payment.status,
-        'ROUTING',
-      )
-      this.logTransition(payment, 'CREATED', 'ROUTING', undefined, undefined, requestId)
+      attempt = (
+        await this.repository.getOrCreatePaymentAttempt({
+          id: createPaymentAttemptId(),
+          paymentId: payment.id,
+          rail: rail.name,
+          status: 'CREATED',
+        })
+      ).attempt
+      payment = await this.ensurePaymentRouting(payment)
 
       const quote = await rail.quote(request)
       if (
@@ -618,28 +648,70 @@ export class PaymentService {
       ) {
         throw new ExternalRailError('Payment rail returned an invalid quote')
       }
-      const preparationContext = this.createPreparationContext({
-        ...payment,
-        payerPublicKey,
-      })
-      const prepared = await rail.prepare(request, preparationContext)
-      attempt = await this.repository.updatePaymentAttempt(
-        attempt.id,
-        'CREATED',
-        'PREPARED',
-        this.durableAttemptFields(prepared),
-      )
+      let prepared: RailPreparedPayment | undefined
+      if (attempt.status === 'CREATED') {
+        prepared = await rail.prepare(
+          request,
+          this.createPreparationContext({
+            ...payment,
+            payerPublicKey,
+          }),
+        )
+        try {
+          attempt = await this.repository.updatePaymentAttempt(
+            attempt.id,
+            'CREATED',
+            'PREPARED',
+            this.durableAttemptFields(prepared),
+          )
+        } catch (error) {
+          if (!(error instanceof ConflictError)) throw error
+          attempt = (await this.repository.listPaymentAttempts(payment.id)).at(-1)
+          if (attempt === undefined) throw error
+          prepared = undefined
+        }
+      }
 
-      const execute = rail.execute
-      if (execute === undefined) {
+      if (prepared === undefined) {
+        prepared = this.preparedPaymentFromAttempt(attempt)
+      }
+      if (
+        prepared === undefined ||
+        attempt.status === 'CONFIRMED' ||
+        attempt.status === 'FAILED'
+      ) {
         return {
-          payment: await this.getPayment(payment.payerAccountId, payment.id),
+          payment: await this.reloadPayment(payment),
+          created: true,
+        }
+      }
+      if (rail.execute === undefined) {
+        return {
+          payment: await this.reloadPayment(payment),
+          created: true,
+        }
+      }
+      if (attempt.status !== 'PREPARED') {
+        return {
+          payment: await this.recoverPersistedPayment(
+            await this.reloadPayment(payment),
+          ),
+          created: true,
+        }
+      }
+      const claim = await this.repository.claimPaymentAttemptExecution(attempt.id)
+      attempt = claim.attempt
+      if (!claim.claimed) {
+        return {
+          payment: await this.recoverPersistedPayment(
+            await this.reloadPayment(payment),
+          ),
           created: true,
         }
       }
 
       executionCalled = true
-      const execution = await execute(prepared)
+      const execution = await rail.execute(prepared)
       return {
         payment: await this.applyExecutionResult(
           payment,
@@ -666,6 +738,7 @@ export class PaymentService {
           { payment_id: payment.id },
         )
       }
+      if (isRetryablePreDurableFailure(error)) throw error
       await this.tryFinalizeFailure(payment, attempt, error, requestId)
       if (error instanceof InsufficientFundsError) {
         throw error
@@ -681,7 +754,8 @@ export class PaymentService {
     rail: PaymentRail,
   ): Promise<RailRecoveryResult> {
     const expectedExternalId = prepared.durableExecution?.expectedExternalId
-    if (expectedExternalId !== undefined && rail.getStatus !== undefined) {
+    if (expectedExternalId !== undefined) {
+      if (rail.getStatus === undefined) return { status: 'RECONCILING' }
       return rail.getStatus(expectedExternalId)
     }
     if (rail.execute === undefined) {
@@ -934,6 +1008,10 @@ function compareStrings(left: string, right: string): -1 | 0 | 1 {
     return 1
   }
   return 0
+}
+
+function isRetryablePreDurableFailure(error: unknown): boolean {
+  return error instanceof ExternalRailError && error.kind === 'RETRYABLE'
 }
 
 class ResourceNotFoundError extends Error {

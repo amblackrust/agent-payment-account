@@ -73,6 +73,8 @@ export class IncomingReconciliationService {
           accountId: account.accountId,
           signature: transfer.signature,
           amountAtomic: transfer.amount.atomicUnits,
+          tokenAtomicUnits: transfer.tokenAtomicUnits,
+          tokenDecimals: transfer.tokenDecimals,
           currency: transfer.amount.currency,
           ...(transfer.sourceAddress === undefined
             ? {}

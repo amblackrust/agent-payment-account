@@ -208,6 +208,15 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           currency: 'USD',
           reference: 'invoice-42',
         })
+        await expect(
+          database.createReceiveRequest({
+            id: `recv_${randomUUID().replaceAll('-', '')}`,
+            accountId,
+            amountAtomic: 1250n,
+            currency: 'USD',
+            reference: 'invoice-42',
+          }),
+        ).rejects.toThrow(ConflictError)
         const first = await database.createIncomingPayment({
           id: incomingId,
           accountId,
@@ -379,6 +388,165 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(
           (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
         ).toBe('EXPIRED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('revives a wall-clock expired request when the chain confirmed before expiry', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
+      const expiresAt = new Date('2026-09-06T12:00:00.000Z')
+      const confirmedAt = new Date('2026-09-06T11:59:00.000Z')
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'receive-revival-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.createReceiveRequest({
+          id: receiveId,
+          accountId,
+          amountAtomic: 500n,
+          currency: 'USD',
+          reference: 'late-reconciled-before-expiry',
+          expiresAt,
+        })
+        await database.expireOpenReceiveRequests(
+          accountId,
+          new Date('2026-09-06T12:01:00.000Z'),
+        )
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
+        ).toBe('EXPIRED')
+
+        const incoming = await database.createIncomingPayment({
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          accountId,
+          signature: `revival-${randomUUID()}`,
+          amountAtomic: 500n,
+          currency: 'USD',
+          sourceAddress: 'external-wallet',
+          reference: 'late-reconciled-before-expiry',
+          tokenAccount: 'destination-token-account',
+          settlementMint: 'settlement-mint',
+          confirmedAt,
+        })
+
+        expect(incoming.payment.receiveRequestId).toBe(receiveId)
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
+        ).toBe('PAID')
+        expect(
+          (await database.findReceiveRequestForOwner(accountId, receiveId))?.paidAt,
+        ).toEqual(confirmedAt)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('atomically claims a receive request once for concurrent incoming signatures', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'receive-concurrency-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.createReceiveRequest({
+          id: receiveId,
+          accountId,
+          amountAtomic: 700n,
+          currency: 'USD',
+          reference: 'concurrent-receive-reference',
+        })
+        const createIncoming = (signature: string) =>
+          database.createIncomingPayment({
+            id: `in_${randomUUID().replaceAll('-', '')}`,
+            accountId,
+            signature,
+            amountAtomic: 700n,
+            currency: 'USD',
+            sourceAddress: 'external-wallet',
+            reference: 'concurrent-receive-reference',
+            tokenAccount: 'destination-token-account',
+            settlementMint: 'settlement-mint',
+            confirmedAt: new Date(),
+          })
+        const [first, second] = await Promise.all([
+          createIncoming(`concurrent-a-${randomUUID()}`),
+          createIncoming(`concurrent-b-${randomUUID()}`),
+        ])
+
+        expect(
+          [first.payment.receiveRequestId, second.payment.receiveRequestId].filter(
+            (value) => value === receiveId,
+          ),
+        ).toHaveLength(1)
+        expect(
+          (await database.listIncomingPayments(accountId)).filter(
+            (payment) => payment.receiveRequestId === receiveId,
+          ),
+        ).toHaveLength(1)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('persists sub-cent incoming settlement events for audit', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'sub-cent-audit-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        const incoming = await database.createIncomingPayment({
+          id: `in_${randomUUID().replaceAll('-', '')}`,
+          accountId,
+          signature: `dust-${randomUUID()}`,
+          amountAtomic: 0n,
+          tokenAtomicUnits: 1n,
+          tokenDecimals: 6,
+          currency: 'USD',
+          sourceAddress: 'external-wallet',
+          tokenAccount: 'destination-token-account',
+          settlementMint: 'settlement-mint',
+          confirmedAt: new Date(),
+        })
+
+        expect(incoming.payment.amountAtomic).toBe(0n)
+        expect(incoming.payment.tokenAtomicUnits).toBe(1n)
+        expect(incoming.payment.tokenDecimals).toBe(6)
+        expect(await database.listIncomingPayments(accountId)).toHaveLength(1)
       } finally {
         await database.disconnect()
       }

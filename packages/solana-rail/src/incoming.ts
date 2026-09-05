@@ -5,6 +5,8 @@ import type { SolanaRpc, SolanaRail, SolanaRailOptions } from './read.js'
 export interface IncomingTransfer {
   readonly signature: string
   readonly amount: Money
+  readonly tokenAtomicUnits: bigint
+  readonly tokenDecimals: number
   readonly sourceAddress: string | undefined
   readonly reference: string | undefined
   readonly tokenAccount: string
@@ -187,12 +189,11 @@ export function createSolanaIncomingReader(
           break
         }
         const amount = tokenAmountToUsd(transfer.amount, tokenDecimals)
-        if (amount.atomicUnits <= 0n) {
-          continue
-        }
         transfers.push({
           signature: item.signature,
           amount,
+          tokenAtomicUnits: transfer.amount,
+          tokenDecimals,
           sourceAddress: transfer.sourceAddress,
           reference: getMemo(transaction),
           tokenAccount: destination.tokenAccount,
@@ -277,7 +278,7 @@ function getExternalIncomingTransfer(
   | {
       readonly kind: 'INCOMING'
       readonly amount: bigint
-      readonly sourceAddress: string
+      readonly sourceAddress: string | undefined
     }
   | { readonly kind: 'IRRELEVANT' }
   | { readonly kind: 'UNCLASSIFIED' } {
@@ -364,12 +365,15 @@ function getExternalIncomingTransfer(
     (total, transfer) => total + transfer.amount,
     0n,
   )
-  const firstTransfer = externalTransfers[0]
-  if (firstTransfer !== undefined && transferredAmount === destinationDelta) {
+  const sourceOwners = new Set(
+    externalTransfers.map((transfer) => transfer.sourceAddress),
+  )
+  if (externalTransfers.length > 0 && transferredAmount === destinationDelta) {
     return {
       kind: 'INCOMING',
       amount: transferredAmount,
-      sourceAddress: firstTransfer.sourceAddress,
+      sourceAddress:
+        sourceOwners.size === 1 ? externalTransfers[0]!.sourceAddress : undefined,
     }
   }
   return selfTransferAmount === destinationDelta

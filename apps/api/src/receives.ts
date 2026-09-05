@@ -55,6 +55,23 @@ export class ReceiveService {
     })
     return serializeReceiveRequest(request, destination)
   }
+
+  public async getReceiveRequest(accountId: string, owner: string, receiveId: string) {
+    await this.repository.expireOpenReceiveRequests(accountId, new Date(this.now()))
+    const request = await this.repository.findReceiveRequestForOwner(
+      accountId,
+      receiveId,
+    )
+    if (request === null) {
+      const error = new Error('Receive request not found')
+      Object.assign(error, { statusCode: 404 })
+      throw error
+    }
+    return serializeReceiveRequest(
+      request,
+      await this.rail.getReceiveDestination(owner),
+    )
+  }
 }
 
 function serializeReceiveRequest(

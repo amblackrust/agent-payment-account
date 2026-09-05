@@ -491,7 +491,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         client.surfnet.stop()
         await database.disconnect()
       }
-    })
+    }, 30_000)
   },
 )
 

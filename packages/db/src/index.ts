@@ -7,7 +7,7 @@ import {
   InsufficientFundsError,
   RecipientResolutionError,
 } from '@agent-payment/core'
-import { PrismaClient } from './generated/client/client.js'
+import { PrismaClient, type Prisma } from './generated/client/client.js'
 
 export type AgentAccountStatus = 'ACTIVE' | 'DISABLED'
 
@@ -153,7 +153,13 @@ export type PaymentKind = 'PAY' | 'SEND' | 'REFUND'
 export type PaymentStatus =
   'CREATED' | 'ROUTING' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
 export type PaymentAttemptStatus =
-  'CREATED' | 'PREPARED' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
+  | 'CREATED'
+  | 'PREPARED'
+  | 'EXECUTING'
+  | 'SUBMITTED'
+  | 'RECONCILING'
+  | 'CONFIRMED'
+  | 'FAILED'
 export type ReservationStatus = 'ACTIVE' | 'RELEASED'
 
 export interface PaymentRecord {
@@ -204,6 +210,8 @@ export interface IncomingPaymentRecord {
   readonly accountId: string
   readonly signature: string
   readonly amountAtomic: bigint
+  readonly tokenAtomicUnits: bigint
+  readonly tokenDecimals: number
   readonly currency: string
   readonly sourceAddress: string | null
   readonly reference: string | null
@@ -241,11 +249,21 @@ export interface CreateIncomingPaymentInput {
   readonly accountId: string
   readonly signature: string
   readonly amountAtomic: bigint
+  readonly tokenAtomicUnits?: bigint
+  readonly tokenDecimals?: number
   readonly currency: string
   readonly sourceAddress?: string
   readonly reference?: string
   readonly tokenAccount: string
   readonly settlementMint: string
+  readonly confirmedAt: Date
+}
+
+interface IncomingMatchInput {
+  readonly incomingPaymentId: string
+  readonly accountId: string
+  readonly amountAtomic: bigint
+  readonly reference: string | null
   readonly confirmedAt: Date
 }
 
@@ -256,13 +274,7 @@ export interface ReceiveRepository {
     id: string,
   ): Promise<ReceiveRequestRecord | null>
   listReceiveRequests(accountId: string): Promise<readonly ReceiveRequestRecord[]>
-  matchIncomingPayment(input: {
-    readonly incomingPaymentId: string
-    readonly accountId: string
-    readonly amountAtomic: bigint
-    readonly reference: string | null
-    readonly confirmedAt: Date
-  }): Promise<string | null>
+  matchIncomingPayment(input: IncomingMatchInput): Promise<string | null>
   expireOpenReceiveRequests(accountId: string, now: Date): Promise<void>
 }
 
@@ -396,10 +408,12 @@ export interface PaymentRepository {
       failureMessageSafe?: string | null
     }>,
   ): Promise<PaymentRecord>
-  createPaymentAttempt(input: CreatePaymentAttemptInput): Promise<PaymentAttemptRecord>
   getOrCreatePaymentAttempt(
     input: CreatePaymentAttemptInput,
   ): Promise<{ readonly attempt: PaymentAttemptRecord; readonly created: boolean }>
+  claimPaymentAttemptExecution(
+    attemptId: string,
+  ): Promise<{ readonly attempt: PaymentAttemptRecord; readonly claimed: boolean }>
   updatePaymentAttempt(
     attemptId: string,
     currentStatus: PaymentAttemptStatus,
@@ -414,6 +428,9 @@ export interface PaymentRepository {
     }>,
   ): Promise<PaymentAttemptRecord>
   listPaymentAttempts(paymentId: string): Promise<readonly PaymentAttemptRecord[]>
+  readonly listLatestPaymentAttempts?: (
+    paymentIds: readonly string[],
+  ) => Promise<readonly PaymentAttemptRecord[]>
   releaseReservation(paymentId: string): Promise<void>
   findPaymentForOwner(
     ownerAccountId: string,
@@ -452,6 +469,62 @@ export interface DatabaseClient
   findAccountPublicKey(accountId: string): Promise<string | null>
   checkReadiness(): Promise<void>
   disconnect(): Promise<void>
+}
+
+async function matchIncomingPaymentInTransaction(
+  transaction: Prisma.TransactionClient,
+  input: IncomingMatchInput,
+): Promise<string | null> {
+  if (input.amountAtomic <= 0n) return null
+  if (input.reference === null) return null
+
+  await transaction.receiveRequest.updateMany({
+    where: {
+      accountId: input.accountId,
+      status: 'OPEN',
+      expiresAt: { lte: input.confirmedAt },
+    },
+    data: { status: 'EXPIRED' },
+  })
+
+  const candidates = await transaction.$queryRaw<readonly { id: string }[]>`
+    SELECT "id"
+    FROM "receive_requests"
+    WHERE "account_id" = ${input.accountId}
+      AND "reference" = ${input.reference}
+      AND "status" IN ('OPEN', 'EXPIRED')
+      AND "matched_incoming_payment_id" IS NULL
+      AND ("expires_at" IS NULL OR "expires_at" > ${input.confirmedAt})
+      AND ("amount_atomic" IS NULL OR "amount_atomic" = ${input.amountAtomic})
+    ORDER BY "created_at" ASC, "id" ASC
+    LIMIT 1
+    FOR UPDATE
+  `
+  const requestId = candidates[0]?.id
+  if (requestId === undefined) return null
+
+  const incomingResult = await transaction.incomingPayment.updateMany({
+    where: { id: input.incomingPaymentId, receiveRequestId: null },
+    data: { receiveRequestId: requestId },
+  })
+  if (incomingResult.count !== 1) return null
+
+  const requestResult = await transaction.receiveRequest.updateMany({
+    where: {
+      id: requestId,
+      status: { in: ['OPEN', 'EXPIRED'] },
+      matchedIncomingPaymentId: null,
+    },
+    data: {
+      status: 'PAID',
+      paidAt: input.confirmedAt,
+      matchedIncomingPaymentId: input.incomingPaymentId,
+    },
+  })
+  if (requestResult.count !== 1) {
+    throw new ConflictError('Receive request was claimed concurrently')
+  }
+  return requestId
 }
 
 export function createDatabaseClient(databaseUrl: string): DatabaseClient {
@@ -934,40 +1007,6 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
       return toPaymentRecord(payment)
     },
-    async createPaymentAttempt(input): Promise<PaymentAttemptRecord> {
-      const attempt = await prisma.$transaction(async (transaction) => {
-        await transaction.$queryRaw`
-          SELECT id FROM "payments" WHERE id = ${input.paymentId} FOR UPDATE
-        `
-        const latest = await transaction.paymentAttempt.findFirst({
-          where: { paymentId: input.paymentId },
-          orderBy: { attemptNumber: 'desc' },
-          select: { attemptNumber: true },
-        })
-        return transaction.paymentAttempt.create({
-          data: {
-            id: input.id,
-            paymentId: input.paymentId,
-            attemptNumber: (latest?.attemptNumber ?? 0) + 1,
-            rail: input.rail,
-            status: input.status,
-            ...(input.serializedPayloadSafe === undefined
-              ? {}
-              : { serializedPayloadSafe: input.serializedPayloadSafe }),
-            ...(input.durablePayload === undefined
-              ? {}
-              : { durablePayload: input.durablePayload }),
-            ...(input.expectedExternalId === undefined
-              ? {}
-              : { expectedExternalId: input.expectedExternalId }),
-            ...(input.recoveryMetadata === undefined
-              ? {}
-              : { recoveryMetadata: input.recoveryMetadata }),
-          },
-        })
-      })
-      return toPaymentAttemptRecord(attempt)
-    },
     async getOrCreatePaymentAttempt(input) {
       return prisma.$transaction(async (transaction) => {
         await transaction.$queryRaw`
@@ -1004,9 +1043,33 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         return { attempt: toPaymentAttemptRecord(attempt), created: true }
       })
     },
+    async claimPaymentAttemptExecution(attemptId) {
+      return prisma.$transaction(async (transaction) => {
+        const attempt = await transaction.paymentAttempt.findUniqueOrThrow({
+          where: { id: attemptId },
+        })
+        await transaction.$queryRaw`
+          SELECT id FROM "payments" WHERE id = ${attempt.paymentId} FOR UPDATE
+        `
+        const result = await transaction.paymentAttempt.updateMany({
+          where: { id: attemptId, status: 'PREPARED' },
+          data: { status: 'EXECUTING' },
+        })
+        const current = await transaction.paymentAttempt.findUniqueOrThrow({
+          where: { id: attemptId },
+        })
+        return {
+          attempt: toPaymentAttemptRecord(current),
+          claimed: result.count === 1,
+        }
+      })
+    },
     async finalizeConfirmedPayment(input): Promise<PaymentRecord> {
-      if (input.expectedAttemptStatus === 'PREPARED') {
-        assertPaymentAttemptStatusTransition('PREPARED', 'SUBMITTED')
+      if (
+        input.expectedAttemptStatus === 'PREPARED' ||
+        input.expectedAttemptStatus === 'EXECUTING'
+      ) {
+        assertPaymentAttemptStatusTransition(input.expectedAttemptStatus, 'SUBMITTED')
       } else {
         assertPaymentAttemptStatusTransition(input.expectedAttemptStatus, 'CONFIRMED')
       }
@@ -1021,9 +1084,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           select: { expectedExternalId: true },
         })
         let attemptStatus = input.expectedAttemptStatus
-        if (attemptStatus === 'PREPARED') {
+        if (attemptStatus === 'PREPARED' || attemptStatus === 'EXECUTING') {
           const submittedAttempt = await transaction.paymentAttempt.updateMany({
-            where: { id: input.attemptId, status: 'PREPARED' },
+            where: { id: input.attemptId, status: attemptStatus },
             data: {
               status: 'SUBMITTED',
               ...(input.railTransactionId === undefined
@@ -1213,6 +1276,14 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
       return attempts.map(toPaymentAttemptRecord)
     },
+    async listLatestPaymentAttempts(paymentIds) {
+      if (paymentIds.length === 0) return []
+      const attempts = await prisma.paymentAttempt.findMany({
+        where: { paymentId: { in: [...paymentIds] } },
+        orderBy: { attemptNumber: 'desc' },
+      })
+      return attempts.map(toPaymentAttemptRecord)
+    },
     async releaseReservation(paymentId): Promise<void> {
       await prisma.outgoingReservation.updateMany({
         where: { paymentId, status: 'ACTIVE' },
@@ -1271,19 +1342,26 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       return toPaymentRecord(payment)
     },
     async createReceiveRequest(input): Promise<ReceiveRequestRecord> {
-      const request = await prisma.receiveRequest.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          ...(input.amountAtomic === undefined
-            ? {}
-            : { amountAtomic: input.amountAtomic }),
-          currency: input.currency,
-          reference: input.reference,
-          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-        },
-      })
-      return toReceiveRequestRecord(request)
+      try {
+        const request = await prisma.receiveRequest.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            ...(input.amountAtomic === undefined
+              ? {}
+              : { amountAtomic: input.amountAtomic }),
+            currency: input.currency,
+            reference: input.reference,
+            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+          },
+        })
+        return toReceiveRequestRecord(request)
+      } catch (error) {
+        if (isPrismaUniqueConstraintError(error)) {
+          throw new ConflictError('Receive reference is already in use')
+        }
+        throw error
+      }
     },
     async findReceiveRequestForOwner(accountId, id) {
       const request = await prisma.receiveRequest.findFirst({
@@ -1305,43 +1383,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
     },
     async matchIncomingPayment(input): Promise<string | null> {
-      return prisma.$transaction(async (transaction) => {
-        if (input.reference === null) {
-          return null
-        }
-        await transaction.receiveRequest.updateMany({
-          where: {
-            accountId: input.accountId,
-            status: 'OPEN',
-            expiresAt: { lte: input.confirmedAt },
-          },
-          data: { status: 'EXPIRED' },
-        })
-        const request = await transaction.receiveRequest.findFirst({
-          where: {
-            accountId: input.accountId,
-            reference: input.reference,
-            status: 'OPEN',
-            AND: [
-              { OR: [{ expiresAt: null }, { expiresAt: { gt: input.confirmedAt } }] },
-            ],
-            OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
-          },
-          orderBy: { createdAt: 'asc' },
-        })
-        if (request === null) {
-          return null
-        }
-        const result = await transaction.receiveRequest.updateMany({
-          where: { id: request.id, status: 'OPEN' },
-          data: {
-            status: 'PAID',
-            paidAt: input.confirmedAt,
-            matchedIncomingPaymentId: input.incomingPaymentId,
-          },
-        })
-        return result.count === 1 ? request.id : null
-      })
+      return prisma.$transaction((transaction) =>
+        matchIncomingPaymentInTransaction(transaction, input),
+      )
     },
     async listActiveAccountSettlements() {
       const accounts = await prisma.agentAccount.findMany({
@@ -1391,6 +1435,8 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             accountId: input.accountId,
             signature: input.signature,
             amountAtomic: input.amountAtomic,
+            tokenAtomicUnits: input.tokenAtomicUnits ?? input.amountAtomic,
+            tokenDecimals: input.tokenDecimals ?? 2,
             currency: input.currency,
             ...(input.sourceAddress === undefined
               ? {}
@@ -1401,48 +1447,13 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             confirmedAt: input.confirmedAt,
           },
         })
-        await transaction.receiveRequest.updateMany({
-          where: {
-            accountId: input.accountId,
-            status: 'OPEN',
-            expiresAt: { lte: input.confirmedAt },
-          },
-          data: { status: 'EXPIRED' },
+        await matchIncomingPaymentInTransaction(transaction, {
+          incomingPaymentId: incoming.id,
+          accountId: input.accountId,
+          amountAtomic: input.amountAtomic,
+          reference: input.reference ?? null,
+          confirmedAt: input.confirmedAt,
         })
-        const request =
-          input.reference === undefined
-            ? null
-            : await transaction.receiveRequest.findFirst({
-                where: {
-                  accountId: input.accountId,
-                  reference: input.reference,
-                  status: 'OPEN',
-                  AND: [
-                    {
-                      OR: [
-                        { expiresAt: null },
-                        { expiresAt: { gt: input.confirmedAt } },
-                      ],
-                    },
-                  ],
-                  OR: [{ amountAtomic: null }, { amountAtomic: input.amountAtomic }],
-                },
-                orderBy: { createdAt: 'asc' },
-              })
-        if (request !== null) {
-          await transaction.receiveRequest.update({
-            where: { id: request.id },
-            data: {
-              status: 'PAID',
-              paidAt: input.confirmedAt,
-              matchedIncomingPaymentId: incoming.id,
-            },
-          })
-          await transaction.incomingPayment.update({
-            where: { id: incoming.id },
-            data: { receiveRequestId: request.id },
-          })
-        }
         return {
           payment: toIncomingPaymentRecord(
             await transaction.incomingPayment.findUniqueOrThrow({
@@ -1577,6 +1588,8 @@ function toIncomingPaymentRecord(payment: {
   accountId: string
   signature: string
   amountAtomic: bigint
+  tokenAtomicUnits: bigint
+  tokenDecimals: number
   currency: string
   sourceAddress: string | null
   reference: string | null
@@ -1606,4 +1619,13 @@ function toPaymentAttemptRecord(attempt: {
   updatedAt: Date
 }): PaymentAttemptRecord {
   return attempt
+}
+
+function isPrismaUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { readonly code?: unknown }).code === 'P2002'
+  )
 }

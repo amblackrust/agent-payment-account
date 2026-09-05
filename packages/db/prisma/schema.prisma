@@ -30,6 +30,7 @@ enum PaymentStatus {
 enum PaymentAttemptStatus {
   CREATED
   PREPARED
+  EXECUTING
   SUBMITTED
   RECONCILING
   CONFIRMED
@@ -173,7 +174,7 @@ model ReceiveRequest {
   matchedIncomingPaymentId String?              @unique @map("matched_incoming_payment_id") @db.VarChar(64)
   account                  AgentAccount         @relation(fields: [accountId], references: [id], onDelete: Restrict)
   matchedIncomingPayment   IncomingPayment?     @relation("ReceiveMatch", fields: [matchedIncomingPaymentId], references: [id], onDelete: Restrict)
-  incomingPayments         IncomingPayment[]    @relation("ReceiveIncoming")
+  incomingPayments         IncomingPayment?    @relation("ReceiveIncoming")
 
   @@unique([accountId, reference])
   @@index([accountId, status])
@@ -185,6 +186,8 @@ model IncomingPayment {
   accountId        String                @map("account_id") @db.VarChar(64)
   signature        String                @db.VarChar(128)
   amountAtomic     BigInt                @map("amount_atomic")
+  tokenAtomicUnits BigInt                @map("token_atomic_units")
+  tokenDecimals    Int                   @map("token_decimals")
   currency         String                @db.VarChar(3)
   sourceAddress    String?               @map("source_address") @db.VarChar(128)
   reference        String?               @db.VarChar(255)
@@ -193,7 +196,7 @@ model IncomingPayment {
   status           IncomingPaymentStatus @default(CONFIRMED)
   createdAt        DateTime              @default(now()) @map("created_at")
   confirmedAt      DateTime              @default(now()) @map("confirmed_at")
-  receiveRequestId String?               @map("receive_request_id") @db.VarChar(64)
+  receiveRequestId String?               @unique @map("receive_request_id") @db.VarChar(64)
   account          AgentAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)
   receiveRequest   ReceiveRequest?       @relation("ReceiveIncoming", fields: [receiveRequestId], references: [id], onDelete: Restrict)
   matchedByRequest ReceiveRequest?       @relation("ReceiveMatch")
@@ -220,7 +223,7 @@ model IndexerCheckpoint {
 
 model PaymentAttempt {
   id                            String               @id @db.VarChar(64)
-  paymentId                     String               @map("payment_id") @db.VarChar(64)
+  paymentId                     String               @unique @map("payment_id") @db.VarChar(64)
   attemptNumber                 Int                  @map("attempt_number")
   rail                          String               @db.VarChar(64)
   status                        PaymentAttemptStatus @default(CREATED)

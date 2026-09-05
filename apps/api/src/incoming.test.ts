@@ -6,6 +6,8 @@ import { IncomingReconciliationService } from './incoming.js'
 const transfer: IncomingTransfer = {
   signature: 'signature-1',
   amount: moneyFromAtomicUnits(100n),
+  tokenAtomicUnits: 1_000_000n,
+  tokenDecimals: 6,
   sourceAddress: 'source',
   reference: 'reference',
   tokenAccount: 'token-account',

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { ConflictError } from '@agent-payment/core'
 import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 import { moneyFromAtomicUnits } from '@agent-payment/core'
@@ -7,6 +8,7 @@ import { buildApp } from './app.js'
 import type { AccountService, CreatedAccountResponse } from './accounts.js'
 import { hashApiKey } from './auth.js'
 import type { AppConfig } from './config.js'
+import type { ReceiveService } from './receives.js'
 
 const config: AppConfig = {
   databaseUrl: 'postgresql://postgres:postgres@localhost:5432/test',
@@ -43,6 +45,7 @@ const createdAccount: CreatedAccountResponse = {
   name: 'new-agent',
   status: 'ACTIVE',
   apiKey: 'apa_one-time-key',
+  credentialId: 'cred_created',
   receiveId: 'recv_created',
   destination: {
     owner: 'owner-public-key',
@@ -66,7 +69,10 @@ function createRepository(account: AuthenticatedAccount | null): AccountReposito
   }
 }
 
-function createApp(account: AuthenticatedAccount | null = activeAccount) {
+function createApp(
+  account: AuthenticatedAccount | null = activeAccount,
+  receiveService?: ReceiveService,
+) {
   const repository = createRepository(account)
   const accountService = {
     createAccount: async () => createdAccount,
@@ -88,6 +94,7 @@ function createApp(account: AuthenticatedAccount | null = activeAccount) {
     accountRepository: repository,
     accountService,
     solanaRail: rail,
+    ...(receiveService === undefined ? {} : { receiveService }),
   })
 }
 
@@ -171,6 +178,7 @@ describe('account API authentication', () => {
       name: 'new-agent',
       status: 'ACTIVE',
       api_key: 'apa_one-time-key',
+      credential_id: 'cred_created',
       receive: {
         id: 'recv_created',
         currency: 'USD',
@@ -201,6 +209,79 @@ describe('account API authentication', () => {
       currency: 'USD',
       status: 'OPEN',
       destination: { type: 'external_transfer_target', reference: 'token-account' },
+    })
+  })
+
+  it('returns an own receive request and keeps the lookup account-scoped', async () => {
+    const receiveRequest = {
+      id: 'recv_lookup',
+      account_id: 'acct_test',
+      amount: null,
+      currency: 'USD',
+      reference: 'lookup-reference',
+      status: 'OPEN',
+      created_at: '2026-09-06T00:00:00.000Z',
+      expires_at: null,
+      paid_at: null,
+      destination: { type: 'external_transfer_target', reference: 'token-account' },
+      settlement: {
+        owner: 'owner-public-key',
+        token_account: 'token-account',
+        mint: 'settlement-mint',
+      },
+    }
+    const receiveService = {
+      createReceiveRequest: async () => receiveRequest,
+      getReceiveRequest: async (
+        accountId: string,
+        _owner: string,
+        receiveId: string,
+      ) => {
+        if (accountId !== activeAccount.account.id || receiveId !== receiveRequest.id) {
+          const error = new Error('Receive request not found')
+          Object.assign(error, { statusCode: 404 })
+          throw error
+        }
+        return receiveRequest
+      },
+    } as unknown as ReceiveService
+    const app = createApp(activeAccount, receiveService)
+    const own = await app.inject({
+      method: 'GET',
+      url: '/v1/receives/recv_lookup',
+      headers: { authorization: 'Bearer agent-key' },
+    })
+    const foreign = await app.inject({
+      method: 'GET',
+      url: '/v1/receives/recv_other',
+      headers: { authorization: 'Bearer agent-key' },
+    })
+    await app.close()
+
+    expect(own.statusCode).toBe(200)
+    expect(own.json()).toEqual(receiveRequest)
+    expect(foreign.statusCode).toBe(404)
+  })
+
+  it('maps duplicate receive references to a stable conflict response', async () => {
+    const receiveService = {
+      createReceiveRequest: async () => {
+        throw new ConflictError('Receive reference is already in use')
+      },
+    } as unknown as ReceiveService
+    const app = createApp(activeAccount, receiveService)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/receives',
+      headers: { authorization: 'Bearer agent-key' },
+      payload: { currency: 'USD', reference: 'duplicate-reference' },
+    })
+    await app.close()
+
+    expect(response.statusCode).toBe(409)
+    expect(response.json()).toMatchObject({
+      statusCode: 409,
+      error: 'CONFLICT',
     })
   })
 

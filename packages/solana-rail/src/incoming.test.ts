@@ -237,6 +237,80 @@ describe('Solana incoming transfer reader', () => {
     ])
   })
 
+  it('does not attribute an aggregate from multiple source owners to one source', async () => {
+    const sourceTokenTwo = 'Stake11111111111111111111111111111111111111'
+    const sourceOwnerTwo = 'Vote111111111111111111111111111111111111111'
+    const reader = createReader({
+      blockTime: 1_700_000_000,
+      meta: {
+        err: null,
+        preTokenBalances: [
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '5000000' },
+          },
+          {
+            accountIndex: 3,
+            mint,
+            owner: sourceOwnerTwo,
+            uiTokenAmount: { amount: '5000000' },
+          },
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '0' } },
+        ],
+        postTokenBalances: [
+          {
+            accountIndex: 2,
+            mint,
+            owner: sourceToken,
+            uiTokenAmount: { amount: '4000000' },
+          },
+          {
+            accountIndex: 3,
+            mint,
+            owner: sourceOwnerTwo,
+            uiTokenAmount: { amount: '4500000' },
+          },
+          { accountIndex: 1, mint, owner, uiTokenAmount: { amount: '1500000' } },
+        ],
+      },
+      transaction: {
+        message: {
+          accountKeys: [owner, tokenAccount, sourceToken, sourceTokenTwo],
+          instructions: [
+            {
+              program: 'spl-token',
+              parsed: {
+                type: 'transfer',
+                info: {
+                  source: sourceToken,
+                  destination: tokenAccount,
+                  amount: '1000000',
+                },
+              },
+            },
+            {
+              program: 'spl-token',
+              parsed: {
+                type: 'transfer',
+                info: {
+                  source: sourceTokenTwo,
+                  destination: tokenAccount,
+                  amount: '500000',
+                },
+              },
+            },
+          ],
+        },
+      },
+    })
+
+    await expect(reader.scan(owner)).resolves.toEqual([
+      expect.objectContaining({ sourceAddress: undefined }),
+    ])
+  })
+
   it('does not checkpoint a positive balance change without proven transfer semantics', async () => {
     const reader = createReader({
       blockTime: 1_700_000_000,

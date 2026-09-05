@@ -42,6 +42,7 @@ export interface ReceiveDestination {
 export interface SolanaRail {
   getSettlementBalance(owner: string): Promise<SettlementBalance>
   getReceiveDestination(owner: string): Promise<ReceiveDestination>
+  checkReadiness?(): Promise<void>
 }
 
 export interface SolanaRailOptions {
@@ -266,6 +267,10 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
   }
 
   return {
+    async checkReadiness(): Promise<void> {
+      await getSettlementMetadata()
+    },
+
     async getReceiveDestination(owner): Promise<ReceiveDestination> {
       await getSettlementMetadata()
       return deriveDestinationWithoutValidation(owner)

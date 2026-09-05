@@ -19,6 +19,22 @@ function id(prefix: string): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve
+  })
+  return { promise, resolve }
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (condition()) return
+    await new Promise<void>((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error('Timed out waiting for test barrier')
+}
+
 function railThatConfirms(): PaymentRail {
   return {
     name: 'SOLANA_SPL',
@@ -541,6 +557,155 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(
           await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
         ).toBe(1000n)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('converges foreground and recovery callers on one durable payment attempt', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'attempt race recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+      const prepared = deferred()
+      let prepareCalls = 0
+      let executions = 0
+      const rail: PaymentRail = {
+        ...railThatConfirms(),
+        prepare: async () => {
+          prepareCalls += 1
+          await prepared.promise
+          return {
+            rail: 'SOLANA_SPL',
+            durableExecution: {
+              serializedPayload: 'one-signed-payload',
+              expectedExternalId: 'one-signature',
+              recoveryMetadata: JSON.stringify({ version: 1 }),
+            },
+          }
+        },
+        execute: async () => {
+          executions += 1
+          return { status: 'CONFIRMED', railTransactionId: 'one-signature' }
+        },
+      }
+      const service = new PaymentService(
+        database,
+        { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+        [rail],
+      )
+
+      try {
+        const foreground = service.createPayment(
+          account,
+          'PAY',
+          { recipientId: recipient.id, amount: '2.00', currency: 'USD' },
+          'foreground-attempt-race',
+        )
+        await waitFor(() => prepareCalls > 0)
+        const payment = (await database.listPayments(account.account.id))[0]
+        if (payment === undefined) throw new Error('Payment was not persisted')
+        const recovery = service.recoverPersistedPayment(payment)
+        await new Promise<void>((resolve) => setTimeout(resolve, 25))
+        expect(prepareCalls).toBeGreaterThanOrEqual(1)
+        prepared.resolve()
+        const [foregroundResult, recoveryResult] = await Promise.all([
+          foreground,
+          recovery,
+        ])
+
+        const attempts = await database.listPaymentAttempts(payment.id)
+        expect(attempts).toHaveLength(1)
+        expect(attempts[0]?.attemptNumber).toBe(1)
+        expect(attempts[0]?.expectedExternalId).toBe('one-signature')
+        expect(executions).toBe(1)
+        expect(foregroundResult.payment.id).toBe(payment.id)
+        expect(recoveryResult.id).toBe(payment.id)
+        expect(recoveryResult.status).toBe('CONFIRMED')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('fails a persisted CREATED attempt deterministically and releases its reservation', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const account = await createAccount(database)
+      const recipient = await database.createRecipient({
+        id: id('rcpt'),
+        ownerAccountId: account.account.id,
+        displayName: 'prepared failure recipient',
+        type: 'BUSINESS',
+        destination: {
+          id: id('dest'),
+          rail: 'SOLANA_SPL',
+          type: 'SOLANA_SPL',
+          walletAddress: 'wallet-address',
+        },
+      })
+      const payment = (
+        await database.createPaymentWithReservation({
+          paymentId: id('pay'),
+          reservationId: id('resv'),
+          idempotencyId: id('idem'),
+          ownerAccountId: account.account.id,
+          operation: 'SEND',
+          idempotencyKey: 'prepared-deterministic-failure',
+          requestHash: 'a'.repeat(64),
+          payerAccountId: account.account.id,
+          recipientId: recipient.id,
+          amountAtomic: 200n,
+          currency: 'USD',
+          route: 'SOLANA_SPL',
+          payerPublicKey: account.account.solanaPublicKey,
+          destinationRail: 'SOLANA_SPL',
+          destinationType: 'SOLANA_SPL',
+          destinationReference: 'wallet-address',
+          settledAtomic: 1_000n,
+        })
+      ).payment
+      const attempt = (
+        await database.getOrCreatePaymentAttempt({
+          id: id('att'),
+          paymentId: payment.id,
+          rail: 'SOLANA_SPL',
+          status: 'CREATED',
+        })
+      ).attempt
+      const rail: PaymentRail = {
+        ...railThatConfirms(),
+        prepare: async () => {
+          throw new ExternalRailError(
+            'invalid transaction construction',
+            undefined,
+            'DETERMINISTIC',
+          )
+        },
+      }
+
+      try {
+        const recovered = await new PaymentService(
+          database,
+          { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
+          [rail],
+        ).recoverPersistedPayment(payment)
+        expect(recovered.status).toBe('FAILED')
+        expect((await database.listPaymentAttempts(payment.id))[0]?.status).toBe(
+          'FAILED',
+        )
+        expect(
+          await database.getActiveOutgoingReservationAtomic(account.account.id, 'USD'),
+        ).toBe(0n)
+        expect(attempt.status).toBe('CREATED')
       } finally {
         await database.disconnect()
       }

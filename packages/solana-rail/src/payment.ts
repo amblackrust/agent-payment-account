@@ -335,6 +335,11 @@ export function createSolanaPaymentRailWithRpc(
     options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
     'Solana confirmation poll interval',
   )
+  const validatedFeePayerSecret = parseSecretKey(
+    options.feePayerSecret,
+    'fee payer secret',
+  )
+  validatedFeePayerSecret.fill(0)
   const now = options.now ?? Date.now
   const sleep =
     options.sleep ??

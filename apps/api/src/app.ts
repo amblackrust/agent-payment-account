@@ -260,6 +260,31 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       },
     )
 
+    if (options.receiveService !== undefined) {
+      app.get<{ Params: { receiveId: string } }>(
+        '/v1/receives/:receiveId',
+        {
+          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: {
+            params: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { receiveId: { type: 'string', minLength: 1 } },
+              required: ['receiveId'],
+            },
+          },
+        },
+        async (request) => {
+          const account = requireAgentAccount(request)
+          return options.receiveService!.getReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            request.params.receiveId,
+          )
+        },
+      )
+    }
+
     if (options.recipientService !== undefined) {
       const { recipientService } = options
       app.post<{

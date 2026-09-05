@@ -15,13 +15,20 @@ export type PaymentOperation = 'PAY' | 'SEND' | 'RECEIVE' | 'REFUND'
 export type PaymentKind = Extract<PaymentOperation, 'PAY' | 'SEND' | 'REFUND'>
 
 export type PaymentAttemptStatus =
-  'CREATED' | 'PREPARED' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
+  | 'CREATED'
+  | 'PREPARED'
+  | 'EXECUTING'
+  | 'SUBMITTED'
+  | 'RECONCILING'
+  | 'CONFIRMED'
+  | 'FAILED'
 
 const PAYMENT_ATTEMPT_TRANSITIONS: Readonly<
   Record<PaymentAttemptStatus, readonly PaymentAttemptStatus[]>
 > = {
   CREATED: ['PREPARED', 'FAILED'],
-  PREPARED: ['SUBMITTED', 'RECONCILING', 'FAILED'],
+  PREPARED: ['EXECUTING', 'SUBMITTED', 'RECONCILING', 'FAILED'],
+  EXECUTING: ['SUBMITTED', 'RECONCILING', 'FAILED'],
   SUBMITTED: ['CONFIRMED', 'RECONCILING', 'FAILED'],
   RECONCILING: ['CONFIRMED', 'FAILED'],
   CONFIRMED: [],

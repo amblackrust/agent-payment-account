@@ -58,12 +58,25 @@ export class TransactionService {
       .map((payment) => payment.recipientId)
       .filter((id): id is string => id !== null)
     const recipients = await findRecipients(this.repository, accountId, recipientIds)
+    const attempts =
+      this.repository.listLatestPaymentAttempts === undefined
+        ? []
+        : await this.repository.listLatestPaymentAttempts(
+            payments.map((payment) => payment.id),
+          )
+    const transactionIds = new Map(
+      attempts.map((attempt) => [attempt.paymentId, attempt.railTransactionId]),
+    )
     const displayNames = new Map(
       recipients.map((recipient) => [recipient.id, recipient.displayName]),
     )
     const merged = [
       ...payments.map((payment) =>
-        serializeOutgoing(payment, displayNames.get(payment.recipientId ?? '')),
+        serializeOutgoing(
+          payment,
+          displayNames.get(payment.recipientId ?? ''),
+          transactionIds.get(payment.id) ?? null,
+        ),
       ),
       ...incoming.map(serializeIncoming),
     ]
@@ -87,7 +100,15 @@ export class TransactionService {
         payment.recipientId === null
           ? []
           : await findRecipients(this.repository, accountId, [payment.recipientId])
-      return serializeOutgoing(payment, recipients[0]?.displayName)
+      const attempts =
+        this.repository.listLatestPaymentAttempts === undefined
+          ? []
+          : await this.repository.listLatestPaymentAttempts([payment.id])
+      return serializeOutgoing(
+        payment,
+        recipients[0]?.displayName,
+        attempts[0]?.railTransactionId ?? null,
+      )
     }
     const incoming = await this.repository.findIncomingPaymentForOwner(accountId, id)
     if (incoming !== null) return serializeIncoming(incoming)
@@ -206,6 +227,7 @@ async function findRecipients(
 function serializeOutgoing(
   payment: PaymentRecord,
   recipientDisplayName: string | undefined,
+  railTransactionId: string | null = null,
 ): TransactionResponse {
   if (payment.currency !== 'USD') throw new Error('Unsupported transaction currency')
   return {
@@ -224,7 +246,7 @@ function serializeOutgoing(
     created_at: payment.createdAt.toISOString(),
     updated_at: payment.updatedAt.toISOString(),
     confirmed_at: payment.confirmedAt?.toISOString() ?? null,
-    signature: null,
+    signature: railTransactionId,
   }
 }
 

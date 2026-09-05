@@ -495,6 +495,12 @@ export class AgentPaymentAccount {
     )
   }
 
+  public async getReceive(receiveId: string): Promise<ReceiveRequest> {
+    return parseReceive(
+      await this.request(`/v1/receives/${encodeURIComponent(receiveId)}`, 'GET'),
+    )
+  }
+
   public async refund(
     input: RefundInput,
     options?: string | IdempotencyOptions,

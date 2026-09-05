@@ -15,6 +15,7 @@ export interface CreatedAccountResponse {
   readonly name: string
   readonly status: 'ACTIVE'
   readonly apiKey: string
+  readonly credentialId: string
   readonly receiveId: string
   readonly destination: ReceiveDestination
 }
@@ -37,6 +38,7 @@ export class AccountService {
       const encryptedSecret = this.cipher.encrypt(wallet.secretKey)
       const destination = await this.rail.getReceiveDestination(wallet.publicKey)
       const credential = generateApiCredential()
+      const credentialId = createCredentialId()
       const account = await this.repository.createAgentAccount({
         id: createAccountId(),
         name: normalizedName,
@@ -44,7 +46,7 @@ export class AccountService {
         encryptedSolanaSecret: encryptedSecret.ciphertext,
         encryptionNonce: encryptedSecret.nonce,
         encryptionAuthTag: encryptedSecret.authTag,
-        credentialId: createCredentialId(),
+        credentialId,
         keyHash: credential.keyHash,
         keyPrefix: credential.keyPrefix,
       })
@@ -54,6 +56,7 @@ export class AccountService {
         name: account.name,
         status: 'ACTIVE',
         apiKey: credential.rawKey,
+        credentialId,
         receiveId: createReceiveId(),
         destination,
       }
@@ -69,6 +72,7 @@ export function serializeAccountCreation(response: CreatedAccountResponse) {
     name: response.name,
     status: response.status,
     api_key: response.apiKey,
+    credential_id: response.credentialId,
     receive: {
       id: response.receiveId,
       currency: 'USD' as const,

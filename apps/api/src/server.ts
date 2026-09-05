@@ -67,9 +67,15 @@ async function startServer(): Promise<void> {
     allowMainnet: config.allowMainnet,
     settlementMint: config.solanaSettlementMint,
   })
+  const runtimeReadiness = {
+    checkReadiness: async (): Promise<void> => {
+      await database.checkReadiness()
+      await rail.checkReadiness?.()
+    },
+  }
   const app = buildApp({
     config,
-    readinessDependency: database,
+    readinessDependency: runtimeReadiness,
     accountRepository: database,
     accountService,
     solanaRail: rail,
@@ -107,10 +113,9 @@ async function startServer(): Promise<void> {
       )
     })
   }
-  runWorkers()
-  const reconciliationTimer = setInterval(runWorkers, 5_000)
+  let reconciliationTimer: NodeJS.Timeout | undefined
   app.addHook('onClose', async () => {
-    clearInterval(reconciliationTimer)
+    if (reconciliationTimer !== undefined) clearInterval(reconciliationTimer)
     incomingReconciliation.stop()
     outgoingReconciliation.stop()
     await Promise.all([incomingReconciliation.drain(), outgoingReconciliation.drain()])
@@ -145,6 +150,9 @@ async function startServer(): Promise<void> {
   })
 
   try {
+    await runtimeReadiness.checkReadiness()
+    runWorkers()
+    reconciliationTimer = setInterval(runWorkers, 5_000)
     await app.listen({ host: '0.0.0.0', port: config.port })
     app.log.info({ config: redactConfig(config) }, 'API started')
   } catch (error) {

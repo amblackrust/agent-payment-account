@@ -85,6 +85,9 @@ describe('transaction history pagination', () => {
         cursor?: never,
       ) => page(incomingPayments, limit, cursor),
       findRecipientsForOwner: async () => [],
+      listLatestPaymentAttempts: async () => [
+        { paymentId: 'pay_b', railTransactionId: 'signature-pay-b' },
+      ],
     }
     const service = new TransactionService(repository as never)
 
@@ -111,11 +114,15 @@ describe('transaction history pagination', () => {
       listPaymentsPage: async () => [outgoing('pay_b', time)],
       listIncomingPaymentsPage: async () => [incoming('in_a', time)],
       findRecipientsForOwner: async () => [],
+      listLatestPaymentAttempts: async () => [
+        { paymentId: 'pay_b', railTransactionId: 'signature-pay-b' },
+      ],
     }
     const page = await new TransactionService(repository as never).listTransactionsPage(
       'acct_1',
       { limit: 2 },
     )
     expect(page.transactions.map((item) => item.id)).toEqual(['pay_b', 'in_a'])
+    expect(page.transactions[0]?.signature).toBe('signature-pay-b')
   })
 })
