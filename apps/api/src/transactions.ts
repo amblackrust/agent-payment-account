@@ -3,9 +3,10 @@ import type {
   IncomingPaymentRepository,
   PaymentRecord,
   PaymentRepository,
+  RecipientRepository,
 } from '@agent-payment/db'
 
-type TransactionStore = PaymentRepository & IncomingPaymentRepository
+type TransactionStore = PaymentRepository & IncomingPaymentRepository & RecipientRepository
 
 export class TransactionService {
   public constructor(private readonly repository: TransactionStore) {}
@@ -15,14 +16,23 @@ export class TransactionService {
       this.repository.listPayments(accountId),
       this.repository.listIncomingPayments(accountId),
     ])
-    return [...payments.map((payment) => serializeOutgoing(payment)), ...incoming.map(serializeIncoming)]
+    const outgoing = await Promise.all(
+      payments.map(async (payment) => serializeOutgoing(
+        payment,
+        (await this.repository.findRecipientForOwner(accountId, payment.recipientId))?.displayName,
+      )),
+    )
+    return [...outgoing, ...incoming.map(serializeIncoming)]
       .sort((left, right) => right.created_at.localeCompare(left.created_at))
   }
 
   public async getTransaction(accountId: string, id: string) {
     const payment = await this.repository.findPaymentForOwner(accountId, id)
     if (payment !== null) {
-      return serializeOutgoing(payment)
+      return serializeOutgoing(
+        payment,
+        (await this.repository.findRecipientForOwner(accountId, payment.recipientId))?.displayName,
+      )
     }
     const incoming = await this.repository.findIncomingPaymentForOwner(accountId, id)
     if (incoming !== null) {
@@ -34,7 +44,7 @@ export class TransactionService {
   }
 }
 
-function serializeOutgoing(payment: PaymentRecord) {
+function serializeOutgoing(payment: PaymentRecord, recipientDisplayName: string | undefined) {
   return {
     id: payment.id,
     direction: 'OUTGOING' as const,
@@ -42,7 +52,10 @@ function serializeOutgoing(payment: PaymentRecord) {
     amount: formatMoney(moneyFromAtomicUnits(payment.amountAtomic, payment.currency)),
     currency: payment.currency,
     status: payment.status,
-    counterparty: { recipient_id: payment.recipientId },
+    counterparty: {
+      recipient_id: payment.recipientId,
+      display_name: recipientDisplayName ?? null,
+    },
     created_at: payment.createdAt.toISOString(),
     updated_at: payment.updatedAt.toISOString(),
     confirmed_at: payment.confirmedAt?.toISOString() ?? null,

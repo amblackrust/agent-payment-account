@@ -22,7 +22,7 @@ export interface SolanaIncomingReader {
 interface SignatureInfo {
   readonly signature: string
   readonly err: unknown
-  readonly blockTime: number | null
+  readonly blockTime: number | bigint | null
 }
 
 interface TokenBalance {
@@ -115,7 +115,7 @@ export function createSolanaIncomingReader(
           settlementMint,
           confirmedAt: transaction.blockTime === null
             ? new Date()
-            : new Date(transaction.blockTime * 1000),
+            : new Date(Number(transaction.blockTime) * 1000),
         })
       }
       return transfers
