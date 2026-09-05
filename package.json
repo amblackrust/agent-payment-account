@@ -16,7 +16,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:solana": "test -n \"$DATABASE_URL\" || { echo 'DATABASE_URL is required for the PostgreSQL-backed Solana E2E' >&2; exit 1; }; vitest run packages/solana-rail/src/surfpool.integration.test.ts apps/api/src/payments.solana.integration.test.ts",
-    "verify": "test -n \"$DATABASE_URL\" || { echo 'DATABASE_URL is required for the full verification gate' >&2; exit 1; }; pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm test:solana",
+    "verify": "node scripts/verify-clean.mjs",
     "test:watch": "vitest",
     "typecheck": "pnpm --recursive --if-present typecheck",
     "db:generate": "pnpm --filter @agent-payment/db generate",

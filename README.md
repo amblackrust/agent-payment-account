@@ -204,6 +204,16 @@ key returns `409`. If a POST outcome is ambiguous, `PaymentPendingError` exposes
 the same `idempotencyKey` and, when known, `paymentId`; poll or retry with that
 key instead of creating a new one.
 
+## Local development
+
+```bash
+pnpm install --frozen-lockfile
+cp .env.example .env
+docker compose up -d postgres
+pnpm db:migrate
+pnpm dev
+```
+
 ## Local Solana integration test with Surfpool
 
 The product integration suite uses isolated, offline Surfpool and PostgreSQL;
@@ -270,20 +280,18 @@ console.log(balance.available, current.status, transactions.length)
 The polling loop is explicit application code; the SDK does not silently poll.
 The SDK package has no Solana dependency.
 
-## Verification commands
+## Release / CI verification
 
-With PostgreSQL running and `DATABASE_URL` set:
+The release gate creates a disposable PostgreSQL Compose project backed by
+tmpfs, applies every migration to an empty database with `prisma migrate deploy`,
+runs all PostgreSQL-backed tests, builds the workspace, and runs the offline
+Surfpool E2E. It removes the disposable database on success or failure and
+does not touch the normal developer volume.
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm db:migrate
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm build
-pnpm test:solana
 pnpm verify
 ```
 
-`pnpm verify` is the release gate and fails fast when `DATABASE_URL` is absent,
-so PostgreSQL-backed verification cannot be silently skipped.
+`pnpm verify` is the final release gate. It provides `DATABASE_URL` itself, so
+required PostgreSQL and Surfpool suites cannot be silently skipped.

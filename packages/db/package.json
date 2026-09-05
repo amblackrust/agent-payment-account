@@ -16,6 +16,7 @@
     "build": "pnpm generate && tsc -p tsconfig.json",
     "generate": "prisma generate --config prisma.generate.config.ts",
     "migrate:dev": "prisma migrate dev --config prisma.config.ts",
+    "migrate:deploy": "prisma migrate deploy --config prisma.config.ts",
     "prisma:format": "prisma format --config prisma.config.ts",
     "prisma:validate": "prisma validate --config prisma.config.ts",
     "typecheck": "pnpm generate && tsc --noEmit -p tsconfig.json"
