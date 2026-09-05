@@ -556,17 +556,27 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       )
 
       if (options.transactionService !== undefined) {
-        app.get(
+        app.get<{ Querystring: { limit?: number; cursor?: string } }>(
           '/v1/transactions',
           {
             preHandler: async (request) =>
               authenticateAgent(request, accountRepository),
+            schema: {
+              querystring: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                  cursor: { type: 'string', minLength: 1 },
+                },
+              },
+            },
           },
-          async (request) => ({
-            transactions: await options.transactionService!.listTransactions(
+          async (request) =>
+            options.transactionService!.listTransactionsPage(
               requireAgentAccount(request).account.id,
+              request.query,
             ),
-          }),
         )
         app.get<{ Params: { transactionId: string } }>(
           '/v1/transactions/:transactionId',

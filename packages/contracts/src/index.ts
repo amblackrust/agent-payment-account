@@ -97,7 +97,10 @@ export const transactionResponseSchema = z
   .strict()
 
 export const transactionListResponseSchema = z
-  .object({ transactions: z.array(transactionResponseSchema) })
+  .object({
+    transactions: z.array(transactionResponseSchema),
+    next_cursor: z.string().nullable(),
+  })
   .strict()
 
 export const apiErrorResponseSchema = z

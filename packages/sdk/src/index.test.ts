@@ -144,7 +144,7 @@ async function createLocalApi() {
   }))
   app.post('/v1/receives', async () => receive)
   app.get('/v1/payments/:paymentId', async () => payment)
-  app.get('/v1/transactions', async () => ({ transactions: [transaction] }))
+  app.get('/v1/transactions', async () => ({ transactions: [transaction], next_cursor: null }))
   return { app, requests }
 }
 

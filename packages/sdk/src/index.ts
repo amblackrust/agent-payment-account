@@ -111,6 +111,11 @@ export interface Transaction {
   readonly signature: string | null
 }
 
+export interface TransactionPage {
+  readonly transactions: readonly Transaction[]
+  readonly nextCursor: string | null
+}
+
 export interface IdempotencyOptions {
   readonly idempotencyKey?: string
 }
@@ -335,13 +340,16 @@ function parseTransaction(value: unknown): Transaction {
   }
 }
 
-function parseTransactionList(value: unknown): readonly Transaction[] {
+function parseTransactionListPage(value: unknown): TransactionPage {
   const response = parseContract<TransactionListResponse>(
     value,
     transactionListResponseSchema,
     'API returned an invalid transaction list response',
   )
-  return response.transactions.map(parseTransaction)
+  return {
+    transactions: response.transactions.map(parseTransaction),
+    nextCursor: response.next_cursor,
+  }
 }
 
 function generatedIdempotencyKey(): string {
@@ -504,8 +512,30 @@ export class AgentPaymentAccount {
     )
   }
 
+  public async listTransactionsPage(input: {
+    readonly limit?: number
+    readonly cursor?: string
+  } = {}): Promise<TransactionPage> {
+    const query = new URLSearchParams()
+    if (input.limit !== undefined) query.set('limit', String(input.limit))
+    if (input.cursor !== undefined) query.set('cursor', input.cursor)
+    const suffix = query.toString()
+    return parseTransactionListPage(
+      await this.request(`/v1/transactions${suffix === '' ? '' : `?${suffix}`}`, 'GET'),
+    )
+  }
+
   public async listTransactions(): Promise<readonly Transaction[]> {
-    return parseTransactionList(await this.request('/v1/transactions', 'GET'))
+    const transactions: Transaction[] = []
+    let cursor: string | undefined
+    do {
+      const page = await this.listTransactionsPage({
+        ...(cursor === undefined ? {} : { cursor }),
+      })
+      transactions.push(...page.transactions)
+      cursor = page.nextCursor ?? undefined
+    } while (cursor !== undefined)
+    return transactions
   }
 
   private async postMoney<T>(

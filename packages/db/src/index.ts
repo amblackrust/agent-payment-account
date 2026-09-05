@@ -125,6 +125,10 @@ export interface RecipientRepository {
     recipientId: string,
   ): Promise<RecipientRecord | null>
   listRecipients(ownerAccountId: string): Promise<readonly RecipientRecord[]>
+  readonly findRecipientsForOwner?: (
+    ownerAccountId: string,
+    recipientIds: readonly string[],
+  ) => Promise<readonly RecipientRecord[]>
   updateRecipient(input: UpdateRecipientInput): Promise<RecipientRecord | null>
 }
 
@@ -282,6 +286,11 @@ export interface IncomingPaymentRepository {
     id: string,
   ): Promise<IncomingPaymentRecord | null>
   listIncomingPayments(accountId: string): Promise<readonly IncomingPaymentRecord[]>
+  readonly listIncomingPaymentsPage?: (
+    accountId: string,
+    limit: number,
+    cursor?: { readonly createdAt: Date; readonly id: string },
+  ) => Promise<readonly IncomingPaymentRecord[]>
 }
 
 export interface PaymentAttemptRecord {
@@ -420,6 +429,11 @@ export interface PaymentRepository {
     paymentId: string,
   ): Promise<PaymentRecord | null>
   listPayments(ownerAccountId: string): Promise<readonly PaymentRecord[]>
+  readonly listPaymentsPage?: (
+    ownerAccountId: string,
+    limit: number,
+    cursor?: { readonly createdAt: Date; readonly id: string },
+  ) => Promise<readonly PaymentRecord[]>
   listRecoverablePayments(limit: number): Promise<readonly PaymentRecord[]>
   findPaymentForRefund(
     accountId: string,
@@ -590,6 +604,14 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       const recipients = await prisma.recipient.findMany({
         where: { ownerAccountId },
         orderBy: { createdAt: 'desc' },
+        include: { destinations: true, ownerAccount: { select: { status: true } } },
+      })
+      return recipients.map(toRecipientRecord)
+    },
+    async findRecipientsForOwner(ownerAccountId, recipientIds) {
+      if (recipientIds.length === 0) return []
+      const recipients = await prisma.recipient.findMany({
+        where: { ownerAccountId, id: { in: [...recipientIds] } },
         include: { destinations: true, ownerAccount: { select: { status: true } } },
       })
       return recipients.map(toRecipientRecord)
@@ -1255,6 +1277,24 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
       return payments.map(toPaymentRecord)
     },
+    async listPaymentsPage(ownerAccountId, limit, cursor) {
+      const payments = await prisma.payment.findMany({
+        where: {
+          payerAccountId: ownerAccountId,
+          ...(cursor === undefined
+            ? {}
+            : {
+                OR: [
+                  { createdAt: { lt: cursor.createdAt } },
+                  { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+                ],
+              }),
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+      })
+      return payments.map(toPaymentRecord)
+    },
     async listRecoverablePayments(limit): Promise<readonly PaymentRecord[]> {
       const payments = await prisma.payment.findMany({
         where: {
@@ -1458,6 +1498,24 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       const payments = await prisma.incomingPayment.findMany({
         where: { accountId },
         orderBy: { createdAt: 'desc' },
+      })
+      return payments.map(toIncomingPaymentRecord)
+    },
+    async listIncomingPaymentsPage(accountId, limit, cursor) {
+      const payments = await prisma.incomingPayment.findMany({
+        where: {
+          accountId,
+          ...(cursor === undefined
+            ? {}
+            : {
+                OR: [
+                  { createdAt: { lt: cursor.createdAt } },
+                  { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+                ],
+              }),
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
       })
       return payments.map(toIncomingPaymentRecord)
     },
