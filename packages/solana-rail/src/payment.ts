@@ -48,6 +48,7 @@ export const SOLANA_SPL_RAIL = 'SOLANA_SPL'
 const CONFIRMATION_COMMITMENT = 'confirmed' as const
 const DEFAULT_CONFIRMATION_TIMEOUT_MS = 15_000
 const DEFAULT_POLL_INTERVAL_MS = 250
+const DEFAULT_MIN_FEE_PAYER_BALANCE_LAMPORTS = 1_000_000n
 const SOLANA_SECRET_KEY_BYTES = 64
 
 function createPaymentMemo(
@@ -70,6 +71,7 @@ export interface SolanaPaymentRailOptions {
   readonly rpcTimeoutMs?: number | undefined
   readonly confirmationTimeoutMs?: number | undefined
   readonly pollIntervalMs?: number | undefined
+  readonly minimumFeePayerBalanceLamports?: bigint | undefined
   readonly now?: (() => number) | undefined
   readonly sleep?: ((milliseconds: number) => Promise<void>) | undefined
 }
@@ -335,6 +337,13 @@ export function createSolanaPaymentRailWithRpc(
     options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
     'Solana confirmation poll interval',
   )
+  const minimumFeePayerBalanceLamports =
+    options.minimumFeePayerBalanceLamports ?? DEFAULT_MIN_FEE_PAYER_BALANCE_LAMPORTS
+  if (minimumFeePayerBalanceLamports <= 0n) {
+    throw new SolanaRailConfigurationError(
+      'Minimum fee payer balance must be a positive lamport amount',
+    )
+  }
   const validatedFeePayerSecret = parseSecretKey(
     options.feePayerSecret,
     'fee payer secret',
@@ -690,6 +699,13 @@ export function createSolanaPaymentRailWithRpc(
 
         const instructions: Instruction[] = []
         if (!recipientAccount.exists) {
+          if (context.allowRecipientAtaCreation !== true) {
+            throw new ExternalRailError(
+              'Recipient token account must already exist for externally controlled recipients',
+              undefined,
+              'DETERMINISTIC',
+            )
+          }
           instructions.push(
             getCreateAssociatedTokenIdempotentInstruction({
               payer: feePayerSigner,
@@ -754,12 +770,24 @@ export function createSolanaPaymentRailWithRpc(
             .getBalance(feePayerSigner.address, { commitment: CONFIRMATION_COMMITMENT })
             .send({ abortSignal }),
         )
+        if (feeBalance.value < minimumFeePayerBalanceLamports) {
+          throw new ExternalRailError(
+            'Platform fee payer is below the minimum operating balance',
+            undefined,
+            'DETERMINISTIC',
+          )
+        }
         if (feeBalance.value < requiredFeePayerBalance) {
           throw new ExternalRailError(
             'Platform fee payer balance is insufficient for this transaction',
             undefined,
             'DETERMINISTIC',
           )
+        }
+        if (recipientAta[0] !== payerAta[0] && !recipientAccount.exists) {
+          if (context.reserveSponsorship !== undefined) {
+            await context.reserveSponsorship(requiredFeePayerBalance)
+          }
         }
         const signedTransaction =
           await signTransactionMessageWithSigners(transactionMessage)

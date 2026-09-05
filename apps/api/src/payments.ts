@@ -53,6 +53,11 @@ export interface PaymentEventSink {
   info(data: Readonly<Record<string, unknown>>, message: string): void
 }
 
+export interface SponsorshipPolicy {
+  readonly maxLamportsPerDay: bigint
+  readonly maxTransactionsPerHour: number
+}
+
 export type PayerSecretKeyProvider = (accountId: string) => Promise<Uint8Array>
 
 type PaymentStore = PaymentRepository & RecipientRepository & ReservationRepository
@@ -66,6 +71,7 @@ export class PaymentService {
     private readonly rails: readonly PaymentRail[],
     private readonly payerSecretKeyProvider?: PayerSecretKeyProvider,
     eventSink?: PaymentEventSink,
+    private readonly sponsorshipPolicy?: SponsorshipPolicy,
   ) {
     this.eventSink = eventSink
   }
@@ -508,10 +514,25 @@ export class PaymentService {
   }
 
   private createPreparationContext(payment: PaymentRecord): RailPreparationContext {
+    const sponsorshipPolicy = this.sponsorshipPolicy
+    const reserveFeeSponsorship = this.repository.reserveFeeSponsorship
     return {
       paymentId: payment.id,
       payerAccountId: payment.payerAccountId,
       payerPublicKey: payment.payerPublicKey as string,
+      allowRecipientAtaCreation: payment.recipientManagedAccountId !== null,
+      ...(sponsorshipPolicy === undefined || reserveFeeSponsorship === undefined
+        ? {}
+        : {
+            reserveSponsorship: (lamports: bigint) =>
+              reserveFeeSponsorship({
+                accountId: payment.payerAccountId,
+                paymentId: payment.id,
+                lamports,
+                maxLamportsPerDay: sponsorshipPolicy.maxLamportsPerDay,
+                maxTransactionsPerHour: sponsorshipPolicy.maxTransactionsPerHour,
+              }),
+          }),
       getPayerSecretKey: async () => {
         if (this.payerSecretKeyProvider === undefined) {
           throw new ExternalRailError('Payer custody is not configured')

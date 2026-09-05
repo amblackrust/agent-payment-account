@@ -174,6 +174,7 @@ async function createPreparedRail(
     allowMainnet: false,
     settlementMint: mint,
     feePayerSecret: JSON.stringify(Array.from(await exportSecret(feePayer))),
+    minimumFeePayerBalanceLamports: 1n,
   })
   const payerSecret = await exportSecret(payer)
   const prepared = await rail.prepare(
@@ -193,6 +194,7 @@ async function createPreparedRail(
       paymentId: 'pay_transfer',
       payerAccountId: 'acct_payer',
       payerPublicKey: payer.address,
+      allowRecipientAtaCreation: true,
       getPayerSecretKey: async () => payerSecret,
     },
   )

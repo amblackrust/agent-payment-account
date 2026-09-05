@@ -4,6 +4,7 @@ import {
   assertPaymentAttemptStatusTransition,
   assertPaymentStatusTransition,
   ConflictError,
+  ExternalRailError,
   InsufficientFundsError,
   RecipientResolutionError,
 } from '@agent-payment/core'
@@ -69,6 +70,17 @@ export interface AccountRepository {
   markCredentialUsed(credentialId: string): Promise<void>
   revokeCredential(accountId: string, credentialId: string): Promise<boolean>
   readonly findAccountPublicKey?: (accountId: string) => Promise<string | null>
+}
+
+export interface SponsorshipRepository {
+  reserveFeeSponsorship(input: {
+    readonly accountId: string
+    readonly paymentId: string
+    readonly lamports: bigint
+    readonly maxLamportsPerDay: bigint
+    readonly maxTransactionsPerHour: number
+    readonly now?: Date
+  }): Promise<void>
 }
 
 export interface RecipientDestinationRecord {
@@ -147,6 +159,14 @@ export interface ReservationRepository {
     ownerAccountId: string,
     currency: string,
   ): Promise<bigint>
+  readonly reserveFeeSponsorship?: (input: {
+    readonly accountId: string
+    readonly paymentId: string
+    readonly lamports: bigint
+    readonly maxLamportsPerDay: bigint
+    readonly maxTransactionsPerHour: number
+    readonly now?: Date
+  }) => Promise<void>
 }
 
 export type PaymentKind = 'PAY' | 'SEND' | 'REFUND'
@@ -465,6 +485,14 @@ export interface DatabaseClient
     ReservationRepository,
     ReceiveRepository,
     IncomingPaymentRepository {
+  reserveFeeSponsorship(input: {
+    readonly accountId: string
+    readonly paymentId: string
+    readonly lamports: bigint
+    readonly maxLamportsPerDay: bigint
+    readonly maxTransactionsPerHour: number
+    readonly now?: Date
+  }): Promise<void>
   findAccountCustody(accountId: string): Promise<AccountCustodyRecord | null>
   findAccountPublicKey(accountId: string): Promise<string | null>
   checkReadiness(): Promise<void>
@@ -980,6 +1008,50 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         _sum: { amountAtomic: true },
       })
       return result._sum.amountAtomic ?? 0n
+    },
+    async reserveFeeSponsorship(input): Promise<void> {
+      const now = input.now ?? new Date()
+      const dayStart = new Date(now)
+      dayStart.setUTCHours(0, 0, 0, 0)
+      const hourStart = new Date(now.getTime() - 60 * 60 * 1000)
+      await prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT id FROM "agent_accounts" WHERE id = ${input.accountId} FOR UPDATE
+        `
+        const existing = await transaction.feeSponsorship.findUnique({
+          where: { paymentId: input.paymentId },
+        })
+        if (existing !== null) return
+        const [daily, hourly] = await Promise.all([
+          transaction.feeSponsorship.aggregate({
+            where: { accountId: input.accountId, createdAt: { gte: dayStart } },
+            _sum: { lamports: true },
+          }),
+          transaction.feeSponsorship.count({
+            where: { accountId: input.accountId, createdAt: { gte: hourStart } },
+          }),
+        ])
+        const dailyLamports = daily._sum.lamports ?? 0n
+        if (
+          dailyLamports + input.lamports > input.maxLamportsPerDay ||
+          hourly >= input.maxTransactionsPerHour
+        ) {
+          throw new ExternalRailError(
+            'Account sponsorship budget is exhausted',
+            undefined,
+            'DETERMINISTIC',
+          )
+        }
+        await transaction.feeSponsorship.create({
+          data: {
+            id: `spon_${randomBytes(16).toString('hex')}`,
+            accountId: input.accountId,
+            paymentId: input.paymentId,
+            lamports: input.lamports,
+            createdAt: now,
+          },
+        })
+      })
     },
     async transitionPayment(paymentId, currentStatus, nextStatus, fields) {
       assertPaymentStatusTransition(currentStatus, nextStatus)

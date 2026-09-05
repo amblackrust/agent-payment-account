@@ -20,6 +20,9 @@ import { IncomingReconciliationService } from './incoming.js'
 import { OutgoingPaymentReconciliationService } from './outgoing.js'
 import { TransactionService } from './transactions.js'
 
+const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
+const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
+
 async function startServer(): Promise<void> {
   const config = loadConfig()
   const database = createDatabaseClient(config.databaseUrl)
@@ -57,6 +60,11 @@ async function startServer(): Promise<void> {
     rail,
     [paymentRail],
     payerSecretKeyProvider,
+    undefined,
+    {
+      maxLamportsPerDay: SPONSORSHIP_MAX_LAMPORTS_PER_DAY,
+      maxTransactionsPerHour: SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR,
+    },
   )
   const transactionService = new TransactionService(database)
   const incomingReader = createSolanaIncomingReader({

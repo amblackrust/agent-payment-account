@@ -71,6 +71,7 @@ model AgentAccount {
   receiveRequests       ReceiveRequest[]
   idempotencyRecords    IdempotencyRecord[]
   outgoingReservations  OutgoingReservation[]
+  feeSponsorships       FeeSponsorship[]
   indexerCheckpoints    IndexerCheckpoint[]
 
   @@map("agent_accounts")
@@ -277,6 +278,18 @@ model OutgoingReservation {
 
   @@index([ownerAccountId, status])
   @@map("outgoing_reservations")
+}
+
+model FeeSponsorship {
+  id             String       @id @db.VarChar(64)
+  accountId      String       @map("account_id") @db.VarChar(64)
+  paymentId      String       @unique @map("payment_id") @db.VarChar(64)
+  lamports       BigInt
+  createdAt      DateTime     @default(now()) @map("created_at")
+  account        AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@index([accountId, createdAt])
+  @@map("fee_sponsorships")
 }
 
 model RuntimeMetadata {

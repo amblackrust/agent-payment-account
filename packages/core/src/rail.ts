@@ -40,6 +40,13 @@ export interface RailPreparationContext {
   readonly paymentId: string
   readonly payerAccountId: string
   readonly payerPublicKey: string
+  /**
+   * The application has verified whether a destination is eligible for
+   * platform-sponsored account creation. Rails must not infer that policy
+   * from an arbitrary destination address.
+   */
+  readonly allowRecipientAtaCreation?: boolean
+  readonly reserveSponsorship?: (lamports: bigint) => Promise<void>
   readonly getPayerSecretKey: () => Promise<Uint8Array>
 }
 
