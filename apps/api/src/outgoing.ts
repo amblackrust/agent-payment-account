@@ -35,7 +35,10 @@ export class OutgoingPaymentReconciliationService {
   }
 
   private async reconcileBatch(): Promise<void> {
-    const payments = await this.repository.listRecoverablePayments(this.batchSize)
+    const payments =
+      this.repository.claimRecoverablePayments === undefined
+        ? await this.repository.listRecoverablePayments(this.batchSize)
+        : await this.repository.claimRecoverablePayments(this.batchSize)
     for (const payment of payments) {
       try {
         await this.paymentService.recoverPersistedPayment(payment)

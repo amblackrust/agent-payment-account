@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 
 const AES_GCM_ALGORITHM = 'aes-256-gcm'
 const NONCE_BYTES = 12
@@ -74,5 +74,14 @@ export class WalletSecretCipher {
       }
       throw new WalletEncryptionError('Unable to decrypt wallet secret')
     }
+  }
+}
+
+export function fingerprintWalletMasterKey(masterKey: string): string {
+  const key = decodeMasterKey(masterKey)
+  try {
+    return createHash('sha256').update(key).digest('hex').slice(0, 32)
+  } finally {
+    key.fill(0)
   }
 }

@@ -19,8 +19,8 @@ export class IncomingReconciliationService {
     private readonly logger: { error(data: object, message: string): void },
   ) {}
 
-  public async runOnce(): Promise<void> {
-    if (this.stopped) return
+  public runOnce(): Promise<void> {
+    if (this.stopped) return Promise.resolve()
     if (this.currentRun !== undefined) return this.currentRun
     const run = this.reconcileAllAccounts()
     let trackedRun: Promise<void>

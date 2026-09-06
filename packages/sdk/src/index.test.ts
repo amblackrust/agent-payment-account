@@ -312,8 +312,8 @@ describe('AgentPaymentAccount SDK', () => {
         fetch: response('EXTERNAL_RAIL_FAILURE', 502),
       }).pay({ recipientId: 'rcpt_test', amount: '1.20' }, 'rail-failure-key'),
     ).rejects.toMatchObject({
-      code: 'EXTERNAL_SERVICE_ERROR',
-      statusCode: 502,
+      code: 'PAYMENT_PENDING',
+      idempotencyKey: 'rail-failure-key',
     })
     await expect(
       new AgentPaymentAccount({

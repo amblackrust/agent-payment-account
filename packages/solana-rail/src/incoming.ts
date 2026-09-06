@@ -458,14 +458,6 @@ function findAccountIndex(
   )
 }
 
-function getBalance(
-  balances: readonly TokenBalance[] | undefined,
-  accountIndex: number,
-): bigint | undefined {
-  const balance = balances?.find((candidate) => candidate.accountIndex === accountIndex)
-  return balance === undefined ? undefined : BigInt(balance.uiTokenAmount.amount)
-}
-
 function isDestinationAccount(
   transaction: TransactionResponse,
   accountIndex: number,

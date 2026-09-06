@@ -149,6 +149,10 @@ model Payment {
   originalPaymentId         String?              @map("original_payment_id") @db.VarChar(64)
   counterpartyAccountId     String?              @map("counterparty_account_id") @db.VarChar(64)
   counterpartyAddress       String?              @map("counterparty_address") @db.VarChar(128)
+  lastRecoveryAttemptAt     DateTime?            @map("last_recovery_attempt_at")
+  nextRecoveryAt            DateTime?            @map("next_recovery_at")
+  recoveryCount             Int                  @default(0) @map("recovery_count")
+  stuckSince                DateTime?            @map("stuck_since")
   payerAccount              AgentAccount         @relation("PayerPayments", fields: [payerAccountId], references: [id], onDelete: Restrict)
   recipient                 Recipient?           @relation(fields: [recipientId], references: [id], onDelete: Restrict)
   originalPayment           Payment?             @relation("PaymentRefunds", fields: [originalPaymentId], references: [id], onDelete: Restrict)
@@ -159,6 +163,7 @@ model Payment {
   @@index([payerAccountId, createdAt])
   @@index([recipientId, createdAt])
   @@index([payerAccountId, status])
+  @@index([status, nextRecoveryAt, lastRecoveryAttemptAt])
   @@map("payments")
 }
 

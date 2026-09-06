@@ -87,6 +87,7 @@ export interface PaymentRail {
     context?: RailPreparationContext,
   ) => Promise<RailRecoveryResult>
   readonly getStatus?: (railTransactionId: string) => Promise<RailStatusResult>
+  readonly checkReadiness?: () => Promise<void>
 }
 
 export type RailRecoveryResult = RailExecutionResult

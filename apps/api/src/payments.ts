@@ -13,6 +13,7 @@ import {
   RefundNotSupportedError,
   UnsupportedRailError,
   ValidationError,
+  MAX_REFERENCE_BYTES,
   type Money,
   type PaymentKind,
   type PaymentRail,
@@ -31,7 +32,6 @@ import type {
   RecipientRepository,
   ReservationRepository,
 } from '@agent-payment/db'
-import { MAX_REFERENCE_BYTES } from '@agent-payment/contracts'
 
 export interface SettledBalanceReader {
   getSettlementBalance(owner: string): Promise<{ readonly settled: Money }>
@@ -302,6 +302,44 @@ export class PaymentService {
 
   public listPayments(accountId: string): Promise<readonly PaymentRecord[]> {
     return this.repository.listPayments(accountId)
+  }
+
+  public async listPaymentsPage(
+    accountId: string,
+    input: { readonly limit?: number; readonly cursor?: string },
+  ): Promise<{
+    readonly payments: readonly PaymentRecord[]
+    readonly next_cursor: string | null
+  }> {
+    const limit = validatePaymentListLimit(input.limit)
+    const cursor = decodePaymentCursor(input.cursor)
+    const records =
+      this.repository.listPaymentsPage === undefined
+        ? await this.repository.listPayments(accountId)
+        : await this.repository.listPaymentsPage(accountId, limit + 1, cursor)
+    const page =
+      this.repository.listPaymentsPage === undefined
+        ? records
+            .filter(
+              (payment) =>
+                cursor === undefined ||
+                payment.createdAt < cursor.createdAt ||
+                (payment.createdAt.getTime() === cursor.createdAt.getTime() &&
+                  payment.id < cursor.id),
+            )
+            .sort(comparePaymentRecords)
+            .slice(0, limit + 1)
+        : records
+    const hasMore = page.length > limit
+    const visible = page.slice(0, limit)
+    const last = visible.at(-1)
+    return {
+      payments: visible,
+      next_cursor:
+        hasMore && last !== undefined
+          ? encodePaymentCursor({ createdAt: last.createdAt, id: last.id })
+          : null,
+    }
   }
 
   public async recoverPersistedPayment(payment: PaymentRecord): Promise<PaymentRecord> {
@@ -1060,6 +1098,50 @@ function compareStrings(left: string, right: string): -1 | 0 | 1 {
 
 function isRetryablePreDurableFailure(error: unknown): boolean {
   return error instanceof ExternalRailError && error.kind === 'RETRYABLE'
+}
+
+function validatePaymentListLimit(value: number | undefined): number {
+  const limit = value ?? 50
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new ValidationError('Payment limit must be an integer from 1 to 100')
+  }
+  return limit
+}
+
+function decodePaymentCursor(
+  value: string | undefined,
+): { readonly createdAt: Date; readonly id: string } | undefined {
+  if (value === undefined) return undefined
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      typeof (parsed as { createdAt?: unknown }).createdAt !== 'string' ||
+      typeof (parsed as { id?: unknown }).id !== 'string'
+    ) {
+      throw new Error('invalid cursor')
+    }
+    const createdAt = new Date((parsed as { createdAt: string }).createdAt)
+    if (Number.isNaN(createdAt.getTime())) throw new Error('invalid cursor')
+    return { createdAt, id: (parsed as { id: string }).id }
+  } catch {
+    throw new ValidationError('Payment cursor is invalid')
+  }
+}
+
+function encodePaymentCursor(cursor: {
+  readonly createdAt: Date
+  readonly id: string
+}): string {
+  return Buffer.from(
+    JSON.stringify({ createdAt: cursor.createdAt.toISOString(), id: cursor.id }),
+  ).toString('base64url')
+}
+
+function comparePaymentRecords(left: PaymentRecord, right: PaymentRecord): number {
+  const time = right.createdAt.getTime() - left.createdAt.getTime()
+  return time === 0 ? right.id.localeCompare(left.id) : time
 }
 
 class ResourceNotFoundError extends Error {

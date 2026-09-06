@@ -70,6 +70,32 @@ export interface AccountRepository {
   markCredentialUsed(credentialId: string): Promise<void>
   revokeCredential(accountId: string, credentialId: string): Promise<boolean>
   readonly findAccountPublicKey?: (accountId: string) => Promise<string | null>
+  readonly createApiCredential?: (input: {
+    readonly id: string
+    readonly accountId: string
+    readonly keyHash: string
+    readonly keyPrefix: string
+  }) => Promise<StoredApiCredential>
+  readonly listAccountSummaries?: () => Promise<readonly AccountSummary[]>
+  readonly findAccountSummary?: (accountId: string) => Promise<AccountSummary | null>
+}
+
+export interface StoredApiCredential {
+  readonly id: string
+  readonly accountId: string
+  readonly keyPrefix: string
+  readonly createdAt: Date
+  readonly revokedAt: Date | null
+}
+
+export interface AccountSummary {
+  readonly id: string
+  readonly name: string
+  readonly status: AgentAccountStatus
+  readonly solanaPublicKey: string
+  readonly createdAt: Date
+  readonly updatedAt: Date
+  readonly credentials: readonly StoredApiCredential[]
 }
 
 export interface SponsorshipRepository {
@@ -137,6 +163,11 @@ export interface RecipientRepository {
     recipientId: string,
   ): Promise<RecipientRecord | null>
   listRecipients(ownerAccountId: string): Promise<readonly RecipientRecord[]>
+  readonly listRecipientsPage?: (
+    ownerAccountId: string,
+    limit: number,
+    cursor?: { readonly createdAt: Date; readonly id: string },
+  ) => Promise<readonly RecipientRecord[]>
   readonly findRecipientsForOwner?: (
     ownerAccountId: string,
     recipientIds: readonly string[],
@@ -207,6 +238,10 @@ export interface PaymentRecord {
   readonly originalPaymentId: string | null
   readonly counterpartyAccountId: string | null
   readonly counterpartyAddress: string | null
+  readonly lastRecoveryAttemptAt: Date | null
+  readonly nextRecoveryAt: Date | null
+  readonly recoveryCount: number
+  readonly stuckSince: Date | null
 }
 
 export type ReceiveRequestStatus = 'OPEN' | 'PAID' | 'EXPIRED' | 'CANCELLED'
@@ -261,6 +296,7 @@ export interface CreateReceiveRequestInput {
   readonly amountAtomic?: bigint
   readonly currency: string
   readonly reference: string
+  readonly createdAt?: Date
   readonly expiresAt?: Date
 }
 
@@ -469,6 +505,10 @@ export interface PaymentRepository {
     cursor?: { readonly createdAt: Date; readonly id: string },
   ) => Promise<readonly PaymentRecord[]>
   listRecoverablePayments(limit: number): Promise<readonly PaymentRecord[]>
+  readonly claimRecoverablePayments?: (
+    limit: number,
+    now?: Date,
+  ) => Promise<readonly PaymentRecord[]>
   findPaymentForRefund(
     accountId: string,
     paymentId: string,
@@ -491,6 +531,7 @@ export interface DatabaseClient
     ReservationRepository,
     ReceiveRepository,
     IncomingPaymentRepository {
+  initializeRuntimeIdentity(input: RuntimeIdentity): Promise<void>
   reserveFeeSponsorship(input: {
     readonly accountId: string
     readonly paymentId: string
@@ -503,6 +544,14 @@ export interface DatabaseClient
   findAccountPublicKey(accountId: string): Promise<string | null>
   checkReadiness(): Promise<void>
   disconnect(): Promise<void>
+}
+
+export interface RuntimeIdentity {
+  readonly rail: string
+  readonly version: string
+  readonly cluster: string
+  readonly settlementMint: string
+  readonly custodyKeyFingerprint: string
 }
 
 async function matchIncomingPaymentInTransaction(
@@ -659,6 +708,78 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
       return result.count === 1
     },
+    async createApiCredential(input): Promise<StoredApiCredential> {
+      const credential = await prisma.apiCredential.create({
+        data: {
+          id: input.id,
+          accountId: input.accountId,
+          keyHash: input.keyHash,
+          keyPrefix: input.keyPrefix,
+        },
+      })
+      return {
+        id: credential.id,
+        accountId: credential.accountId,
+        keyPrefix: credential.keyPrefix,
+        createdAt: credential.createdAt,
+        revokedAt: credential.revokedAt,
+      }
+    },
+    async listAccountSummaries() {
+      const accounts = await prisma.agentAccount.findMany({
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        include: {
+          credentials: {
+            select: {
+              id: true,
+              accountId: true,
+              keyPrefix: true,
+              createdAt: true,
+              revokedAt: true,
+            },
+            orderBy: { createdAt: 'asc' },
+          },
+        },
+      })
+      return accounts.map((account) => ({
+        id: account.id,
+        name: account.name,
+        status: account.status,
+        solanaPublicKey: account.solanaPublicKey,
+        createdAt: account.createdAt,
+        updatedAt: account.updatedAt,
+        credentials: account.credentials,
+      }))
+    },
+    async findAccountSummary(accountId) {
+      const accounts = await prisma.agentAccount.findMany({
+        where: { id: accountId },
+        include: {
+          credentials: {
+            select: {
+              id: true,
+              accountId: true,
+              keyPrefix: true,
+              createdAt: true,
+              revokedAt: true,
+            },
+            orderBy: { createdAt: 'asc' },
+          },
+        },
+      })
+      const account = accounts[0]
+      return account === undefined
+        ? null
+        : {
+            id: account.id,
+            name: account.name,
+            status: account.status,
+            solanaPublicKey: account.solanaPublicKey,
+            createdAt: account.createdAt,
+            updatedAt: account.updatedAt,
+            credentials: account.credentials,
+          }
+    },
     async findAccountPublicKey(accountId): Promise<string | null> {
       const account = await prisma.agentAccount.findFirst({
         where: { id: accountId, status: 'ACTIVE' },
@@ -703,6 +824,25 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       const recipients = await prisma.recipient.findMany({
         where: { ownerAccountId },
         orderBy: { createdAt: 'desc' },
+        include: { destinations: true, ownerAccount: { select: { status: true } } },
+      })
+      return recipients.map(toRecipientRecord)
+    },
+    async listRecipientsPage(ownerAccountId, limit, cursor) {
+      const recipients = await prisma.recipient.findMany({
+        where: {
+          ownerAccountId,
+          ...(cursor === undefined
+            ? {}
+            : {
+                OR: [
+                  { createdAt: { lt: cursor.createdAt } },
+                  { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+                ],
+              }),
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
         include: { destinations: true, ownerAccount: { select: { status: true } } },
       })
       return recipients.map(toRecipientRecord)
@@ -1407,11 +1547,53 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       const payments = await prisma.payment.findMany({
         where: {
           status: { in: ['CREATED', 'ROUTING', 'SUBMITTED', 'RECONCILING'] },
+          OR: [{ nextRecoveryAt: null }, { nextRecoveryAt: { lte: new Date() } }],
         },
-        orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+        orderBy: [
+          { lastRecoveryAttemptAt: { sort: 'asc', nulls: 'first' } },
+          { id: 'asc' },
+        ],
         take: limit,
       })
       return payments.map(toPaymentRecord)
+    },
+    async claimRecoverablePayments(limit, now = new Date()) {
+      const nextRecoveryAt = new Date(now.getTime() + 30_000)
+      return prisma.$transaction(async (transaction) => {
+        const candidates = await transaction.payment.findMany({
+          where: {
+            status: { in: ['CREATED', 'ROUTING', 'SUBMITTED', 'RECONCILING'] },
+            OR: [{ nextRecoveryAt: null }, { nextRecoveryAt: { lte: now } }],
+          },
+          orderBy: [
+            { lastRecoveryAttemptAt: { sort: 'asc', nulls: 'first' } },
+            { id: 'asc' },
+          ],
+          take: limit,
+        })
+        const claimedIds: string[] = []
+        for (const candidate of candidates) {
+          const updated = await transaction.payment.updateMany({
+            where: {
+              id: candidate.id,
+              status: { in: ['CREATED', 'ROUTING', 'SUBMITTED', 'RECONCILING'] },
+              OR: [{ nextRecoveryAt: null }, { nextRecoveryAt: { lte: now } }],
+            },
+            data: {
+              lastRecoveryAttemptAt: now,
+              nextRecoveryAt,
+              recoveryCount: { increment: 1 },
+              stuckSince: candidate.stuckSince ?? now,
+            },
+          })
+          if (updated.count === 1) claimedIds.push(candidate.id)
+        }
+        if (claimedIds.length === 0) return []
+        const claimed = await transaction.payment.findMany({
+          where: { id: { in: claimedIds } },
+        })
+        return claimed.map(toPaymentRecord)
+      })
     },
     async findPaymentForRefund(accountId, paymentId): Promise<PaymentRecord | null> {
       const payment = await prisma.payment.findFirst({ where: { id: paymentId } })
@@ -1431,6 +1613,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
               : { amountAtomic: input.amountAtomic }),
             currency: input.currency,
             reference: input.reference,
+            ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
             ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
           },
         })
@@ -1498,7 +1681,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     async recordIncomingReconciliationIssue(input): Promise<void> {
       const now = new Date()
       await prisma.incomingReconciliationIssue.upsert({
-        where: { accountId_signature: { accountId: input.accountId, signature: input.signature } },
+        where: {
+          accountId_signature: {
+            accountId: input.accountId,
+            signature: input.signature,
+          },
+        },
         create: {
           id: input.id,
           accountId: input.accountId,
@@ -1597,6 +1785,25 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     async checkReadiness(): Promise<void> {
       await prisma.$queryRaw`SELECT 1`
     },
+    async initializeRuntimeIdentity(input): Promise<void> {
+      const value = JSON.stringify(input)
+      await prisma.$transaction(async (transaction) => {
+        const existing = await transaction.runtimeMetadata.findUnique({
+          where: { key: 'runtime_identity' },
+        })
+        if (existing === null) {
+          await transaction.runtimeMetadata.create({
+            data: { key: 'runtime_identity', value },
+          })
+          return
+        }
+        if (existing.value !== value) {
+          throw new Error(
+            'Runtime financial identity mismatch; configured rail, cluster, settlement mint, or custody key differs from the database',
+          )
+        }
+      })
+    },
     async disconnect(): Promise<void> {
       await prisma.$disconnect()
     },
@@ -1662,6 +1869,10 @@ function toPaymentRecord(payment: {
   originalPaymentId: string | null
   counterpartyAccountId: string | null
   counterpartyAddress: string | null
+  lastRecoveryAttemptAt: Date | null
+  nextRecoveryAt: Date | null
+  recoveryCount: number
+  stuckSince: Date | null
 }): PaymentRecord {
   return payment
 }

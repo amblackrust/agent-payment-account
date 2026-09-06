@@ -70,6 +70,20 @@ export class AccountService {
       wallet.secretKey.fill(0)
     }
   }
+
+  public async createCredential(accountId: string) {
+    if (this.repository.createApiCredential === undefined) {
+      throw new Error('Credential persistence is unavailable')
+    }
+    const credential = generateApiCredential()
+    const stored = await this.repository.createApiCredential({
+      id: createCredentialId(),
+      accountId,
+      keyHash: credential.keyHash,
+      keyPrefix: credential.keyPrefix,
+    })
+    return { ...stored, apiKey: credential.rawKey }
+  }
 }
 
 export function serializeAccountCreation(response: CreatedAccountResponse) {

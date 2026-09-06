@@ -106,6 +106,9 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await client.cheatcodes
           .setTokenAccount(payer.address, mint.address, { amount: 2_000_000n })
           .send()
+        await client.cheatcodes
+          .setTokenAccount(recipient.address, mint.address, { amount: 0n })
+          .send()
 
         await database.createAgentAccount({
           id: accountId,
@@ -272,7 +275,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           recipientService: new RecipientService(database),
           paymentService: service,
           reservationRepository: database,
-          receiveService: new ReceiveService(database, readRail),
+          receiveService: new ReceiveService(database, readRail, () => 0),
           transactionService: new TransactionService(database),
         })
         await app.listen({ host: '127.0.0.1', port: 0 })

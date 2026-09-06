@@ -1,13 +1,16 @@
 import { z } from 'zod'
-
-export const MAX_REFERENCE_BYTES = 128
+import { MAX_REFERENCE_BYTES } from '@agent-payment/core'
+export { MAX_REFERENCE_BYTES } from '@agent-payment/core'
 
 const reference = z
   .string()
   .min(1)
-  .refine((value) => Buffer.byteLength(value, 'utf8') <= MAX_REFERENCE_BYTES, {
-    message: `reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
-  })
+  .refine(
+    (value) => new TextEncoder().encode(value).byteLength <= MAX_REFERENCE_BYTES,
+    {
+      message: `reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
+    },
+  )
 
 const moneyString = z.string().regex(/^(0|[1-9][0-9]*)\.[0-9]{2}$/u)
 const currency = z.literal('USD')

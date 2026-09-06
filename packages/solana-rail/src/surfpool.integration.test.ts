@@ -98,6 +98,7 @@ describe('Solana payment rail on isolated offline Surfpool', () => {
         paymentId: 'pay_surfpool',
         payerAccountId: 'acct_surfpool',
         payerPublicKey: payer.address,
+        allowRecipientAtaCreation: true,
         getPayerSecretKey: async () => payerSecret,
       },
     )

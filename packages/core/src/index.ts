@@ -33,6 +33,8 @@ export {
 } from './money.js'
 export type { AtomicUnits, Currency, Money } from './money.js'
 
+export const MAX_REFERENCE_BYTES = 128
+
 export {
   createAccountId,
   createCredentialId,

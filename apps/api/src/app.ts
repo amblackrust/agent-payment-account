@@ -171,6 +171,69 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       },
     )
 
+    app.post<{ Params: { accountId: string } }>(
+      '/v1/accounts/:accountId/credentials',
+      {
+        schema: {
+          params: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { accountId: { type: 'string', minLength: 1 } },
+            required: ['accountId'],
+          },
+        },
+      },
+      async (request, reply) => {
+        assertAdminApiKey(request, options.config.adminApiKey)
+        if (
+          accountRepository.findAccountSummary === undefined ||
+          accountService.createCredential === undefined
+        ) {
+          throw new Error('Credential management is unavailable')
+        }
+        if (
+          (await accountRepository.findAccountSummary(request.params.accountId)) ===
+          null
+        ) {
+          throw new ValidationError('Account was not found')
+        }
+        const credential = await accountService.createCredential(
+          request.params.accountId,
+        )
+        return reply.code(201).send({
+          credential_id: credential.id,
+          account_id: credential.accountId,
+          api_key: credential.apiKey,
+          key_prefix: credential.keyPrefix,
+          created_at: credential.createdAt.toISOString(),
+        })
+      },
+    )
+
+    app.get('/v1/accounts', async (request) => {
+      assertAdminApiKey(request, options.config.adminApiKey)
+      if (accountRepository.listAccountSummaries === undefined) {
+        throw new Error('Account lookup is unavailable')
+      }
+      const accounts = await accountRepository.listAccountSummaries()
+      return {
+        accounts: accounts.map((account) => ({
+          id: account.id,
+          name: account.name,
+          status: account.status,
+          solana_public_key: account.solanaPublicKey,
+          created_at: account.createdAt.toISOString(),
+          updated_at: account.updatedAt.toISOString(),
+          credentials: account.credentials.map((credential) => ({
+            id: credential.id,
+            key_prefix: credential.keyPrefix,
+            created_at: credential.createdAt.toISOString(),
+            revoked_at: credential.revokedAt?.toISOString() ?? null,
+          })),
+        })),
+      }
+    })
+
     app.get(
       '/v1/balance',
       { preHandler: async (request) => authenticateAgent(request, accountRepository) },
@@ -337,15 +400,31 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         },
       )
 
-      app.get(
+      app.get<{ Querystring: { limit?: number; cursor?: string } }>(
         '/v1/recipients',
         {
           preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                cursor: { type: 'string', minLength: 1 },
+              },
+            },
+          },
         },
         async (request) => {
           const account = requireAgentAccount(request)
-          const recipients = await recipientService.listRecipients(account.account.id)
-          return { recipients: recipients.map(serializeRecipient) }
+          const page = await recipientService.listRecipientsPage(
+            account.account.id,
+            request.query,
+          )
+          return {
+            recipients: page.recipients.map(serializeRecipient),
+            next_cursor: page.next_cursor,
+          }
         },
       )
 
@@ -571,15 +650,31 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         },
       )
 
-      app.get(
+      app.get<{ Querystring: { limit?: number; cursor?: string } }>(
         '/v1/payments',
         {
           preHandler: async (request) => authenticateAgent(request, accountRepository),
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                cursor: { type: 'string', minLength: 1 },
+              },
+            },
+          },
         },
         async (request) => {
           const account = requireAgentAccount(request)
-          const payments = await paymentService.listPayments(account.account.id)
-          return { payments: payments.map(serializePayment) }
+          const page = await paymentService.listPaymentsPage(
+            account.account.id,
+            request.query,
+          )
+          return {
+            payments: page.payments.map(serializePayment),
+            next_cursor: page.next_cursor,
+          }
         },
       )
 

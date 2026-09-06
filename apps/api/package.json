@@ -14,6 +14,7 @@
     "@agent-payment/core": "workspace:*",
     "@agent-payment/db": "workspace:*",
     "@agent-payment/solana-rail": "workspace:*",
+    "@solana/kit": "8.2.0",
     "dotenv": "17.4.2",
     "fastify": "5.12.3",
     "zod": "4.5.4"
@@ -21,7 +22,6 @@
   "devDependencies": {
     "@agent-payment/sdk": "workspace:*",
     "@solana-program/token": "0.16.1",
-    "@solana/kit": "8.2.0",
     "@solana/surfpool": "1.5.0",
     "tsx": "4.23.13"
   }

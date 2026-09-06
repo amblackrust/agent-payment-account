@@ -33,6 +33,7 @@ import {
   ExternalRailError,
   formatMoney,
   InsufficientFundsError,
+  MAX_REFERENCE_BYTES,
   ValidationError,
   type Money,
   type PaymentRail,
@@ -55,6 +56,16 @@ function createPaymentMemo(
   paymentId: string,
   externalReference: string | undefined,
 ): string {
+  if (
+    externalReference !== undefined &&
+    new TextEncoder().encode(externalReference).byteLength > MAX_REFERENCE_BYTES
+  ) {
+    throw new ExternalRailError(
+      `External reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
+      undefined,
+      'DETERMINISTIC',
+    )
+  }
   return externalReference === undefined
     ? paymentId
     : `${paymentId}|reference:${externalReference}`
@@ -891,6 +902,27 @@ export function createSolanaPaymentRailWithRpc(
     getStatus: async (transactionId): Promise<RailStatusResult> => {
       const observation = await observeSignature(transactionId)
       return observation.result
+    },
+    checkReadiness: async (): Promise<void> => {
+      // Readiness must validate the same network and settlement mint used for
+      // execution, even when this rail is checked without the read adapter.
+      await getSettlementMetadata()
+      const feePayerSigner = await createSigner(
+        options.feePayerSecret,
+        'fee payer secret',
+      )
+      const feeBalance = await withRpcTimeout((abortSignal) =>
+        options.rpc
+          .getBalance(feePayerSigner.address, { commitment: CONFIRMATION_COMMITMENT })
+          .send({ abortSignal }),
+      )
+      if (feeBalance.value < minimumFeePayerBalanceLamports) {
+        throw new ExternalRailError(
+          'Platform fee payer is below the minimum operating balance',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
     },
   }
 }

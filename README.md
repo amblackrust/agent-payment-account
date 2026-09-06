@@ -63,8 +63,10 @@ curl http://127.0.0.1:3000/health
 curl http://127.0.0.1:3000/ready
 ```
 
-`/health` reports process health. `/ready` reports PostgreSQL readiness and
-returns `503 {"status":"not_ready"}` when PostgreSQL is unavailable.
+`/health` reports process health. `/ready` performs bounded, fresh checks for
+PostgreSQL, the configured Solana network/mint, and the platform fee payer
+operating threshold. It returns `503 {"status":"not_ready"}` whenever any
+required dependency is unavailable.
 
 ## Environment variables
 
@@ -105,6 +107,11 @@ curl -X POST http://127.0.0.1:3000/v1/accounts \
 
 The response includes `id`, one-time `api_key`, and normalized receive
 settlement details. The account signer private key is never returned.
+
+If the bootstrap HTTP response is lost, an administrator can list accounts and
+their non-secret credential metadata with `GET /v1/accounts`, then issue a new
+one-time credential with `POST /v1/accounts/:accountId/credentials`. Existing
+credentials can be revoked with the returned `credential_id`.
 
 ## Fund / receive
 
@@ -191,6 +198,12 @@ const refund = await account.refund(
 ```
 
 External uncontrolled recipients return `REFUND_NOT_SUPPORTED`.
+
+For ordinary external recipients, the destination SPL token account must
+already exist; Mux does not sponsor arbitrary ATA rent. Verified managed
+recipients may have their ATA created, subject to a per-account sponsorship
+budget (10,000,000 lamports per UTC day and 60 sponsored transactions per
+hour) and the platform fee-payer minimum operating balance.
 
 ## Transaction lifecycle
 
@@ -309,3 +322,10 @@ pnpm verify
 
 `pnpm verify` is the final release gate. It provides `DATABASE_URL` itself, so
 required PostgreSQL and Surfpool suites cannot be silently skipped.
+
+If a payment remains `RECONCILING` beyond the normal confirmation window, do
+not create a new idempotency key or manually send a second transfer. Poll the
+payment and inspect the persisted expected transaction signature. An operator
+may resolve it only after checking that signature on the configured cluster;
+automatic recovery never creates a replacement transfer after an unknown
+expired outcome.

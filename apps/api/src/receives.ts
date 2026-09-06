@@ -4,8 +4,8 @@ import {
   formatMoney,
   moneyFromAtomicUnits,
   ValidationError,
+  MAX_REFERENCE_BYTES,
 } from '@agent-payment/core'
-import { MAX_REFERENCE_BYTES } from '@agent-payment/contracts'
 import type { ReceiveRepository, ReceiveRequestRecord } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 
@@ -46,7 +46,9 @@ export class ReceiveService {
       input.expiresAt === undefined ? undefined : new Date(input.expiresAt)
     if (
       expiresAt !== undefined &&
-      (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= this.now())
+      (!isCanonicalRfc3339Instant(input.expiresAt!) ||
+        Number.isNaN(expiresAt.getTime()) ||
+        expiresAt.getTime() <= this.now())
     ) {
       throw new ValidationError('Receive expiration must be a valid date')
     }
@@ -57,6 +59,7 @@ export class ReceiveService {
       ...(amount === undefined ? {} : { amountAtomic: amount.atomicUnits }),
       currency: 'USD',
       reference,
+      createdAt: new Date(this.now()),
       ...(expiresAt === undefined ? {} : { expiresAt }),
     })
     return serializeReceiveRequest(request, destination)
@@ -78,6 +81,12 @@ export class ReceiveService {
       await this.rail.getReceiveDestination(owner),
     )
   }
+}
+
+function isCanonicalRfc3339Instant(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(
+    value,
+  )
 }
 
 function serializeReceiveRequest(

@@ -56,6 +56,9 @@ importers:
       '@agent-payment/solana-rail':
         specifier: workspace:*
         version: link:../../packages/solana-rail
+      '@solana/kit':
+        specifier: 8.2.0
+        version: 8.2.0(typescript@5.9.3)
       dotenv:
         specifier: 17.4.2
         version: 17.4.2
@@ -72,9 +75,6 @@ importers:
       '@solana-program/token':
         specifier: 0.16.1
         version: 0.16.1(@solana/kit@8.2.0(typescript@5.9.3))
-      '@solana/kit':
-        specifier: 8.2.0
-        version: 8.2.0(typescript@5.9.3)
       '@solana/surfpool':
         specifier: 1.5.0
         version: 1.5.0(@solana/kit-plugin-rpc@0.19.0)(@solana/kit-plugin-signer@0.19.0)(@solana/kit@8.2.0(typescript@5.9.3))
@@ -84,6 +84,9 @@ importers:
 
   packages/contracts:
     dependencies:
+      '@agent-payment/core':
+        specifier: workspace:*
+        version: link:../core
       zod:
         specifier: 4.5.4
         version: 4.5.4

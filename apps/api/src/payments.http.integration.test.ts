@@ -101,7 +101,10 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           payload: {
             display_name: 'API recipient',
             type: 'BUSINESS',
-            destination: { type: 'SOLANA_SPL', wallet_address: 'wallet-address' },
+            destination: {
+              type: 'SOLANA_SPL',
+              wallet_address: 'So11111111111111111111111111111111111111112',
+            },
           },
         })
         expect(recipientResponse.statusCode).toBe(201)

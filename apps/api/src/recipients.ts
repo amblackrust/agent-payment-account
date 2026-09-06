@@ -1,4 +1,5 @@
 import { ValidationError, createRecipientId } from '@agent-payment/core'
+import { address } from '@solana/kit'
 import type {
   CreateRecipientInput,
   RecipientRecord,
@@ -50,6 +51,7 @@ export class RecipientService {
     if (input.destination.type !== SOLANA_SPL_DESTINATION) {
       throw new ValidationError('Only SOLANA_SPL recipient destinations are supported')
     }
+    validateSolanaAddress(walletAddress)
 
     const managedAccountId =
       input.managedAccountId === undefined
@@ -148,6 +150,7 @@ export class RecipientService {
     ) {
       throw new ValidationError('Only SOLANA_SPL recipient destinations are supported')
     }
+    if (walletAddress !== undefined) validateSolanaAddress(walletAddress)
     const recipient = await this.repository.updateRecipient(updateInput)
     if (recipient === null) {
       throw new ErrorWithStatus('Recipient not found', 404)
@@ -180,6 +183,51 @@ export class RecipientService {
   public listRecipients(ownerAccountId: string): Promise<readonly RecipientRecord[]> {
     return this.repository.listRecipients(ownerAccountId)
   }
+
+  public async listRecipientsPage(
+    ownerAccountId: string,
+    input: { readonly limit?: number; readonly cursor?: string },
+  ) {
+    const limit = input.limit ?? 50
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new ValidationError('Recipient limit must be an integer from 1 to 100')
+    }
+    const cursor = decodeRecipientCursor(input.cursor)
+    const records =
+      this.repository.listRecipientsPage === undefined
+        ? await this.repository.listRecipients(ownerAccountId)
+        : await this.repository.listRecipientsPage(ownerAccountId, limit + 1, cursor)
+    const page =
+      this.repository.listRecipientsPage === undefined
+        ? records
+            .filter(
+              (recipient) =>
+                cursor === undefined ||
+                recipient.createdAt < cursor.createdAt ||
+                (recipient.createdAt.getTime() === cursor.createdAt.getTime() &&
+                  recipient.id < cursor.id),
+            )
+            .sort((left, right) => {
+              const time = right.createdAt.getTime() - left.createdAt.getTime()
+              return time === 0 ? right.id.localeCompare(left.id) : time
+            })
+            .slice(0, limit + 1)
+        : records
+    const visible = page.slice(0, limit)
+    const last = visible.at(-1)
+    return {
+      recipients: visible,
+      next_cursor:
+        page.length > limit && last !== undefined
+          ? Buffer.from(
+              JSON.stringify({
+                createdAt: last.createdAt.toISOString(),
+                id: last.id,
+              }),
+            ).toString('base64url')
+          : null,
+    }
+  }
 }
 
 export function serializeRecipient(recipient: RecipientRecord) {
@@ -205,6 +253,35 @@ function validateText(value: string, field: string, maxLength: number): string {
     throw new ValidationError(`${field} must contain 1 to ${maxLength} characters`)
   }
   return normalized
+}
+
+function validateSolanaAddress(value: string): void {
+  try {
+    address(value)
+  } catch {
+    throw new ValidationError('Recipient Solana wallet address is invalid')
+  }
+}
+
+function decodeRecipientCursor(
+  value: string | undefined,
+): { readonly createdAt: Date; readonly id: string } | undefined {
+  if (value === undefined) return undefined
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      typeof (parsed as { createdAt?: unknown }).createdAt !== 'string' ||
+      typeof (parsed as { id?: unknown }).id !== 'string'
+    )
+      throw new Error('invalid cursor')
+    const createdAt = new Date((parsed as { createdAt: string }).createdAt)
+    if (Number.isNaN(createdAt.getTime())) throw new Error('invalid cursor')
+    return { createdAt, id: (parsed as { id: string }).id }
+  } catch {
+    throw new ValidationError('Recipient cursor is invalid')
+  }
 }
 
 class ErrorWithStatus extends Error {

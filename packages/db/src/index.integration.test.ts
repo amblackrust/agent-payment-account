@@ -261,8 +261,8 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`
       const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
       const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
-      const confirmedAt = new Date('2026-01-01T00:00:00.000Z')
-      const expiresAt = new Date('2026-01-01T00:00:01.000Z')
+      const confirmedAt = new Date(Date.now() + 1_000)
+      const expiresAt = new Date(confirmedAt.getTime() + 1_000)
 
       try {
         await database.createAgentAccount({

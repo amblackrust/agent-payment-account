@@ -1,4 +1,5 @@
 services:
+  # Development-only PostgreSQL. Do not expose this compose service publicly.
   postgres:
     image: postgres:16-alpine
     environment:
@@ -13,7 +14,7 @@ services:
         - pg_isready -U postgres -d agent_payment_account
       timeout: 5s
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
 

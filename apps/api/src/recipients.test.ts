@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { RecipientService } from './recipients.js'
 
 const accountB = 'acct_b'
-const walletB = 'wallet-b'
+const walletB = 'So11111111111111111111111111111111111111112'
+const walletC = 'SysvarRent111111111111111111111111111111111'
 
 function createService() {
   let current = {
@@ -47,7 +48,7 @@ describe('managed recipient verification', () => {
         displayName: 'unknown',
         type: 'AGENT',
         managedAccountId: 'acct_missing',
-        destination: { type: 'SOLANA_SPL', walletAddress: 'wallet-c' },
+        destination: { type: 'SOLANA_SPL', walletAddress: walletC },
       }),
     ).rejects.toThrow('Managed account was not found')
     await expect(
@@ -55,7 +56,7 @@ describe('managed recipient verification', () => {
         displayName: 'wrong wallet',
         type: 'AGENT',
         managedAccountId: accountB,
-        destination: { type: 'SOLANA_SPL', walletAddress: 'wallet-c' },
+        destination: { type: 'SOLANA_SPL', walletAddress: walletC },
       }),
     ).rejects.toThrow('does not match')
   })
@@ -64,7 +65,7 @@ describe('managed recipient verification', () => {
     const { service } = createService()
     await expect(
       service.updateRecipient('acct_a', 'rcpt_1', {
-        destination: { id: 'dest_1', type: 'SOLANA_SPL', walletAddress: 'wallet-c' },
+        destination: { id: 'dest_1', type: 'SOLANA_SPL', walletAddress: walletC },
       }),
     ).rejects.toThrow('does not match')
     await expect(
