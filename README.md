@@ -193,3 +193,7 @@ The implemented v1 and possible post-v1 directions are separated in [Roadmap](do
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
+
+## License
+
+Mux is available under the [MIT License](LICENSE).
