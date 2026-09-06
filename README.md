@@ -57,10 +57,9 @@ See [Architecture](docs/architecture.md) for component boundaries, payment state
 
 Requirements: Node.js 22+, pnpm 11+, Docker with Compose, the Solana CLI (including `solana-keygen` and `solana-test-validator`), and `spl-token`.
 
-From a cloned checkout:
+From the repository root:
 
 ```bash
-cd <project-directory>
 pnpm install --frozen-lockfile
 pnpm local:setup
 pnpm dev

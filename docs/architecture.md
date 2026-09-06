@@ -133,7 +133,7 @@ Runtime metadata pins the configured rail version, cluster, settlement mint, and
 
 The runtime exposes `USD` with two decimal places. The rail reads the configured mint's decimals and converts normalized amounts to mint atomic units before using `transferChecked`. Only the classic SPL Token program is accepted; Token-2022 is not the v1 settlement rail.
 
-External recipients identify an existing SPL token account. Mux does not sponsor arbitrary token-account rent for uncontrolled destinations. A recipient tied to another managed account is checked against that account's canonical Solana public key and may receive a sponsored associated token account.
+An external recipient's `wallet_address` identifies its Solana owner/public key. Mux derives the associated token account for that owner and the configured settlement mint; the derived account must already exist because Mux does not sponsor token-account creation for arbitrary external recipients. A recipient tied to another managed account is checked against that account's canonical public key and may receive sponsored associated-token-account creation through the platform fee payer.
 
 The platform fee payer and settlement mint are global runtime configuration. Agent Account balances remain held at account-owned SPL token accounts and transfers are authorized by the corresponding account signer.
 

@@ -1,6 +1,6 @@
 # API Reference
 
-The Mux API is served at `http://127.0.0.1:3000` by default. Request and response field names are snake_case. All responses include `x-request-id`.
+The Mux API is served at `http://127.0.0.1:3000` by default. Domain request and response payloads use snake_case; errors use the envelope documented below. All responses include `x-request-id`.
 
 ## Authentication
 
@@ -113,7 +113,9 @@ Requires agent authentication and returns `201`.
 }
 ```
 
-For another Mux-managed account, add `managed_account_id`. Its `wallet_address` must equal that account's canonical Solana public key. Self-payments are rejected.
+`wallet_address` is the recipient's Solana owner/public key, not an SPL token-account address. Mux derives its associated token account for the configured settlement mint. For an external recipient, that derived token account must already exist; Mux does not sponsor its creation.
+
+For another Mux-managed account, add `managed_account_id`. Its `wallet_address` must equal that account's canonical Solana public key. Verified managed recipients may receive sponsored associated-token-account creation through the platform fee payer. Self-payments are rejected.
 
 Response fields are `id`, `display_name`, `type`, `managed_account_id`, `destinations`, `created_at`, and `updated_at`. Each destination includes `id`, `rail`, `type`, and `wallet_address`.
 
