@@ -44,7 +44,7 @@ try {
   run('pnpm', ['typecheck'])
   run('pnpm', ['test'], { DATABASE_URL: databaseUrl })
   run('pnpm', ['build'])
-  run('pnpm', ['test:solana'], { DATABASE_URL: databaseUrl })
+  run('pnpm', ['test:solana:raw'], { DATABASE_URL: databaseUrl })
 } finally {
   stopDatabase()
 }

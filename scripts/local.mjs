@@ -135,6 +135,13 @@ function checkPrerequisites() {
         'Install it with the Solana CLI: https://solana.com/docs/intro/installation',
     },
     {
+      label: 'solana-keygen',
+      command: 'solana-keygen',
+      args: ['--version'],
+      install:
+        'Install it with the Solana CLI: https://solana.com/docs/intro/installation',
+    },
+    {
       label: 'spl-token',
       command: 'spl-token',
       args: ['--version'],
@@ -636,7 +643,7 @@ async function setup() {
   await ensureSettlementMint(mintAddress, feePayerAddress)
   console.log('✓ Settlement mint ready')
 
-  run('pnpm', ['db:migrate'], { environment })
+  run('pnpm', ['db:migrate:deploy'], { environment })
   console.log('✓ Database migrations applied')
 
   console.log(`\nSettlement mint: ${mintAddress}`)

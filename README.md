@@ -1,53 +1,66 @@
 # Mux
 
-Mux is a developer-facing financial runtime for AI agents.
-It gives an application a persistent custodial account, normalized money
-operations, balance reads, receive instructions, transaction history, and a
-TypeScript SDK. The agent works with account, recipient, amount, currency, pay,
-send, receive, and refund concepts; Solana transaction construction stays inside
-the settlement adapter.
+Mux is a custodial payment runtime that gives AI-agent applications programmable accounts and normalized payment operations while keeping Solana transaction mechanics inside the backend.
 
-## What problem it solves
+## Problem
 
-Developers can provide an agent with a programmable financial account without
-making the agent understand token accounts, decimals, RPC, transaction signing,
-or chain-specific routing. The backend owns custody, payment lifecycle,
-idempotency, reservations, confirmation, and reconciliation.
+Giving an agent a raw blockchain wallet also gives it responsibility for RPC calls, token accounts, mint decimals, transaction construction, signing, retries, confirmation, and reconciliation. Those concerns make ordinary tasks such as checking a balance or paying a known recipient chain-specific and difficult to recover safely.
+
+## Solution
+
+Mux exposes an account-oriented model: balances, recipients, `pay`, `send`, `receive`, refunds, payment status, and transaction history. The backend owns the managed signer, persists the payment lifecycle, reserves outgoing funds, submits settlement transactions, and reconciles ambiguous or incoming activity.
+
+## Why Solana
+
+Solana is the settlement rail in the current implementation, not a detail the agent must operate directly. Every Agent Account has a real Solana signer, and confirmed payments correspond to classic SPL Token transfers of one configured mint. Mux constructs and signs those transactions, pays network fees from a separate platform fee payer, and ties confirmation and reconciliation to on-chain transaction state.
+
+The v1 custody boundary is intentionally narrow:
+
+- account signers are managed by the backend;
+- signer secrets are encrypted with `WALLET_MASTER_KEY`, but this prototype does not use an HSM or MPC;
+- one classic SPL settlement mint is configured for the runtime;
+- the public `USD` contract is a normalized accounting interface, not fiat custody, an FX service, or a claim that every configured mint is redeemable for dollars.
+
+## Features
+
+- Agent Account creation with one-time API credentials, hashed credential storage, rotation, and revocation
+- Encrypted per-account Solana signer custody and a separate platform fee payer
+- Settled, pending-outgoing, and available balance reads
+- Account-owned recipients for external or managed Solana destinations
+- Idempotent `pay`, `send`, and managed-account refund operations
+- Durable reservations, attempts, confirmation, recovery, and reconciliation
+- Persistent receive requests and discovery of incoming SPL transfers
+- Payment lookup plus cursor-paginated payment and transaction history
+- TypeScript SDK for the agent-facing account operations
+- Automated local PostgreSQL, Solana validator, fee payer, and test-mint setup
+- Explicit mainnet opt-in and runtime network/mint validation
 
 ## Architecture
 
-```text
-apps/api                  Fastify HTTP API and reconciliation timer
-packages/core             Money, payment lifecycle, routing contracts, errors
-packages/db               Prisma schema, migrations, repositories
-packages/solana-rail      Kit-first SPL read/write and incoming reconciliation
-packages/contracts        Shared Zod HTTP wire schemas
-packages/sdk              Agent-facing TypeScript HTTP client
-tests/e2e                 E2E documentation and entrypoint reference
+```mermaid
+flowchart LR
+  Agent[Agent application] --> Client[Mux SDK or HTTP API]
+  Client --> API[Fastify API]
+  API --> Runtime[Payment runtime]
+  Runtime --> DB[(PostgreSQL)]
+  Runtime --> Custody[Managed signer custody]
+  Runtime --> Rail[Solana settlement rail]
+  Workers[Reconciliation workers] <--> DB
+  Workers <--> Rail
+  Custody --> Rail
+  Rail --> RPC[Solana RPC / network]
 ```
 
-PostgreSQL stores accounts, credential hashes, encrypted wallet material,
-recipients, payments, attempts, reservations, receive requests, incoming
-transfers, and reconciliation cursors.
+See [Architecture](docs/architecture.md) for component boundaries, payment states, custody, and reconciliation.
 
-## Product v1 scope
+## Quick Start
 
-- One agent-facing currency: `USD`.
-- One real settlement rail: classic Solana SPL Token.
-- `SOLANA_SETTLEMENT_MINT` selects the configured stablecoin mint; this is not
-  an FX engine or a promise of fiat custody.
-- Custody is a prototype custodial boundary, not an HSM/MPC architecture.
-- Card, bank, x402, FX, off-ramp, KYC, frontend, and agent orchestration are
-  outside product v1.
+Requirements: Node.js 22+, pnpm 11+, Docker with Compose, the Solana CLI (including `solana-keygen` and `solana-test-validator`), and `spl-token`.
 
-## Quick start
-
-Requirements: Node.js 22+, pnpm 11+, Docker with Compose, Solana CLI with
-`solana-test-validator`, and `spl-token`.
+From a cloned checkout:
 
 ```bash
-git clone <repository-url>
-cd agent-payment-account
+cd <project-directory>
 pnpm install --frozen-lockfile
 pnpm local:setup
 pnpm dev
@@ -57,70 +70,42 @@ In another terminal:
 
 ```bash
 curl http://127.0.0.1:3000/ready
+pnpm local:status
 ```
 
-Expected response:
+Expected readiness response:
 
-```text
+```json
 {"status":"ok"}
 ```
 
-`local:setup` starts local PostgreSQL and a detached local Solana validator,
-creates a platform fee payer and a 6-decimal classic SPL test-USD mint, funds
-the fee payer with fake local SOL, generates `ADMIN_API_KEY` and
-`WALLET_MASTER_KEY`, writes the root `.env`, and applies database migrations.
-This environment is local-only: it uses no real money, no mainnet, and no
-external faucet.
+`local:setup` creates a local-only environment: PostgreSQL, a detached Solana validator, a platform fee payer funded with fake SOL, a 6-decimal classic SPL test mint, generated API and wallet-encryption secrets, a root `.env`, and the committed database migrations. It does not use mainnet, real money, or an external faucet.
 
-The API listens on `http://127.0.0.1:3000` by default. `/health` reports process
-health. `/ready` performs bounded, fresh checks for PostgreSQL, the configured
-Solana network/mint, and the platform fee payer operating threshold. It returns
-`503 {"status":"not_ready"}` whenever a required dependency is unavailable.
-
-Inspect or stop the local infrastructure with:
+Stop project-owned local infrastructure without deleting the database volume, ledger, keypairs, or `.env`:
 
 ```bash
-pnpm local:status
 pnpm local:down
 ```
 
-`local:down` stops only this checkout's validator and PostgreSQL service. It
-preserves the database volume, `.local/` ledger and keypairs, and `.env`. Run
-`pnpm local:setup` again to restart the preserved environment.
+Running `pnpm local:setup` again preserves existing local secrets and state.
 
-## Environment variables
+## Basic Usage
 
-Root commands load `<repo>/.env` explicitly, including when pnpm executes API or
-Prisma tooling from a workspace package directory. Shell-specific `export` or
-Fish `set -x` commands are not required. See [`.env.example`](.env.example) for
-the manual/advanced reference.
+Create an Agent Account with the admin API. The generated `.env` is loaded automatically by project commands, but shell variables are not modified. Load only the admin key before the manual request.
 
-- `DATABASE_URL` — PostgreSQL connection URL.
-- `PORT` — HTTP port, default `3000`.
-- `NODE_ENV` — `development`, `test`, or `production`.
-- `ADMIN_API_KEY` — bootstrap credential for account administration.
-- `SOLANA_RPC_URL` — custom Kit-compatible Solana RPC URL.
-- `SOLANA_CLUSTER` — `localnet`, `devnet`, `testnet`, or `mainnet-beta`.
-- `SOLANA_SETTLEMENT_MINT` — configured classic SPL stablecoin mint address.
-- `SOLANA_FEE_PAYER_SECRET` — 64-byte key in JSON-array, hex, or base64 form.
-- `WALLET_MASTER_KEY` — 32 bytes encoded as 64 hexadecimal characters.
-- `ALLOW_MAINNET` — must be explicitly `true` for mainnet; default is `false`.
-
-`pnpm local:setup` generates and preserves local secrets automatically. For a
-manual environment, generate secret material with:
+Bash or zsh:
 
 ```bash
-openssl rand -hex 32                 # WALLET_MASTER_KEY or an admin secret
+export ADMIN_API_KEY="$(node scripts/run-with-root-env.mjs --require=ADMIN_API_KEY node -e 'process.stdout.write(process.env.ADMIN_API_KEY ?? "")')"
 ```
 
-Generate a Solana fee-payer key using the operator's Solana tooling, then
-provide its 64-byte secret as JSON, hex, or base64. Keep all secrets outside
-source control and never put them in logs. `.env` and `.local/` are gitignored.
+Fish:
 
-## Create an account
+```fish
+set -gx ADMIN_API_KEY (node scripts/run-with-root-env.mjs --require=ADMIN_API_KEY node -e 'process.stdout.write(process.env.ADMIN_API_KEY ?? "")')
+```
 
-The admin bootstrap endpoint returns the agent API key exactly once. Store it
-securely; it is not persisted in plaintext.
+Then create the account:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/accounts \
@@ -129,270 +114,83 @@ curl -X POST http://127.0.0.1:3000/v1/accounts \
   -d '{"name":"research-agent"}'
 ```
 
-The response includes `id`, one-time `api_key`, and normalized receive
-settlement details. The account signer private key is never returned.
-
-If the bootstrap HTTP response is lost, an administrator can list accounts and
-their non-secret credential metadata with `GET /v1/accounts`, then issue a new
-one-time credential with `POST /v1/accounts/:accountId/credentials`. Existing
-credentials can be revoked with the returned `credential_id`.
-
-## Fund / receive
-
-Use the returned settlement `owner`, `token_account`, and `mint` as developer
-settlement details for a real SPL transfer. An agent can request normalized
-receive instructions through the SDK:
-
-```ts
-const receive = await account.receive({
-  amount: '1.25',
-  reference: 'invoice-123',
-})
-```
-
-The incoming reconciler validates the configured mint, successful transfer,
-positive external token delta, and optional reference. An unmatched incoming
-transfer remains visible as a generic `RECEIVE` transaction.
-
-## Create a recipient
-
-Recipients are owned by the authenticated account and payments use `recipient_id`,
-never a wallet address in the agent-facing payment request.
-
-```bash
-curl -X POST http://127.0.0.1:3000/v1/recipients \
-  -H "authorization: Bearer $AGENT_API_KEY" \
-  -H 'content-type: application/json' \
-  -d '{"display_name":"managed-recipient","type":"AGENT","managed_account_id":"acct_...","destination":{"type":"SOLANA_SPL","wallet_address":"..."}}'
-```
-
-Managed-account destinations are server-verified against the target account's
-canonical Solana public key.
-
-## Get balance
-
-```ts
-const balance = await account.getBalance()
-// { currency: 'USD', settled: '12.50', pendingOutgoing: '0.00', available: '12.50' }
-```
-
-Balances are normalized USD strings. Internally all calculations use integer
-atomic units; the configured token's raw units never cross the public contract.
-
-## Pay and send
-
-```ts
-const paid = await account.pay(
-  {
-    recipientId: 'rcpt_...',
-    amount: '0.50',
-    description: 'dataset access',
-    externalReference: 'order-123',
-  },
-  { idempotencyKey: 'order-123-payment' },
-)
-
-const sent = await account.send(
-  { recipientId: 'rcpt_...', amount: '0.25' },
-  { idempotencyKey: 'order-123-send' },
-)
-```
-
-Both operations use the same reservation, durable attempt, signed-payload,
-confirmation, and recovery pipeline. Always inspect the returned `status`
-alongside the HTTP status: `CONFIRMED` means that the chain transaction reached
-the configured confirmation level, while `RECONCILING` means that the outcome
-is not known yet. An HTTP `200` or `201` alone must never be interpreted as
-proof of blockchain success. Poll `getPayment()` or retry with the same
-idempotency key while the payment remains recoverable.
-
-## Receive and refund
-
-`receive()` creates a persistent receive request; it does not itself move funds.
-Refund is a new reverse SPL transfer, not a cancellation of an immutable chain
-transaction. It is supported only when the original recipient is another
-managed account controlled by this system and the original payer destination is
-known.
-
-```ts
-const refund = await account.refund(
-  { originalPaymentId: 'pay_...', amount: '0.50' },
-  { idempotencyKey: 'refund-pay-...' },
-)
-```
-
-External uncontrolled recipients return `REFUND_NOT_SUPPORTED`.
-
-For ordinary external recipients, the destination SPL token account must
-already exist; Mux does not sponsor arbitrary ATA rent. Verified managed
-recipients may have their ATA created, subject to a per-account sponsorship
-budget (10,000,000 lamports per UTC day and 60 sponsored transactions per
-hour) and the platform fee-payer minimum operating balance.
-
-## Transaction lifecycle
-
-Payments move through `CREATED`, `ROUTING`, `SUBMITTED`, `RECONCILING`,
-`CONFIRMED`, or `FAILED`. A network ambiguity remains recoverable and keeps its
-reservation until chain status is known. Transaction history is available via
-`GET /v1/transactions` and `account.listTransactions()`.
-
-Transaction history is cursor-paginated with `limit` (default 50, maximum 100)
-and an opaque `cursor`; `account.listTransactionsPage()` exposes one page and
-`account.listTransactions()` explicitly collects all pages for compatibility.
-The cursor uses `(created_at, id)` ordering so new inserts do not create gaps or
-duplicates in an existing traversal.
-
-## Idempotency
-
-`pay`, `send`, and `refund` require an idempotency key at the HTTP boundary.
-The SDK accepts a caller key or generates one for the operation. Retries reuse
-the same key and do not create a second logical payment. Conflicting reuse of a
-key returns `409`. If a POST outcome is ambiguous, `PaymentPendingError` exposes
-the same `idempotencyKey` and, when known, `paymentId`; poll or retry with that
-key instead of creating a new one.
-
-## Local development
-
-```bash
-pnpm install --frozen-lockfile
-pnpm local:setup
-pnpm dev
-```
-
-`local:setup` is idempotent: it reuses the database volume, validator ledger,
-fee payer, mint, and existing secrets. It does not reset local state. When an
-existing `.env` contains a non-local database, cluster, RPC, port, or mint, the
-command stops with an explanation instead of overwriting it. Place an advanced
-configuration aside before creating an automated local environment.
-
-Local state is stored under `.local/`:
-
-```text
-.local/
-  fee-payer.json
-  mint.json
-  solana-ledger/
-  solana-validator.json
-  solana-validator.log
-```
-
-The validator is detached from the setup shell and resumes its existing ledger
-on the next `local:setup`. The script accepts an already-running validator only
-when its genesis hash matches the state recorded for this checkout. It never
-resets a ledger, calls an external faucet, or creates Token-2022 assets.
-
-`pnpm local:status` reports PostgreSQL, Solana, settlement mint, fee payer, and
-Mux API readiness without printing secrets.
-
-## Local Solana integration tests with Surfpool
-
-The product integration suite uses isolated, offline Surfpool and PostgreSQL;
-it does not fork mainnet or use an external faucet.
-
-```bash
-pnpm local:setup
-pnpm test:solana
-```
-
-The suite performs real SPL transfers, incoming reconciliation, restart/replay
-checks, and a managed-account refund through the HTTP API/SDK.
-
-## Solana stack and signer roles
-
-The adapter uses `@solana/kit` and official `@solana-program/token` and memo
-primitives. The agent account signer is the SPL token authority; the separate
-platform fee payer supplies SOL for network fees and ATA rent. The fee payer and
-agent signer must not be the same key. Solana types remain inside the adapter,
-not in core or the SDK public API.
-
-## Advanced Solana configuration
-
-To use your own RPC and classic SPL mint, copy `.env.example` to `.env` and set
-the RPC URL, cluster, settlement mint, platform fee-payer secret, and application
-secrets manually. Then start PostgreSQL, apply migrations with
-`pnpm db:migrate`, and run `pnpm dev`. Do not run `local:setup` against this
-custom environment.
-
-For devnet or testnet, use `SOLANA_CLUSTER=devnet` or
-`SOLANA_CLUSTER=testnet`, point `SOLANA_RPC_URL` at that cluster, and supply a
-classic SPL mint and funded fee payer belonging to the same network. Public
-network funding and mint administration remain explicit operator tasks.
-
-For mainnet, both safety settings are mandatory:
-
-```dotenv
-SOLANA_CLUSTER=mainnet-beta
-ALLOW_MAINNET=true
-```
-
-Setting only one is rejected. Mainnet is never enabled by local tooling and is
-not part of the Quick Start.
-
-## Mainnet safety
-
-Mainnet is blocked unless both `SOLANA_CLUSTER=mainnet-beta` and
-`ALLOW_MAINNET=true` are configured. The adapter validates RPC network identity
-through genesis information, including custom RPC URLs. Automated tests always
-use offline local Surfpool.
-
-## Known product-v1 limitations
-
-Product v1 supports one configured classic SPL settlement mint represented as
-USD. It does not provide fiat custody, FX, card/bank rails, x402, off-ramp,
-KYC/compliance tooling, HSM/MPC custody, frontend, or AI-agent orchestration.
-
-## SDK usage
+The response contains an `api_key` shown once. Use it with the workspace SDK:
 
 ```ts
 import { AgentPaymentAccount } from '@agent-payment/sdk'
 
 const account = new AgentPaymentAccount({
   baseUrl: 'http://127.0.0.1:3000',
-  apiKey: process.env.AGENT_PAYMENT_API_KEY ?? '',
+  apiKey: process.env.AGENT_API_KEY!,
 })
 
 const balance = await account.getBalance()
 const payment = await account.pay(
-  { recipientId: 'rcpt_preconfigured', amount: '0.50' },
-  { idempotencyKey: 'technical-example-001' },
+  {
+    recipientId: 'rcpt_...',
+    amount: '0.50',
+    description: 'dataset access',
+  },
+  { idempotencyKey: 'order-123-payment' },
 )
-
-let current = payment
-while (['CREATED', 'ROUTING', 'SUBMITTED', 'RECONCILING'].includes(current.status)) {
-  await new Promise((resolve) => setTimeout(resolve, 500))
-  current = await account.getPayment(current.id)
-}
-
-const transactions = await account.listTransactions()
-console.log(balance.available, current.status, transactions.length)
 ```
 
-The polling loop is explicit application code; the SDK does not silently poll.
-The SDK package has no Solana dependency.
+An HTTP `200` or `201` is not proof of blockchain confirmation. Treat only a payment with `status: "CONFIRMED"` as confirmed; poll `getPayment()` when a result remains `RECONCILING`.
 
-After startup, API workers recover bounded batches of pending outgoing payments
-and reconcile incoming transfers. They are single-flight, stop accepting new
-runs during shutdown, drain active runs, and only then disconnect PostgreSQL.
+## Local Development
 
-## Release / CI verification
+Root project commands load the checkout's root `.env` explicitly, even when pnpm runs tooling from a workspace directory. Root `.env` values for project configuration take precedence over stale shell values; system variables such as `PATH`, `HOME`, and temporary-directory settings are preserved.
 
-The release gate creates a disposable PostgreSQL Compose project backed by
-tmpfs, applies every migration to an empty database with `prisma migrate deploy`,
-runs all PostgreSQL-backed tests, builds the workspace, and runs the offline
-Surfpool E2E. It removes the disposable database on success or failure and
-does not touch the normal developer volume.
+Useful commands:
 
-```bash
-pnpm install --frozen-lockfile
-pnpm verify
-```
+| Command | Purpose |
+| --- | --- |
+| `pnpm local:setup` | Create or restart the preserved local environment and deploy committed migrations |
+| `pnpm local:status` | Report PostgreSQL, Solana, mint, fee-payer, and API status without printing secrets |
+| `pnpm local:down` | Stop only this checkout's local infrastructure while preserving state |
+| `pnpm db:migrate` | Author a new Prisma migration during schema development |
+| `pnpm db:migrate:deploy` | Apply already committed migrations |
 
-`pnpm verify` is the final release gate. It provides `DATABASE_URL` itself, so
-required PostgreSQL and Surfpool suites cannot be silently skipped.
+### Configuration
 
-If a payment remains `RECONCILING` beyond the normal confirmation window, do
-not create a new idempotency key or manually send a second transfer. Poll the
-payment and inspect the persisted expected transaction signature. An operator
-may resolve it only after checking that signature on the configured cluster;
-automatic recovery never creates a replacement transfer after an unknown
-expired outcome.
+See [`.env.example`](.env.example) for safe manual defaults and accepted secret formats.
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL connection URL |
+| `PORT` | API port; defaults to `3000` |
+| `NODE_ENV` | `development`, `test`, or `production` |
+| `ADMIN_API_KEY` | Administrative account and credential authentication |
+| `SOLANA_RPC_URL` | RPC endpoint for the configured cluster |
+| `SOLANA_CLUSTER` | `localnet`, `devnet`, `testnet`, or `mainnet-beta` |
+| `SOLANA_SETTLEMENT_MINT` | One classic SPL mint used for settlement |
+| `SOLANA_FEE_PAYER_SECRET` | Separate platform fee-payer signer secret |
+| `WALLET_MASTER_KEY` | 32-byte key used to encrypt managed signer secrets |
+| `ALLOW_MAINNET` | Additional explicit mainnet opt-in; defaults to `false` |
+
+For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supply a mint and funded fee payer belonging to that cluster. Do not use `local:setup` to prepare a custom network. Mainnet is never part of Quick Start and requires both `SOLANA_CLUSTER=mainnet-beta` and `ALLOW_MAINNET=true`.
+
+## Documentation
+
+- [Product](docs/product.md) — users, mental model, product flow, v1 scope, and non-goals
+- [Architecture](docs/architecture.md) — components, lifecycle, custody, data, and trust boundaries
+- [API Reference](docs/api.md) — authentication, routes, payloads, statuses, and errors
+- [Roadmap](docs/roadmap.md) — implemented scope and explicitly uncommitted future directions
+- [Contributing](CONTRIBUTING.md) — development and pull-request workflow
+
+## Current Scope and Limitations
+
+- The runtime is custodial and stores encrypted signer material in PostgreSQL.
+- Only `USD` is exposed and only one configured classic SPL mint settles it.
+- Refunds are supported only when the original recipient is another managed account and the reverse destination is known.
+- External recipient token accounts must already exist; sponsored associated-token-account creation is limited to verified managed recipients.
+- Cards, bank rails, x402, FX, off-ramp, KYC, a browser UI, and agent orchestration are not part of v1.
+- This repository does not claim HSM/MPC custody or an external security audit.
+
+## Roadmap
+
+The implemented v1 and possible post-v1 directions are separated in [Roadmap](docs/roadmap.md). No dates or post-v1 commitments are declared in the repository.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
