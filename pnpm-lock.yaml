@@ -32,6 +32,9 @@ importers:
       eslint-config-prettier:
         specifier: 10.1.8
         version: 10.1.8(eslint@10.10.0(jiti@2.7.0))
+      dotenv:
+        specifier: 17.4.2
+        version: 17.4.2
       prettier:
         specifier: 3.9.6
         version: 3.9.6

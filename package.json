@@ -10,18 +10,21 @@
   },
   "scripts": {
     "build": "pnpm --recursive --if-present build",
-    "dev": "pnpm --filter @agent-payment/api dev",
+    "dev": "pnpm build && node scripts/run-with-root-env.mjs pnpm --filter @agent-payment/api exec tsx watch src/server.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:solana": "test -n \"$DATABASE_URL\" || { echo 'DATABASE_URL is required for the PostgreSQL-backed Solana E2E' >&2; exit 1; }; vitest run packages/solana-rail/src/surfpool.integration.test.ts apps/api/src/payments.solana.integration.test.ts",
+    "test:solana": "node scripts/run-with-root-env.mjs --optional --require=DATABASE_URL pnpm exec vitest run packages/solana-rail/src/surfpool.integration.test.ts apps/api/src/payments.solana.integration.test.ts",
     "verify": "node scripts/verify-clean.mjs",
     "test:watch": "vitest",
     "typecheck": "pnpm --recursive --if-present typecheck",
     "db:generate": "pnpm --filter @agent-payment/db generate",
-    "db:migrate": "pnpm --filter @agent-payment/db migrate:dev",
-    "db:validate": "pnpm --filter @agent-payment/db prisma:validate"
+    "db:migrate": "node scripts/run-with-root-env.mjs pnpm --filter @agent-payment/db migrate:dev",
+    "db:validate": "node scripts/run-with-root-env.mjs pnpm --filter @agent-payment/db prisma:validate",
+    "local:setup": "node scripts/local.mjs setup",
+    "local:status": "node scripts/local.mjs status",
+    "local:down": "node scripts/local.mjs down"
   },
   "devDependencies": {
     "@solana/kit-plugin-rpc": "^0.19.0",
@@ -32,6 +35,7 @@
     "@typescript-eslint/parser": "8.69.0",
     "eslint": "10.10.0",
     "eslint-config-prettier": "10.1.8",
+    "dotenv": "17.4.2",
     "prettier": "3.9.6",
     "typescript": "5.9.3",
     "vitest": "5.0.0"

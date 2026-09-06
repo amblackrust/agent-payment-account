@@ -42,35 +42,58 @@ transfers, and reconciliation cursors.
 
 ## Quick start
 
-Requirements: Node.js 22+, pnpm 11+, Docker with Compose, and a configured
-classic SPL settlement mint for real payments.
+Requirements: Node.js 22+, pnpm 11+, Docker with Compose, Solana CLI with
+`solana-test-validator`, and `spl-token`.
 
 ```bash
 git clone <repository-url>
 cd agent-payment-account
 pnpm install --frozen-lockfile
-cp .env.example .env
-# Edit .env with the local settlement mint and fee-payer secret.
-docker compose up -d postgres
-pnpm db:migrate
+pnpm local:setup
 pnpm dev
 ```
 
-The API listens on `http://127.0.0.1:3000` by default.
+In another terminal:
 
 ```bash
-curl http://127.0.0.1:3000/health
 curl http://127.0.0.1:3000/ready
 ```
 
-`/health` reports process health. `/ready` performs bounded, fresh checks for
-PostgreSQL, the configured Solana network/mint, and the platform fee payer
-operating threshold. It returns `503 {"status":"not_ready"}` whenever any
-required dependency is unavailable.
+Expected response:
+
+```text
+{"status":"ok"}
+```
+
+`local:setup` starts local PostgreSQL and a detached local Solana validator,
+creates a platform fee payer and a 6-decimal classic SPL test-USD mint, funds
+the fee payer with fake local SOL, generates `ADMIN_API_KEY` and
+`WALLET_MASTER_KEY`, writes the root `.env`, and applies database migrations.
+This environment is local-only: it uses no real money, no mainnet, and no
+external faucet.
+
+The API listens on `http://127.0.0.1:3000` by default. `/health` reports process
+health. `/ready` performs bounded, fresh checks for PostgreSQL, the configured
+Solana network/mint, and the platform fee payer operating threshold. It returns
+`503 {"status":"not_ready"}` whenever a required dependency is unavailable.
+
+Inspect or stop the local infrastructure with:
+
+```bash
+pnpm local:status
+pnpm local:down
+```
+
+`local:down` stops only this checkout's validator and PostgreSQL service. It
+preserves the database volume, `.local/` ledger and keypairs, and `.env`. Run
+`pnpm local:setup` again to restart the preserved environment.
 
 ## Environment variables
 
-All runtime configuration is loaded and validated centrally. See [`.env.example`](.env.example).
+Root commands load `<repo>/.env` explicitly, including when pnpm executes API or
+Prisma tooling from a workspace package directory. Shell-specific `export` or
+Fish `set -x` commands are not required. See [`.env.example`](.env.example) for
+the manual/advanced reference.
 
 - `DATABASE_URL` — PostgreSQL connection URL.
 - `PORT` — HTTP port, default `3000`.
@@ -83,15 +106,16 @@ All runtime configuration is loaded and validated centrally. See [`.env.example`
 - `WALLET_MASTER_KEY` — 32 bytes encoded as 64 hexadecimal characters.
 - `ALLOW_MAINNET` — must be explicitly `true` for mainnet; default is `false`.
 
-Generate local secret material with:
+`pnpm local:setup` generates and preserves local secrets automatically. For a
+manual environment, generate secret material with:
 
 ```bash
 openssl rand -hex 32                 # WALLET_MASTER_KEY or an admin secret
 ```
 
-Generate a Solana fee-payer key using the Solana tooling appropriate for the
-operator, then provide its 64-byte secret as JSON, hex, or base64. Keep all
-secrets outside source control and never put them in logs.
+Generate a Solana fee-payer key using the operator's Solana tooling, then
+provide its 64-byte secret as JSON, hex, or base64. Keep all secrets outside
+source control and never put them in logs. `.env` and `.local/` are gitignored.
 
 ## Create an account
 
@@ -231,23 +255,43 @@ key instead of creating a new one.
 
 ```bash
 pnpm install --frozen-lockfile
-cp .env.example .env
-docker compose up -d postgres
-pnpm db:migrate
+pnpm local:setup
 pnpm dev
 ```
 
-## Local Solana integration test with Surfpool
+`local:setup` is idempotent: it reuses the database volume, validator ledger,
+fee payer, mint, and existing secrets. It does not reset local state. When an
+existing `.env` contains a non-local database, cluster, RPC, port, or mint, the
+command stops with an explanation instead of overwriting it. Place an advanced
+configuration aside before creating an automated local environment.
+
+Local state is stored under `.local/`:
+
+```text
+.local/
+  fee-payer.json
+  mint.json
+  solana-ledger/
+  solana-validator.json
+  solana-validator.log
+```
+
+The validator is detached from the setup shell and resumes its existing ledger
+on the next `local:setup`. The script accepts an already-running validator only
+when its genesis hash matches the state recorded for this checkout. It never
+resets a ledger, calls an external faucet, or creates Token-2022 assets.
+
+`pnpm local:status` reports PostgreSQL, Solana, settlement mint, fee payer, and
+Mux API readiness without printing secrets.
+
+## Local Solana integration tests with Surfpool
 
 The product integration suite uses isolated, offline Surfpool and PostgreSQL;
 it does not fork mainnet or use an external faucet.
 
 ```bash
-docker compose up -d postgres
-DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/agent_payment_account \
-  pnpm db:migrate
-DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/agent_payment_account \
-  pnpm test:solana
+pnpm local:setup
+pnpm test:solana
 ```
 
 The suite performs real SPL transfers, incoming reconciliation, restart/replay
@@ -260,6 +304,29 @@ primitives. The agent account signer is the SPL token authority; the separate
 platform fee payer supplies SOL for network fees and ATA rent. The fee payer and
 agent signer must not be the same key. Solana types remain inside the adapter,
 not in core or the SDK public API.
+
+## Advanced Solana configuration
+
+To use your own RPC and classic SPL mint, copy `.env.example` to `.env` and set
+the RPC URL, cluster, settlement mint, platform fee-payer secret, and application
+secrets manually. Then start PostgreSQL, apply migrations with
+`pnpm db:migrate`, and run `pnpm dev`. Do not run `local:setup` against this
+custom environment.
+
+For devnet or testnet, use `SOLANA_CLUSTER=devnet` or
+`SOLANA_CLUSTER=testnet`, point `SOLANA_RPC_URL` at that cluster, and supply a
+classic SPL mint and funded fee payer belonging to the same network. Public
+network funding and mint administration remain explicit operator tasks.
+
+For mainnet, both safety settings are mandatory:
+
+```dotenv
+SOLANA_CLUSTER=mainnet-beta
+ALLOW_MAINNET=true
+```
+
+Setting only one is rejected. Mainnet is never enabled by local tooling and is
+not part of the Quick Start.
 
 ## Mainnet safety
 
