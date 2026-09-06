@@ -52,11 +52,22 @@ export class RecipientService {
       throw new ValidationError('Only SOLANA_SPL recipient destinations are supported')
     }
     validateSolanaAddress(walletAddress)
+    const ownerPublicKey = await this.resolveOwnerPublicKey(ownerAccountId)
+    if (walletAddress === ownerPublicKey) {
+      throw new ValidationError(
+        'Recipient destination must differ from the payer account',
+      )
+    }
 
     const managedAccountId =
       input.managedAccountId === undefined
         ? undefined
         : validateText(input.managedAccountId, 'Managed account id', 64)
+    if (managedAccountId === ownerAccountId) {
+      throw new ValidationError(
+        'Recipient destination must differ from the payer account',
+      )
+    }
     const managedPublicKey =
       managedAccountId === undefined
         ? undefined
@@ -95,6 +106,7 @@ export class RecipientService {
     if (current === null) {
       throw new ErrorWithStatus('Recipient not found', 404)
     }
+    const ownerPublicKey = await this.resolveOwnerPublicKey(ownerAccountId)
     const managedAccountId =
       input.managedAccountId === undefined
         ? current.managedAccountId
@@ -102,6 +114,11 @@ export class RecipientService {
     const currentDestination = current.destinations[0]
     const walletAddress =
       input.destination?.walletAddress ?? currentDestination?.walletAddress
+    if (managedAccountId === ownerAccountId || walletAddress === ownerPublicKey) {
+      throw new ValidationError(
+        'Recipient destination must differ from the payer account',
+      )
+    }
     if (managedAccountId !== null && managedAccountId !== undefined) {
       const managedPublicKey = await this.resolveManagedPublicKey(managedAccountId)
       if (walletAddress !== managedPublicKey) {
@@ -162,6 +179,14 @@ export class RecipientService {
     const publicKey = await this.repository.findAccountPublicKey(accountId)
     if (publicKey === null) {
       throw new ValidationError('Managed account was not found or is disabled')
+    }
+    return publicKey
+  }
+
+  private async resolveOwnerPublicKey(accountId: string): Promise<string> {
+    const publicKey = await this.repository.findAccountPublicKey(accountId)
+    if (publicKey === null) {
+      throw new ValidationError('Recipient owner account was not found or is disabled')
     }
     return publicKey
   }

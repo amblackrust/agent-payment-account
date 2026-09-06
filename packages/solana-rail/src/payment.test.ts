@@ -117,11 +117,15 @@ async function createPreparedRail(
     readonly statusSequence?: readonly unknown[]
     readonly blockHeight?: bigint
     readonly latestBlockhash?: string
+    readonly recipientSameAsPayer?: boolean
+    readonly minimumFeePayerBalanceLamports?: bigint
   } = {},
 ) {
   const payer = await generateKeyPairSigner(true)
   const feePayer = options.sameSigner ? payer : await generateKeyPairSigner(true)
-  const recipient = await generateKeyPairSigner(true)
+  const recipient = options.recipientSameAsPayer
+    ? payer
+    : await generateKeyPairSigner(true)
   const [payerAta] = await findAssociatedTokenPda({
     owner: payer.address,
     tokenProgram: TOKEN_PROGRAM_ADDRESS,
@@ -150,6 +154,7 @@ async function createPreparedRail(
   let sentTransaction = ''
   let signatureValue = ''
   let statusCalls = 0
+  const sponsorshipReservations: bigint[] = []
   const rail = createSolanaPaymentRailWithRpc({
     rpc: createMockRpc(
       accounts,
@@ -174,7 +179,7 @@ async function createPreparedRail(
     allowMainnet: false,
     settlementMint: mint,
     feePayerSecret: JSON.stringify(Array.from(await exportSecret(feePayer))),
-    minimumFeePayerBalanceLamports: 1n,
+    minimumFeePayerBalanceLamports: options.minimumFeePayerBalanceLamports ?? 1n,
   })
   const payerSecret = await exportSecret(payer)
   const prepared = await rail.prepare(
@@ -195,6 +200,9 @@ async function createPreparedRail(
       payerAccountId: 'acct_payer',
       payerPublicKey: payer.address,
       allowRecipientAtaCreation: true,
+      reserveSponsorship: async (lamports) => {
+        sponsorshipReservations.push(lamports)
+      },
       getPayerSecretKey: async () => payerSecret,
     },
   )
@@ -205,6 +213,7 @@ async function createPreparedRail(
     payerSecret,
     payerAddress: payer.address,
     getSent: () => sentTransaction,
+    sponsorshipReservations,
   }
 }
 
@@ -355,8 +364,39 @@ describe('Solana payment rail', () => {
     )
 
     await expect(
-      createPreparedRail({ feePayerBalance: 5_000n, includeRecipientAta: true }),
+      createPreparedRail({ feePayerBalance: 5_001n, includeRecipientAta: true }),
     ).resolves.toBeDefined()
+  })
+
+  it('accounts for network fees with an existing ATA and network fee plus rent when missing', async () => {
+    const existing = await createPreparedRail({ includeRecipientAta: true })
+    const missing = await createPreparedRail()
+
+    expect(existing.sponsorshipReservations).toEqual([5_000n])
+    expect(missing.sponsorshipReservations).toEqual([2_044_280n])
+  })
+
+  it('preserves the configured fee-payer operating reserve after platform cost', async () => {
+    await expect(
+      createPreparedRail({
+        includeRecipientAta: true,
+        minimumFeePayerBalanceLamports: 1_000_000n,
+        feePayerBalance: 1_004_999n,
+      }),
+    ).rejects.toThrow('preserving the minimum operating reserve')
+    await expect(
+      createPreparedRail({
+        includeRecipientAta: true,
+        minimumFeePayerBalanceLamports: 1_000_000n,
+        feePayerBalance: 1_005_000n,
+      }),
+    ).resolves.toBeDefined()
+  })
+
+  it('rejects a legacy self destination before signing or fee accounting', async () => {
+    await expect(createPreparedRail({ recipientSameAsPayer: true })).rejects.toThrow(
+      'must differ from the payer account',
+    )
   })
 
   it('rejects using the payer signer as the platform fee payer', async () => {

@@ -166,6 +166,8 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
               authTag: custody.encryptionAuthTag,
             })
           },
+          undefined,
+          { maxLamportsPerDay: 100_000_000n, maxTransactionsPerHour: 100 },
         )
 
         const result = await service.createPayment(
@@ -265,6 +267,8 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
               authTag: custody.encryptionAuthTag,
             })
           },
+          undefined,
+          { maxLamportsPerDay: 100_000_000n, maxTransactionsPerHour: 100 },
         )
         app = buildApp({
           config: testConfig,

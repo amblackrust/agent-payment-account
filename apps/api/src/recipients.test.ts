@@ -4,6 +4,7 @@ import { RecipientService } from './recipients.js'
 const accountB = 'acct_b'
 const walletB = 'So11111111111111111111111111111111111111112'
 const walletC = 'SysvarRent111111111111111111111111111111111'
+const walletA = 'Vote111111111111111111111111111111111111111'
 
 function createService() {
   let current = {
@@ -20,7 +21,8 @@ function createService() {
     updatedAt: new Date(),
   }
   const repository = {
-    findAccountPublicKey: async (id: string) => (id === accountB ? walletB : null),
+    findAccountPublicKey: async (id: string) =>
+      id === accountB ? walletB : id === 'acct_a' ? walletA : null,
     createRecipient: async (_input: never) => current,
     findRecipientForOwner: async () => current,
     updateRecipient: async (_input: never) => current,
@@ -73,5 +75,30 @@ describe('managed recipient verification', () => {
         managedAccountId: 'acct_missing',
       }),
     ).rejects.toThrow('Managed account was not found')
+  })
+
+  it('rejects direct and managed self recipients', async () => {
+    const { service } = createService()
+    await expect(
+      service.createRecipient('acct_a', {
+        displayName: 'self',
+        type: 'AGENT',
+        destination: { type: 'SOLANA_SPL', walletAddress: walletA },
+      }),
+    ).rejects.toThrow('must differ from the payer account')
+    await expect(
+      service.createRecipient('acct_a', {
+        displayName: 'managed self',
+        type: 'AGENT',
+        managedAccountId: 'acct_a',
+        destination: { type: 'SOLANA_SPL', walletAddress: walletA },
+      }),
+    ).rejects.toThrow('must differ from the payer account')
+    await expect(
+      service.updateRecipient('acct_a', 'rcpt_1', {
+        destination: { id: 'dest_1', type: 'SOLANA_SPL', walletAddress: walletA },
+        managedAccountId: null,
+      }),
+    ).rejects.toThrow('must differ from the payer account')
   })
 })

@@ -1168,7 +1168,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         const existing = await transaction.feeSponsorship.findUnique({
           where: { paymentId: input.paymentId },
         })
-        if (existing !== null) return
+        if (existing !== null && input.lamports <= existing.lamports) return
+        const additionalLamports =
+          existing === null ? input.lamports : input.lamports - existing.lamports
         const [daily, hourly] = await Promise.all([
           transaction.feeSponsorship.aggregate({
             where: { accountId: input.accountId, createdAt: { gte: dayStart } },
@@ -1180,8 +1182,8 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         ])
         const dailyLamports = daily._sum.lamports ?? 0n
         if (
-          dailyLamports + input.lamports > input.maxLamportsPerDay ||
-          hourly >= input.maxTransactionsPerHour
+          dailyLamports + additionalLamports > input.maxLamportsPerDay ||
+          (existing === null && hourly >= input.maxTransactionsPerHour)
         ) {
           throw new ExternalRailError(
             'Account sponsorship budget is exhausted',
@@ -1189,15 +1191,22 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             'DETERMINISTIC',
           )
         }
-        await transaction.feeSponsorship.create({
-          data: {
-            id: `spon_${randomBytes(16).toString('hex')}`,
-            accountId: input.accountId,
-            paymentId: input.paymentId,
-            lamports: input.lamports,
-            createdAt: now,
-          },
-        })
+        if (existing === null) {
+          await transaction.feeSponsorship.create({
+            data: {
+              id: `spon_${randomBytes(16).toString('hex')}`,
+              accountId: input.accountId,
+              paymentId: input.paymentId,
+              lamports: input.lamports,
+              createdAt: now,
+            },
+          })
+        } else {
+          await transaction.feeSponsorship.update({
+            where: { id: existing.id },
+            data: { lamports: input.lamports },
+          })
+        }
       })
     },
     async transitionPayment(paymentId, currentStatus, nextStatus, fields) {

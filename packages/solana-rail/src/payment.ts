@@ -650,6 +650,13 @@ export function createSolanaPaymentRailWithRpc(
         request.destination.reference,
         'recipient public key',
       )
+      if (payerOwner === recipientOwner) {
+        throw new ExternalRailError(
+          'Recipient destination must differ from the payer account',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
       const payerSecret = await context.getPayerSecretKey()
       try {
         const payerSigner = await createSigner(payerSecret, 'payer secret')
@@ -678,6 +685,13 @@ export function createSolanaPaymentRailWithRpc(
             mint: settlementMint,
           }),
         ])
+        if (payerAta[0] === recipientAta[0]) {
+          throw new ExternalRailError(
+            'Recipient destination must differ from the payer account',
+            undefined,
+            'DETERMINISTIC',
+          )
+        }
         const sourceData = await fetchTokenAccount(payerAta[0], 'Payer')
         if (sourceData.owner !== payerOwner) {
           throw new ExternalRailError(
@@ -775,31 +789,30 @@ export function createSolanaPaymentRailWithRpc(
           : await withRpcTimeout((abortSignal) =>
               options.rpc.getMinimumBalanceForRentExemption(165n).send({ abortSignal }),
             )
-        const requiredFeePayerBalance = feeForMessage.value + recipientAtaRent
+        const platformCost = feeForMessage.value + recipientAtaRent
         const feeBalance = await withRpcTimeout((abortSignal) =>
           options.rpc
             .getBalance(feePayerSigner.address, { commitment: CONFIRMATION_COMMITMENT })
             .send({ abortSignal }),
         )
-        if (feeBalance.value < minimumFeePayerBalanceLamports) {
+        if (
+          feeBalance.value < minimumFeePayerBalanceLamports ||
+          feeBalance.value - minimumFeePayerBalanceLamports < platformCost
+        ) {
           throw new ExternalRailError(
-            'Platform fee payer is below the minimum operating balance',
+            'Platform fee payer balance cannot cover this transaction while preserving the minimum operating reserve',
             undefined,
             'DETERMINISTIC',
           )
         }
-        if (feeBalance.value < requiredFeePayerBalance) {
+        if (context.reserveSponsorship === undefined) {
           throw new ExternalRailError(
-            'Platform fee payer balance is insufficient for this transaction',
+            'Platform fee accounting is not configured',
             undefined,
             'DETERMINISTIC',
           )
         }
-        if (recipientAta[0] !== payerAta[0] && !recipientAccount.exists) {
-          if (context.reserveSponsorship !== undefined) {
-            await context.reserveSponsorship(requiredFeePayerBalance)
-          }
-        }
+        await context.reserveSponsorship(platformCost)
         const signedTransaction =
           await signTransactionMessageWithSigners(transactionMessage)
         const serializedTransactionBase64 =

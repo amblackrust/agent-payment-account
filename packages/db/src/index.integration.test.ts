@@ -595,5 +595,91 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await database.disconnect()
       }
     })
+
+    it('accounts sponsorship deltas once per logical payment and serializes quota', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'platform-fee-accounting-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'mux_integration',
+        })
+        const policy = {
+          accountId,
+          maxLamportsPerDay: 10n,
+          maxTransactionsPerHour: 3,
+        }
+        const firstPaymentId = `pay_${randomUUID().replaceAll('-', '')}`
+        await database.reserveFeeSponsorship({
+          ...policy,
+          paymentId: firstPaymentId,
+          lamports: 4n,
+        })
+        await database.reserveFeeSponsorship({
+          ...policy,
+          paymentId: firstPaymentId,
+          lamports: 7n,
+        })
+        await database.reserveFeeSponsorship({
+          ...policy,
+          paymentId: `pay_${randomUUID().replaceAll('-', '')}`,
+          lamports: 3n,
+        })
+        await expect(
+          database.reserveFeeSponsorship({
+            ...policy,
+            paymentId: `pay_${randomUUID().replaceAll('-', '')}`,
+            lamports: 1n,
+          }),
+        ).rejects.toThrow('sponsorship budget is exhausted')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('does not allow concurrent sponsorship reservations to exceed quota', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'concurrent-platform-fee-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'mux_integration',
+        })
+        const results = await Promise.allSettled(
+          [1, 2].map((suffix) =>
+            database.reserveFeeSponsorship({
+              accountId,
+              paymentId: `pay_${suffix}_${randomUUID().replaceAll('-', '')}`,
+              lamports: 6n,
+              maxLamportsPerDay: 10n,
+              maxTransactionsPerHour: 10,
+            }),
+          ),
+        )
+
+        expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(
+          1,
+        )
+        expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+      } finally {
+        await database.disconnect()
+      }
+    })
   },
 )
