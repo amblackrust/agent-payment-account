@@ -1,4 +1,4 @@
-import { generateKeyPairSigner } from '@solana/kit'
+import { createKeyPairSignerFromBytes, generateKeyPairSigner } from '@solana/kit'
 
 const SOLANA_SECRET_KEY_BYTES = 64
 const SOLANA_PRIVATE_SEED_BYTES = 32
@@ -35,4 +35,14 @@ export async function generateManagedWallet(): Promise<GeneratedManagedWallet> {
   privateSeed.fill(0)
 
   return { publicKey: signer.address, secretKey }
+}
+
+export async function deriveManagedWalletPublicKey(
+  secretKey: Uint8Array,
+): Promise<string> {
+  if (secretKey.length !== SOLANA_SECRET_KEY_BYTES) {
+    throw new Error('Managed Solana secret key must contain 64 bytes')
+  }
+  const signer = await createKeyPairSignerFromBytes(secretKey, false)
+  return signer.address
 }

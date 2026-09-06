@@ -268,7 +268,7 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
 
   return {
     async checkReadiness(): Promise<void> {
-      await getSettlementMetadata()
+      await validateSettlementMetadata()
     },
 
     async getReceiveDestination(owner): Promise<ReceiveDestination> {

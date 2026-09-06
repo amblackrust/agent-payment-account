@@ -919,7 +919,7 @@ export function createSolanaPaymentRailWithRpc(
     checkReadiness: async (): Promise<void> => {
       // Readiness must validate the same network and settlement mint used for
       // execution, even when this rail is checked without the read adapter.
-      await getSettlementMetadata()
+      await validateSettlementMetadata()
       const feePayerSigner = await createSigner(
         options.feePayerSecret,
         'fee payer secret',

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
+import { Client } from 'pg'
 
 import { ConflictError, RecipientResolutionError } from '@agent-payment/core'
 import { createDatabaseClient } from './index.js'
@@ -732,6 +733,77 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         ).toBe(false)
       } finally {
         await database.disconnect()
+      }
+    })
+
+    it('initializes runtime identity safely for legacy and concurrent startup', async () => {
+      const cleanupClient = new Client({ connectionString: databaseUrl as string })
+      const identity = {
+        rail: 'SOLANA_SPL',
+        version: '1',
+        cluster: 'localnet',
+        settlementMint: `mint-${randomUUID()}`,
+        custodyKeyFingerprint: 'a'.repeat(32),
+      }
+      await cleanupClient.connect()
+      try {
+        await cleanupClient.query(
+          `DELETE FROM "RuntimeMetadata" WHERE "key" = 'runtime_identity'`,
+        )
+        const rejectedDatabase = createDatabaseClient(databaseUrl as string)
+        let rejectedValidations = 0
+        await expect(
+          rejectedDatabase.initializeRuntimeIdentity(identity, async () => {
+            rejectedValidations += 1
+            throw new Error('wrong custody key')
+          }),
+        ).rejects.toThrow('wrong custody key')
+        expect(rejectedValidations).toBeGreaterThan(0)
+        await rejectedDatabase.disconnect()
+
+        const first = createDatabaseClient(databaseUrl as string)
+        const second = createDatabaseClient(databaseUrl as string)
+        let successfulValidations = 0
+        await Promise.all([
+          first.initializeRuntimeIdentity(identity, async () => {
+            successfulValidations += 1
+          }),
+          second.initializeRuntimeIdentity(identity, async () => {
+            successfulValidations += 1
+          }),
+        ])
+        expect(successfulValidations).toBeGreaterThan(0)
+        await expect(
+          first.initializeRuntimeIdentity({ ...identity, cluster: 'devnet' }),
+        ).rejects.toThrow('Runtime financial identity mismatch')
+        await first.disconnect()
+        await second.disconnect()
+
+        await cleanupClient.query(
+          `DELETE FROM "RuntimeMetadata" WHERE "key" = 'runtime_identity'`,
+        )
+        const competingA = createDatabaseClient(databaseUrl as string)
+        const competingB = createDatabaseClient(databaseUrl as string)
+        const competing = await Promise.allSettled([
+          competingA.initializeRuntimeIdentity(identity, async () => undefined),
+          competingB.initializeRuntimeIdentity(
+            { ...identity, settlementMint: `other-${identity.settlementMint}` },
+            async () => undefined,
+          ),
+        ])
+        expect(
+          competing.filter((result) => result.status === 'fulfilled'),
+        ).toHaveLength(1)
+        expect(competing.filter((result) => result.status === 'rejected')).toHaveLength(
+          1,
+        )
+        await competingA.disconnect()
+        await competingB.disconnect()
+      } finally {
+        await cleanupClient.query(
+          `DELETE FROM "RuntimeMetadata" WHERE "key" = 'runtime_identity'`,
+        )
+        await cleanupClient.end()
       }
     })
   },

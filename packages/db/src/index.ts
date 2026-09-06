@@ -552,7 +552,10 @@ export interface DatabaseClient
     ReservationRepository,
     ReceiveRepository,
     IncomingPaymentRepository {
-  initializeRuntimeIdentity(input: RuntimeIdentity): Promise<void>
+  initializeRuntimeIdentity(
+    input: RuntimeIdentity,
+    validateLegacyCustody?: (custody: AccountCustodyRecord) => Promise<void>,
+  ): Promise<void>
   reserveFeeSponsorship(input: {
     readonly accountId: string
     readonly paymentId: string
@@ -1880,13 +1883,48 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     async checkReadiness(): Promise<void> {
       await prisma.$queryRaw`SELECT 1`
     },
-    async initializeRuntimeIdentity(input): Promise<void> {
+    async initializeRuntimeIdentity(input, validateLegacyCustody): Promise<void> {
       const value = JSON.stringify(input)
       await prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT pg_advisory_xact_lock(764895321) IS NULL AS locked
+        `
         const existing = await transaction.runtimeMetadata.findUnique({
           where: { key: 'runtime_identity' },
         })
         if (existing === null) {
+          let afterId: string | undefined
+          while (true) {
+            const accounts = await transaction.agentAccount.findMany({
+              ...(afterId === undefined ? {} : { cursor: { id: afterId }, skip: 1 }),
+              orderBy: { id: 'asc' },
+              take: 100,
+              select: {
+                id: true,
+                solanaPublicKey: true,
+                encryptedSolanaSecret: true,
+                encryptionNonce: true,
+                encryptionAuthTag: true,
+              },
+            })
+            if (accounts.length === 0) break
+            if (validateLegacyCustody === undefined) {
+              throw new Error(
+                'Runtime financial identity is missing for a database with existing accounts; custody validation is required',
+              )
+            }
+            for (const account of accounts) {
+              await validateLegacyCustody({
+                accountId: account.id,
+                solanaPublicKey: account.solanaPublicKey,
+                encryptedSolanaSecret: account.encryptedSolanaSecret,
+                encryptionNonce: account.encryptionNonce,
+                encryptionAuthTag: account.encryptionAuthTag,
+              })
+            }
+            if (accounts.length < 100) break
+            afterId = accounts.at(-1)!.id
+          }
           await transaction.runtimeMetadata.create({
             data: { key: 'runtime_identity', value },
           })

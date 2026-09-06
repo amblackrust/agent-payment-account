@@ -1,4 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import type { AccountCustodyRecord } from '@agent-payment/db'
+import { deriveManagedWalletPublicKey } from '@agent-payment/solana-rail'
 
 const AES_GCM_ALGORITHM = 'aes-256-gcm'
 const NONCE_BYTES = 12
@@ -83,5 +85,27 @@ export function fingerprintWalletMasterKey(masterKey: string): string {
     return createHash('sha256').update(key).digest('hex').slice(0, 32)
   } finally {
     key.fill(0)
+  }
+}
+
+export async function validateLegacyWalletCustody(
+  cipher: WalletSecretCipher,
+  custody: AccountCustodyRecord,
+): Promise<void> {
+  let secret: Uint8Array | undefined
+  try {
+    secret = cipher.decrypt({
+      ciphertext: custody.encryptedSolanaSecret,
+      nonce: custody.encryptionNonce,
+      authTag: custody.encryptionAuthTag,
+    })
+    const publicKey = await deriveManagedWalletPublicKey(secret)
+    if (publicKey !== custody.solanaPublicKey) throw new Error('public key mismatch')
+  } catch {
+    throw new WalletEncryptionError(
+      'Legacy account custody validation failed; runtime identity was not initialized',
+    )
+  } finally {
+    secret?.fill(0)
   }
 }

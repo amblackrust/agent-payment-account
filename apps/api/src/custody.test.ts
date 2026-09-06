@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { generateManagedWallet } from '@agent-payment/solana-rail'
 
-import { WalletEncryptionError, WalletSecretCipher } from './custody.js'
+import {
+  validateLegacyWalletCustody,
+  WalletEncryptionError,
+  WalletSecretCipher,
+} from './custody.js'
 
 const masterKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
@@ -32,5 +37,30 @@ describe('wallet secret custody', () => {
     }
 
     expect(() => cipher.decrypt(tampered)).toThrow('Unable to decrypt wallet secret')
+  })
+
+  it('validates legacy encrypted custody against its stored public key', async () => {
+    const wallet = await generateManagedWallet()
+    const cipher = new WalletSecretCipher('a'.repeat(64))
+    const encrypted = cipher.encrypt(wallet.secretKey)
+    wallet.secretKey.fill(0)
+    const custody = {
+      accountId: 'acct_legacy',
+      solanaPublicKey: wallet.publicKey,
+      encryptedSolanaSecret: encrypted.ciphertext,
+      encryptionNonce: encrypted.nonce,
+      encryptionAuthTag: encrypted.authTag,
+    }
+
+    await expect(validateLegacyWalletCustody(cipher, custody)).resolves.toBeUndefined()
+    await expect(
+      validateLegacyWalletCustody(new WalletSecretCipher('b'.repeat(64)), custody),
+    ).rejects.toThrow('runtime identity was not initialized')
+    await expect(
+      validateLegacyWalletCustody(cipher, {
+        ...custody,
+        solanaPublicKey: '11111111111111111111111111111111',
+      }),
+    ).rejects.toThrow('runtime identity was not initialized')
   })
 })

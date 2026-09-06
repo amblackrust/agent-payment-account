@@ -12,7 +12,11 @@ import { ExternalRailError } from '@agent-payment/core'
 import { buildApp } from './app.js'
 import { AccountService } from './accounts.js'
 import { loadConfig, redactConfig } from './config.js'
-import { fingerprintWalletMasterKey, WalletSecretCipher } from './custody.js'
+import {
+  fingerprintWalletMasterKey,
+  validateLegacyWalletCustody,
+  WalletSecretCipher,
+} from './custody.js'
 import { PaymentService } from './payments.js'
 import { RecipientService } from './recipients.js'
 import { ReceiveService } from './receives.js'
@@ -33,13 +37,16 @@ async function startServer(): Promise<void> {
     settlementMint: config.solanaSettlementMint,
   })
   const walletCipher = new WalletSecretCipher(config.walletMasterKey)
-  await database.initializeRuntimeIdentity({
-    rail: 'SOLANA_SPL',
-    version: '1',
-    cluster: config.solanaCluster,
-    settlementMint: config.solanaSettlementMint,
-    custodyKeyFingerprint: fingerprintWalletMasterKey(config.walletMasterKey),
-  })
+  await database.initializeRuntimeIdentity(
+    {
+      rail: 'SOLANA_SPL',
+      version: '1',
+      cluster: config.solanaCluster,
+      settlementMint: config.solanaSettlementMint,
+      custodyKeyFingerprint: fingerprintWalletMasterKey(config.walletMasterKey),
+    },
+    (custody) => validateLegacyWalletCustody(walletCipher, custody),
+  )
   const accountService = new AccountService(database, walletCipher, rail)
   const recipientService = new RecipientService(database)
   const receiveService = new ReceiveService(database, rail)

@@ -1,4 +1,4 @@
-export { generateManagedWallet } from './wallet.js'
+export { deriveManagedWalletPublicKey, generateManagedWallet } from './wallet.js'
 export type { GeneratedManagedWallet } from './wallet.js'
 export { createSolanaRail, createSolanaRailWithRpc, tokenToUsdMoney } from './read.js'
 export type {

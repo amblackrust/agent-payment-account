@@ -119,7 +119,7 @@ describe('Solana settlement read rail', () => {
     })
     const destination = await destinationRail.getReceiveDestination(owner)
     const amount = 18446744073709551615n
-    const accounts = new Map([
+    const accounts = new Map<string, MockRpcAccount>([
       [mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(3))],
       [
         destination.tokenAccount,
@@ -257,6 +257,35 @@ describe('Solana settlement read rail', () => {
     await expect(rail.getSettlementBalance(owner)).rejects.toMatchObject({
       code: 'EXTERNAL_RAIL_FAILURE',
       message: 'Solana settlement rail is unavailable',
+    })
+  })
+
+  it('performs fresh RPC and mint validation for every readiness check', async () => {
+    let rpcAvailable = true
+    const accounts: Map<string, MockRpcAccount> = new Map([
+      [mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))],
+    ])
+    const rail = createSolanaRailWithRpc({
+      rpc: {
+        getGenesisHash: () => ({
+          send: async () => {
+            if (!rpcAvailable) throw new Error('offline provider detail')
+            return 'localnet-genesis'
+          },
+        }),
+        getAccountInfo: (accountAddress: string) => ({
+          send: async () => ({ value: accounts.get(accountAddress) ?? null }),
+        }),
+      } as never,
+      expectedCluster: 'localnet',
+      allowMainnet: false,
+      settlementMint: mint,
+    })
+
+    await expect(rail.getReceiveDestination(owner)).resolves.toBeDefined()
+    rpcAvailable = false
+    await expect(rail.checkReadiness?.()).rejects.toMatchObject({
+      code: 'EXTERNAL_RAIL_FAILURE',
     })
   })
 
