@@ -683,6 +683,55 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('enforces the hourly platform-fee limit per logical payment', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'hourly-platform-fee-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'mux_integration',
+        })
+        const firstPaymentId = `pay_${randomUUID().replaceAll('-', '')}`
+        const policy = {
+          accountId,
+          maxLamportsPerDay: 1_000n,
+          maxTransactionsPerHour: 2,
+        }
+        await database.reserveFeeSponsorship({
+          ...policy,
+          paymentId: firstPaymentId,
+          lamports: 1n,
+        })
+        await database.reserveFeeSponsorship({
+          ...policy,
+          paymentId: firstPaymentId,
+          lamports: 2n,
+        })
+        await database.reserveFeeSponsorship({
+          ...policy,
+          paymentId: `pay_${randomUUID().replaceAll('-', '')}`,
+          lamports: 1n,
+        })
+        await expect(
+          database.reserveFeeSponsorship({
+            ...policy,
+            paymentId: `pay_${randomUUID().replaceAll('-', '')}`,
+            lamports: 1n,
+          }),
+        ).rejects.toThrow('sponsorship budget is exhausted')
+      } finally {
+        await database.disconnect()
+      }
+    })
+
     it('claims incoming reconciliation issues once with bounded retry backoff', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`
