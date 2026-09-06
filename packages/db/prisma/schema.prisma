@@ -53,6 +53,11 @@ enum IncomingPaymentStatus {
   CONFIRMED
 }
 
+enum IncomingReconciliationIssueStatus {
+  PENDING
+  RESOLVED
+}
+
 model AgentAccount {
   id                    String                @id @db.VarChar(64)
   name                  String                @db.VarChar(120)
@@ -229,17 +234,21 @@ model IndexerCheckpoint {
 }
 
 model IncomingReconciliationIssue {
-  id          String       @id @db.VarChar(64)
-  accountId   String       @map("account_id") @db.VarChar(64)
-  signature   String       @db.VarChar(128)
-  reason      String       @db.VarChar(128)
-  firstSeenAt DateTime     @default(now()) @map("first_seen_at")
-  lastTriedAt DateTime     @default(now()) @map("last_tried_at")
-  retryCount  Int          @default(1) @map("retry_count")
-  account     AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  id          String                            @id @db.VarChar(64)
+  accountId   String                            @map("account_id") @db.VarChar(64)
+  signature   String                            @db.VarChar(128)
+  status      IncomingReconciliationIssueStatus @default(PENDING)
+  reason      String                            @db.VarChar(128)
+  firstSeenAt DateTime                          @default(now()) @map("first_seen_at")
+  lastTriedAt DateTime?                         @map("last_tried_at")
+  nextRetryAt DateTime                          @default(now()) @map("next_retry_at")
+  retryCount  Int                               @default(0) @map("retry_count")
+  resolvedAt  DateTime?                         @map("resolved_at")
+  account     AgentAccount                      @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
   @@unique([accountId, signature])
-  @@index([accountId, lastTriedAt])
+  @@index([status, nextRetryAt])
+  @@index([accountId, status])
   @@map("incoming_reconciliation_issues")
 }
 

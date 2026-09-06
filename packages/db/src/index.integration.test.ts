@@ -681,5 +681,58 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await database.disconnect()
       }
     })
+
+    it('claims incoming reconciliation issues once with bounded retry backoff', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const signature = `signature-${randomUUID()}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'incoming-issue-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'mux_integration',
+        })
+        await database.recordIncomingReconciliationIssue({
+          id: `issue_${randomUUID().replaceAll('-', '')}`,
+          accountId,
+          signature,
+          reason: 'TRANSACTION_UNAVAILABLE',
+        })
+        const now = new Date()
+        const concurrentClaims = await Promise.all([
+          database.claimIncomingReconciliationIssues(10, now),
+          database.claimIncomingReconciliationIssues(10, now),
+        ])
+        const claimed = concurrentClaims
+          .flat()
+          .filter((issue) => issue.signature === signature)
+
+        expect(claimed).toHaveLength(1)
+        expect(claimed[0]).toMatchObject({ accountId, retryCount: 1 })
+        expect(
+          (await database.claimIncomingReconciliationIssues(10, now)).some(
+            (issue) => issue.signature === signature,
+          ),
+        ).toBe(false)
+        await database.resolveIncomingReconciliationIssue(claimed[0]!.id)
+        expect(
+          (
+            await database.claimIncomingReconciliationIssues(
+              10,
+              new Date(now.getTime() + 10 * 60_000),
+            )
+          ).some((issue) => issue.signature === signature),
+        ).toBe(false)
+      } finally {
+        await database.disconnect()
+      }
+    })
   },
 )

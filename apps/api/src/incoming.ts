@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import type { IncomingPaymentRepository, ReceiveRepository } from '@agent-payment/db'
-import type { SolanaIncomingReader } from '@agent-payment/solana-rail'
+import type { IncomingTransfer, SolanaIncomingReader } from '@agent-payment/solana-rail'
 
 interface IndexedAccount {
   readonly accountId: string
@@ -8,6 +8,7 @@ interface IndexedAccount {
 }
 
 type IncomingStore = IncomingPaymentRepository & ReceiveRepository
+const ISSUE_RETRY_BATCH_SIZE = 50
 
 export class IncomingReconciliationService {
   private stopped = false
@@ -45,6 +46,7 @@ export class IncomingReconciliationService {
     for (const account of accounts) {
       await this.reconcileAccount(account)
     }
+    await this.reconcilePendingIssues()
   }
 
   private async reconcileAccount(account: IndexedAccount): Promise<void> {
@@ -68,24 +70,7 @@ export class IncomingReconciliationService {
               cursor?.cursorSignature,
             )
       for (const transfer of scan.transfers) {
-        await this.repository.createIncomingPayment({
-          id: `in_${randomBytes(16).toString('hex')}`,
-          accountId: account.accountId,
-          signature: transfer.signature,
-          amountAtomic: transfer.amount.atomicUnits,
-          tokenAtomicUnits: transfer.tokenAtomicUnits,
-          tokenDecimals: transfer.tokenDecimals,
-          currency: transfer.amount.currency,
-          ...(transfer.sourceAddress === undefined
-            ? {}
-            : { sourceAddress: transfer.sourceAddress }),
-          ...(transfer.reference === undefined
-            ? {}
-            : { reference: transfer.reference }),
-          tokenAccount: transfer.tokenAccount,
-          settlementMint: transfer.settlementMint,
-          confirmedAt: transfer.confirmedAt,
-        })
+        await this.persistTransfer(account.accountId, transfer)
       }
       for (const issue of scan.unresolved ?? []) {
         if (this.repository.recordIncomingReconciliationIssue === undefined) {
@@ -116,5 +101,68 @@ export class IncomingReconciliationService {
         'Incoming reconciliation failed',
       )
     }
+  }
+
+  private async reconcilePendingIssues(): Promise<void> {
+    const claimIssues = this.repository.claimIncomingReconciliationIssues
+    const resolveIssue = this.repository.resolveIncomingReconciliationIssue
+    const updateReason = this.repository.updateIncomingReconciliationIssueReason
+    const inspectSignature = this.reader.inspectSignature
+    if (
+      claimIssues === undefined ||
+      resolveIssue === undefined ||
+      updateReason === undefined ||
+      inspectSignature === undefined
+    ) {
+      return
+    }
+    const issues = await claimIssues(ISSUE_RETRY_BATCH_SIZE)
+    for (const issue of issues) {
+      try {
+        const inspection = await inspectSignature(
+          issue.accountPublicKey,
+          issue.signature,
+        )
+        if (inspection.kind === 'UNRESOLVED') {
+          await updateReason(issue.id, inspection.reason)
+          continue
+        }
+        if (inspection.kind === 'INCOMING') {
+          await this.persistTransfer(issue.accountId, inspection.transfer)
+        }
+        await resolveIssue(issue.id)
+      } catch (error) {
+        this.logger.error(
+          {
+            accountId: issue.accountId,
+            signature: issue.signature,
+            errorCode: error instanceof Error ? error.name : 'UNKNOWN',
+          },
+          'Incoming reconciliation issue retry failed',
+        )
+      }
+    }
+  }
+
+  private async persistTransfer(
+    accountId: string,
+    transfer: IncomingTransfer,
+  ): Promise<void> {
+    await this.repository.createIncomingPayment({
+      id: `in_${randomBytes(16).toString('hex')}`,
+      accountId,
+      signature: transfer.signature,
+      amountAtomic: transfer.amount.atomicUnits,
+      tokenAtomicUnits: transfer.tokenAtomicUnits,
+      tokenDecimals: transfer.tokenDecimals,
+      currency: transfer.amount.currency,
+      ...(transfer.sourceAddress === undefined
+        ? {}
+        : { sourceAddress: transfer.sourceAddress }),
+      ...(transfer.reference === undefined ? {} : { reference: transfer.reference }),
+      tokenAccount: transfer.tokenAccount,
+      settlementMint: transfer.settlementMint,
+      confirmedAt: transfer.confirmedAt,
+    })
   }
 }

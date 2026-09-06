@@ -96,7 +96,7 @@ describe('Solana incoming transfer reader', () => {
     ])
   })
 
-  it('does not advance the cursor past an unavailable transaction, then retries it after restart', async () => {
+  it('queues an unavailable transaction while advancing the high-water cursor', async () => {
     let available = false
     const reader = createReader(() =>
       available
@@ -147,13 +147,17 @@ describe('Solana incoming transfer reader', () => {
 
     const first = await reader.scanWithCursor!(owner)
     expect(first.transfers).toEqual([])
-    expect(first.nextCursor).toBeNull()
+    expect(first.unresolved).toEqual([
+      { signature: 'sig-1', reason: 'TRANSACTION_UNAVAILABLE' },
+    ])
+    expect(first.nextCursor).toBe('sig-1')
 
     available = true
-    const second = await reader.scanWithCursor!(owner)
-    expect(second.transfers).toHaveLength(1)
-    expect(second.transfers[0]?.signature).toBe('sig-1')
-    expect(second.nextCursor).toBe('sig-1')
+    const inspection = await reader.inspectSignature!(owner, 'sig-1')
+    expect(inspection.kind).toBe('INCOMING')
+    expect(inspection.kind === 'INCOMING' && inspection.transfer.signature).toBe(
+      'sig-1',
+    )
   })
 
   it('ignores wrong mint, failed and non-incoming transactions', async () => {

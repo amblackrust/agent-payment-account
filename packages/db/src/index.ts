@@ -360,12 +360,33 @@ export interface IncomingPaymentRepository {
     limit: number,
     cursor?: { readonly createdAt: Date; readonly id: string },
   ) => Promise<readonly IncomingPaymentRecord[]>
-  readonly recordIncomingReconciliationIssue?: (input: {
+  readonly recordIncomingReconciliationIssue: (input: {
     readonly id: string
     readonly accountId: string
     readonly signature: string
     readonly reason: string
   }) => Promise<void>
+  readonly claimIncomingReconciliationIssues: (
+    limit: number,
+    now?: Date,
+  ) => Promise<readonly IncomingReconciliationIssueRecord[]>
+  readonly resolveIncomingReconciliationIssue: (
+    issueId: string,
+    now?: Date,
+  ) => Promise<void>
+  readonly updateIncomingReconciliationIssueReason: (
+    issueId: string,
+    reason: string,
+  ) => Promise<void>
+}
+
+export interface IncomingReconciliationIssueRecord {
+  readonly id: string
+  readonly accountId: string
+  readonly accountPublicKey: string
+  readonly signature: string
+  readonly reason: string
+  readonly retryCount: number
 }
 
 export interface PaymentAttemptRecord {
@@ -1700,16 +1721,81 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           id: input.id,
           accountId: input.accountId,
           signature: input.signature,
+          status: 'PENDING',
           reason: input.reason,
           firstSeenAt: now,
-          lastTriedAt: now,
-          retryCount: 1,
+          nextRetryAt: now,
+          retryCount: 0,
         },
         update: {
-          lastTriedAt: now,
-          retryCount: { increment: 1 },
           reason: input.reason,
         },
+      })
+    },
+    async claimIncomingReconciliationIssues(limit, now = new Date()) {
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Incoming reconciliation issue batch limit must be 1 to 100')
+      }
+      return prisma.$transaction(async (transaction) => {
+        const issues = await transaction.$queryRaw<
+          {
+            id: string
+            account_id: string
+            account_public_key: string
+            signature: string
+            reason: string
+            retry_count: number
+          }[]
+        >`
+          SELECT issue.id,
+                 issue.account_id,
+                 account.solana_public_key AS account_public_key,
+                 issue.signature,
+                 issue.reason,
+                 issue.retry_count
+          FROM "incoming_reconciliation_issues" issue
+          JOIN "agent_accounts" account ON account.id = issue.account_id
+          WHERE issue.status = 'PENDING'
+            AND issue.next_retry_at <= ${now}
+          ORDER BY issue.next_retry_at ASC, issue.id ASC
+          LIMIT ${limit}
+          FOR UPDATE OF issue SKIP LOCKED
+        `
+        for (const issue of issues) {
+          const retryCount = issue.retry_count + 1
+          const backoffMilliseconds = Math.min(
+            5 * 60_000,
+            5_000 * 2 ** Math.min(retryCount - 1, 6),
+          )
+          await transaction.incomingReconciliationIssue.update({
+            where: { id: issue.id },
+            data: {
+              lastTriedAt: now,
+              nextRetryAt: new Date(now.getTime() + backoffMilliseconds),
+              retryCount,
+            },
+          })
+        }
+        return issues.map((issue) => ({
+          id: issue.id,
+          accountId: issue.account_id,
+          accountPublicKey: issue.account_public_key,
+          signature: issue.signature,
+          reason: issue.reason,
+          retryCount: issue.retry_count + 1,
+        }))
+      })
+    },
+    async resolveIncomingReconciliationIssue(issueId, now = new Date()) {
+      await prisma.incomingReconciliationIssue.updateMany({
+        where: { id: issueId, status: 'PENDING' },
+        data: { status: 'RESOLVED', resolvedAt: now },
+      })
+    },
+    async updateIncomingReconciliationIssueReason(issueId, reason) {
+      await prisma.incomingReconciliationIssue.updateMany({
+        where: { id: issueId, status: 'PENDING' },
+        data: { reason },
       })
     },
     async createIncomingPayment(input) {

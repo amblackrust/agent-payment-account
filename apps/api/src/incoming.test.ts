@@ -156,4 +156,96 @@ describe('incoming reconciliation worker', () => {
 
     expect(events).toEqual(['incoming', 'expire'])
   })
+
+  it('advances past a durable issue and imports it exactly once when retry succeeds', async () => {
+    const persistedSignatures = new Set<string>()
+    const issues = new Map<
+      string,
+      { id: string; accountId: string; signature: string; reason: string }
+    >()
+    let cursor: string | null = null
+    let transactionAvailable = false
+    const transferB = { ...transfer, signature: 'signature-b' }
+    const transferA = { ...transfer, signature: 'signature-a' }
+    const repository = {
+      listActiveAccountSettlements: async () => [
+        { accountId: 'acct_1', solanaPublicKey: 'owner' },
+      ],
+      getIncomingCursor: async () =>
+        cursor === null
+          ? null
+          : {
+              accountId: 'acct_1',
+              rail: 'SOLANA_SPL',
+              address: 'owner',
+              cursorSignature: cursor,
+            },
+      saveIncomingCursor: async (input: { cursorSignature: string }) => {
+        cursor = input.cursorSignature
+      },
+      expireOpenReceiveRequests: async () => undefined,
+      createIncomingPayment: async (input: { signature: string }) => {
+        const created = !persistedSignatures.has(input.signature)
+        persistedSignatures.add(input.signature)
+        return { payment: {} as never, created }
+      },
+      recordIncomingReconciliationIssue: async (input: {
+        id: string
+        accountId: string
+        signature: string
+        reason: string
+      }) => {
+        issues.set(input.signature, input)
+      },
+      claimIncomingReconciliationIssues: async () =>
+        [...issues.values()].map((issue) => ({
+          ...issue,
+          accountPublicKey: 'owner',
+          retryCount: 1,
+        })),
+      resolveIncomingReconciliationIssue: async (issueId: string) => {
+        for (const [signature, issue] of issues) {
+          if (issue.id === issueId) issues.delete(signature)
+        }
+      },
+      updateIncomingReconciliationIssueReason: async () => undefined,
+    }
+    const reader: SolanaIncomingReader = {
+      scan: async () => [],
+      scanWithCursor: async () =>
+        cursor === null
+          ? {
+              transfers: [transferB],
+              unresolved: [
+                {
+                  signature: transferA.signature,
+                  reason: 'TRANSACTION_UNAVAILABLE' as const,
+                },
+              ],
+              nextCursor: transferB.signature,
+            }
+          : { transfers: [], unresolved: [], nextCursor: cursor },
+      inspectSignature: async () =>
+        transactionAvailable
+          ? { kind: 'INCOMING', transfer: transferA }
+          : { kind: 'UNRESOLVED', reason: 'TRANSACTION_UNAVAILABLE' },
+    }
+
+    await new IncomingReconciliationService(repository as never, reader, {
+      error: () => undefined,
+    }).runOnce()
+    expect(cursor).toBe('signature-b')
+    expect(persistedSignatures).toEqual(new Set(['signature-b']))
+    expect(issues.has('signature-a')).toBe(true)
+
+    transactionAvailable = true
+    await new IncomingReconciliationService(repository as never, reader, {
+      error: () => undefined,
+    }).runOnce()
+    await new IncomingReconciliationService(repository as never, reader, {
+      error: () => undefined,
+    }).runOnce()
+    expect(persistedSignatures).toEqual(new Set(['signature-b', 'signature-a']))
+    expect(issues.size).toBe(0)
+  })
 })

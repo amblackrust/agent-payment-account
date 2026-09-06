@@ -27,12 +27,31 @@ export interface SolanaIncomingReader {
     readonly nextCursor: string | null
     readonly unresolved?: readonly UnresolvedIncomingSignature[]
   }>
+  readonly inspectSignature?: (
+    owner: string,
+    transactionSignature: string,
+  ) => Promise<IncomingSignatureInspection>
 }
 
 export interface UnresolvedIncomingSignature {
   readonly signature: string
-  readonly reason: 'UNCLASSIFIED_TRANSFER'
+  readonly reason: IncomingReconciliationIssueReason
 }
+
+export type IncomingReconciliationIssueReason =
+  | 'TRANSACTION_UNAVAILABLE'
+  | 'META_UNAVAILABLE'
+  | 'BLOCK_TIME_UNAVAILABLE'
+  | 'UNCLASSIFIED_TRANSFER'
+  | 'RPC_UNAVAILABLE'
+
+export type IncomingSignatureInspection =
+  | { readonly kind: 'INCOMING'; readonly transfer: IncomingTransfer }
+  | { readonly kind: 'IRRELEVANT' }
+  | {
+      readonly kind: 'UNRESOLVED'
+      readonly reason: IncomingReconciliationIssueReason
+    }
 
 interface SignatureInfo {
   readonly signature: string
@@ -107,6 +126,13 @@ export function createSolanaIncomingReader(
   const settlementMint = options.settlementMint
   const timeoutMs = options.rpcTimeoutMs ?? 5_000
 
+  async function createInspectionContext(owner: string) {
+    const destination = await options.readRail.getReceiveDestination(owner)
+    const tokenDecimals = (await options.readRail.getSettlementBalance(owner))
+      .tokenDecimals
+    return { owner, destination, tokenDecimals }
+  }
+
   async function withRpcTimeout<T>(
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
@@ -144,79 +170,95 @@ export function createSolanaIncomingReader(
     }
   }
 
+  async function inspectWithContext(
+    context: Awaited<ReturnType<typeof createInspectionContext>>,
+    transactionSignature: string,
+  ): Promise<IncomingSignatureInspection> {
+    let transaction: TransactionResponse | null
+    try {
+      transaction = await fetchTransaction(rpc, transactionSignature, withRpcTimeout)
+    } catch {
+      return { kind: 'UNRESOLVED', reason: 'RPC_UNAVAILABLE' }
+    }
+    if (transaction === null) {
+      return { kind: 'UNRESOLVED', reason: 'TRANSACTION_UNAVAILABLE' }
+    }
+    if (transaction.meta === null) {
+      return { kind: 'UNRESOLVED', reason: 'META_UNAVAILABLE' }
+    }
+    if (transaction.meta.err !== null) return { kind: 'IRRELEVANT' }
+    const classified = getExternalIncomingTransfer(
+      transaction,
+      context.owner,
+      context.destination.tokenAccount,
+      settlementMint,
+    )
+    if (classified.kind === 'IRRELEVANT') return classified
+    if (classified.kind === 'UNCLASSIFIED') {
+      return { kind: 'UNRESOLVED', reason: 'UNCLASSIFIED_TRANSFER' }
+    }
+    if (transaction.blockTime === null) {
+      return { kind: 'UNRESOLVED', reason: 'BLOCK_TIME_UNAVAILABLE' }
+    }
+    const confirmedAt = new Date(Number(transaction.blockTime) * 1000)
+    if (Number.isNaN(confirmedAt.getTime())) {
+      return { kind: 'UNRESOLVED', reason: 'BLOCK_TIME_UNAVAILABLE' }
+    }
+    return {
+      kind: 'INCOMING',
+      transfer: {
+        signature: transactionSignature,
+        amount: tokenAmountToUsd(classified.amount, context.tokenDecimals),
+        tokenAtomicUnits: classified.amount,
+        tokenDecimals: context.tokenDecimals,
+        sourceAddress: classified.sourceAddress,
+        reference: getMemo(transaction),
+        tokenAccount: context.destination.tokenAccount,
+        settlementMint,
+        confirmedAt,
+      },
+    }
+  }
+
   return {
     async scan(owner, cursorSignature = null) {
       return (await this.scanWithCursor!(owner, cursorSignature)).transfers
     },
+    async inspectSignature(owner, transactionSignature) {
+      return inspectWithContext(
+        await createInspectionContext(owner),
+        transactionSignature,
+      )
+    },
     async scanWithCursor(owner, cursorSignature = null) {
-      const destination = await options.readRail.getReceiveDestination(owner)
-      const tokenDecimals = (await options.readRail.getSettlementBalance(owner))
-        .tokenDecimals
+      const context = await createInspectionContext(owner)
       const history = await collectHistory(
         rpc,
-        address(destination.tokenAccount),
+        address(context.destination.tokenAccount),
         cursorSignature,
         withRpcTimeout,
       )
       const transfers: IncomingTransfer[] = []
       const unresolved: UnresolvedIncomingSignature[] = []
-      let blockedByUnclassifiedSignature = false
       for (const item of [...history.signatures].reverse()) {
         if (item.err !== null) {
           continue
         }
-        const transaction = await fetchTransaction(rpc, item.signature, withRpcTimeout)
-        if (transaction === null || transaction.meta === null) {
-          blockedByUnclassifiedSignature = true
-          break
-        }
-        if (transaction.meta.err !== null) {
-          continue
-        }
-        const transfer = getExternalIncomingTransfer(
-          transaction,
-          owner,
-          destination.tokenAccount,
-          settlementMint,
-        )
-        if (transfer.kind === 'IRRELEVANT') {
-          continue
-        }
-        if (transfer.kind === 'UNCLASSIFIED') {
+        const inspection = await inspectWithContext(context, item.signature)
+        if (inspection.kind === 'IRRELEVANT') continue
+        if (inspection.kind === 'UNRESOLVED') {
           unresolved.push({
             signature: item.signature,
-            reason: 'UNCLASSIFIED_TRANSFER',
+            reason: inspection.reason,
           })
           continue
         }
-        if (transaction.blockTime === null) {
-          blockedByUnclassifiedSignature = true
-          break
-        }
-        const confirmedAt = new Date(Number(transaction.blockTime) * 1000)
-        if (Number.isNaN(confirmedAt.getTime())) {
-          blockedByUnclassifiedSignature = true
-          break
-        }
-        const amount = tokenAmountToUsd(transfer.amount, tokenDecimals)
-        transfers.push({
-          signature: item.signature,
-          amount,
-          tokenAtomicUnits: transfer.amount,
-          tokenDecimals,
-          sourceAddress: transfer.sourceAddress,
-          reference: getMemo(transaction),
-          tokenAccount: destination.tokenAccount,
-          settlementMint,
-          confirmedAt,
-        })
+        transfers.push(inspection.transfer)
       }
       return {
         transfers,
         unresolved,
-        nextCursor: blockedByUnclassifiedSignature
-          ? cursorSignature
-          : history.nextCursor,
+        nextCursor: history.nextCursor,
       }
     },
   }
