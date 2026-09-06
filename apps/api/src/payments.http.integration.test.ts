@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 
-import { createMoney, type PaymentRail } from '@agent-payment/core'
+import { createMoney, ExternalRailError, type PaymentRail } from '@agent-payment/core'
 import { createDatabaseClient, type AuthenticatedAccount } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 import { AccountService } from './accounts.js'
@@ -32,12 +32,21 @@ function id(prefix: string): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`
 }
 
-function paymentRail(): PaymentRail {
+function paymentRail(shouldReject?: () => boolean): PaymentRail {
   return {
     name: 'SOLANA_SPL',
     canRoute: (request) => request.destination.rail === 'SOLANA_SPL',
     quote: async (request) => ({ rail: 'SOLANA_SPL', amount: request.amount }),
-    prepare: async () => ({ rail: 'SOLANA_SPL' }),
+    prepare: async () => {
+      if (shouldReject?.() === true) {
+        throw new ExternalRailError(
+          'Recipient token account must already exist',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
+      return { rail: 'SOLANA_SPL' }
+    },
     execute: async () => ({
       status: 'CONFIRMED',
       railTransactionId: 'test-transaction',
@@ -80,9 +89,10 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         paymentService: new PaymentService(
           database,
           { getSettlementBalance: async () => ({ settled: createMoney('10.00') }) },
-          [paymentRail()],
+          [paymentRail(() => deterministicFailure)],
         ),
       })
+      let deterministicFailure = false
 
       try {
         const authHeaders = { authorization: `Bearer ${rawKey}` }
@@ -148,6 +158,24 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(payments.statusCode).toBe(200)
         expect(payments.json().payments).toHaveLength(1)
         expect(account.account.id).toMatch(/^acct_/)
+
+        deterministicFailure = true
+        const rejected = await app.inject({
+          method: 'POST',
+          url: '/v1/send',
+          headers: { ...authHeaders, 'idempotency-key': 'deterministic-rail-key' },
+          payload: {
+            recipient_id: recipient.id,
+            amount: '1.00',
+            currency: 'USD',
+          },
+        })
+        expect(rejected.statusCode).toBe(422)
+        expect(rejected.json()).toMatchObject({
+          statusCode: 422,
+          error: 'EXTERNAL_RAIL_FAILURE',
+          details: { payment_id: expect.stringMatching(/^pay_/) },
+        })
       } finally {
         await app.close()
         await database.disconnect()

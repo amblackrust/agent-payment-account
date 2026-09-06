@@ -271,6 +271,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         ).rejects.toMatchObject({
           code: 'EXTERNAL_RAIL_FAILURE',
           kind: 'DETERMINISTIC',
+          details: { payment_id: expect.any(String) },
         })
 
         const payment = (await database.listPayments(account.account.id))[0]

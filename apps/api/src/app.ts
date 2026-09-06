@@ -41,6 +41,7 @@ interface ErrorWithCode {
   readonly details?: Readonly<Record<string, string>>
   readonly statusCode?: number
   readonly validation?: unknown
+  readonly kind?: string
 }
 
 const healthResponseSchema = {
@@ -70,7 +71,7 @@ function getErrorStatusCode(error: ErrorWithCode): number {
     case 'VALIDATION_ERROR':
       return 422
     case 'EXTERNAL_RAIL_FAILURE':
-      return 502
+      return error.kind === 'DETERMINISTIC' ? 422 : 502
     default:
       return error.statusCode ?? 500
   }

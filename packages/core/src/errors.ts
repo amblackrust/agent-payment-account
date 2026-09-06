@@ -68,8 +68,11 @@ export class AuthenticationError extends DomainError {
 }
 
 export class InsufficientFundsError extends DomainError {
-  public constructor(message = 'Insufficient funds') {
-    super(DOMAIN_ERROR_CODES.INSUFFICIENT_FUNDS, message)
+  public constructor(
+    message = 'Insufficient funds',
+    details?: Readonly<Record<string, string>>,
+  ) {
+    super(DOMAIN_ERROR_CODES.INSUFFICIENT_FUNDS, message, details)
   }
 }
 

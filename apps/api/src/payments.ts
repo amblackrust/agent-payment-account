@@ -801,7 +801,7 @@ export class PaymentService {
             error,
             requestId,
           )
-          if (finalized) throw error
+          if (finalized) throw committedFailureError(error, payment.id)
           throw pendingPaymentError(payment.id)
         }
         await this.tryMarkReconciling(payment, attempt, requestId)
@@ -817,10 +817,17 @@ export class PaymentService {
         requestId,
       )
       if (!finalized) throw pendingPaymentError(payment.id, error)
-      if (error instanceof InsufficientFundsError) throw error
+      if (error instanceof InsufficientFundsError) {
+        throw new InsufficientFundsError(error.message, { payment_id: payment.id })
+      }
       throw error instanceof ExternalRailError
-        ? error
-        : new ExternalRailError('Payment rail execution failed')
+        ? committedFailureError(error, payment.id)
+        : new ExternalRailError(
+            'Payment rail execution failed',
+            undefined,
+            'DETERMINISTIC',
+            { payment_id: payment.id },
+          )
     }
   }
 
@@ -1012,6 +1019,16 @@ function pendingPaymentError(paymentId: string, cause?: unknown): ExternalRailEr
     'AMBIGUOUS',
     { payment_id: paymentId },
   )
+}
+
+function committedFailureError(
+  error: ExternalRailError,
+  paymentId: string,
+): ExternalRailError {
+  return new ExternalRailError(error.message, undefined, 'DETERMINISTIC', {
+    ...error.details,
+    payment_id: paymentId,
+  })
 }
 
 export function serializePayment(payment: PaymentRecord) {
