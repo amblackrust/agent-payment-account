@@ -175,7 +175,6 @@ For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supp
 - [Architecture](docs/architecture.md) — components, lifecycle, custody, data, and trust boundaries
 - [API Reference](docs/api.md) — authentication, routes, payloads, statuses, and errors
 - [Roadmap](docs/roadmap.md) — implemented scope and explicitly uncommitted future directions
-- [Contributing](CONTRIBUTING.md) — development and pull-request workflow
 
 ## Current Scope and Limitations
 
@@ -190,10 +189,8 @@ For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supp
 
 The implemented v1 and possible post-v1 directions are separated in [Roadmap](docs/roadmap.md). No dates or post-v1 commitments are declared in the repository.
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
-
 ## License
 
-Mux is available under the [MIT License](LICENSE).
+Copyright (c) 2026 amblackrust. All rights reserved. The source is publicly
+viewable, but no permission is granted to use, copy, modify, or distribute it
+without prior written permission. See [LICENSE](LICENSE).
