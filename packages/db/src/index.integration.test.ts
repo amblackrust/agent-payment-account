@@ -338,6 +338,92 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('reconciles a managed receive after a resumed validator reports an old block time', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const payerId = `acct_${randomUUID().replaceAll('-', '')}`
+      const merchantId = `acct_${randomUUID().replaceAll('-', '')}`
+      const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
+      const incomingId = `in_${randomUUID().replaceAll('-', '')}`
+      const paymentId = `pay_${randomUUID().replaceAll('-', '')}`
+      const attemptId = `att_${randomUUID().replaceAll('-', '')}`
+      const signature = `signature-${randomUUID()}`
+      const reference = `order-${randomUUID()}`
+      await sql.connect()
+      try {
+        for (const accountId of [payerId, merchantId]) {
+          await database.createAgentAccount({
+            id: accountId,
+            name: 'resumed-validator-integration-agent',
+            solanaPublicKey: `${accountId}_public`,
+            encryptedSolanaSecret: 'ciphertext',
+            encryptionNonce: 'bm9uY2U=',
+            encryptionAuthTag: 'dGFn',
+            credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+            keyHash: `${accountId}_hash`,
+            keyPrefix: 'apa_integration',
+          })
+        }
+        await database.createReceiveRequest({
+          id: receiveId,
+          accountId: merchantId,
+          amountAtomic: 3n,
+          currency: 'USD',
+          reference,
+        })
+        const incoming = await database.createIncomingPayment({
+          id: incomingId,
+          accountId: merchantId,
+          signature,
+          amountAtomic: 3n,
+          currency: 'USD',
+          reference,
+          tokenAccount: 'merchant-token-account',
+          settlementMint: 'local-mint',
+          confirmedAt: new Date('2020-01-01T00:00:00.000Z'),
+        })
+        expect(incoming.payment.receiveRequestId).toBeNull()
+
+        const confirmedAt = new Date(Date.now() + 1_000)
+        await sql.query(
+          `INSERT INTO payments
+             (id, payer_account_id, kind, amount_atomic, currency, status,
+              external_reference, recipient_managed_account_id, confirmed_at, updated_at)
+           VALUES ($1, $2, 'PAY', 3, 'USD', 'CONFIRMED', $3, $4, $5, NOW())`,
+          [paymentId, payerId, reference, merchantId, confirmedAt],
+        )
+        await sql.query(
+          `INSERT INTO payment_attempts
+             (id, payment_id, attempt_number, rail, status, rail_transaction_id, updated_at)
+           VALUES ($1, $2, 1, 'SOLANA_SPL', 'CONFIRMED', $3, NOW())`,
+          [attemptId, paymentId, signature],
+        )
+
+        expect(await database.reconcileUnmatchedManagedIncoming?.(50)).toBe(1)
+        const receive = await database.findReceiveRequestForOwner(merchantId, receiveId)
+        expect(receive?.status).toBe('PAID')
+        expect(receive?.matchedIncomingPaymentId).toBe(incomingId)
+        const timestamps = await sql.query<{ same: boolean }>(
+          `SELECT receive.paid_at = payment.confirmed_at AS same
+           FROM receive_requests receive, payments payment
+           WHERE receive.id = $1 AND payment.id = $2`,
+          [receiveId, paymentId],
+        )
+        expect(timestamps.rows[0]?.same).toBe(true)
+      } finally {
+        await sql.query('UPDATE incoming_payments SET receive_request_id = NULL WHERE id = $1', [incomingId])
+        await sql.query('UPDATE receive_requests SET matched_incoming_payment_id = NULL WHERE id = $1', [receiveId])
+        await sql.query('DELETE FROM receive_requests WHERE id = $1', [receiveId])
+        await sql.query('DELETE FROM incoming_payments WHERE id = $1', [incomingId])
+        await sql.query('DELETE FROM payment_attempts WHERE id = $1', [attemptId])
+        await sql.query('DELETE FROM payments WHERE id = $1', [paymentId])
+        await sql.query('DELETE FROM api_credentials WHERE account_id = ANY($1)', [[payerId, merchantId]])
+        await sql.query('DELETE FROM agent_accounts WHERE id = ANY($1)', [[payerId, merchantId]])
+        await sql.end()
+        await database.disconnect()
+      }
+    })
+
     it('expires receive requests and keeps late or unmatched incoming payments in history', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`

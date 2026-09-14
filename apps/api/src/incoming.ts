@@ -47,6 +47,7 @@ export class IncomingReconciliationService {
       await this.reconcileAccount(account)
     }
     await this.reconcilePendingIssues()
+    await this.repository.reconcileUnmatchedManagedIncoming?.(ISSUE_RETRY_BATCH_SIZE)
   }
 
   private async reconcileAccount(account: IndexedAccount): Promise<void> {

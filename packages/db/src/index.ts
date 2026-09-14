@@ -335,6 +335,7 @@ export interface ReceiveRepository {
 }
 
 export interface IncomingPaymentRepository {
+  readonly reconcileUnmatchedManagedIncoming?: (limit: number) => Promise<number>
   listActiveAccountSettlements(): Promise<readonly ActiveAccountSettlement[]>
   getIncomingCursor(
     accountId: string,
@@ -585,11 +586,39 @@ async function matchIncomingPaymentInTransaction(
   if (input.amountAtomic <= 0n) return null
   if (input.reference === null) return null
 
+  const incoming = await transaction.incomingPayment.findUnique({
+    where: { id: input.incomingPaymentId },
+    select: { signature: true },
+  })
+  if (incoming === null) return null
+  const managedPayment = await transaction.payment.findFirst({
+    where: {
+      status: 'CONFIRMED',
+      recipientManagedAccountId: input.accountId,
+      amountAtomic: input.amountAtomic,
+      externalReference: input.reference,
+      attempts: { some: { railTransactionId: incoming.signature } },
+    },
+    select: { createdAt: true, confirmedAt: true },
+  })
+  // A resumed local validator can report a block time from before the wall-clock
+  // receive. The matching confirmed managed payment anchors the order in time.
+  const useManagedTime =
+    managedPayment?.confirmedAt !== null &&
+    managedPayment?.confirmedAt !== undefined &&
+    managedPayment.confirmedAt > input.confirmedAt
+  const matchConfirmedAt = useManagedTime
+    ? managedPayment.confirmedAt!
+    : input.confirmedAt
+  const latestReceiveCreation = useManagedTime
+    ? managedPayment.createdAt
+    : input.confirmedAt
+
   await transaction.receiveRequest.updateMany({
     where: {
       accountId: input.accountId,
       status: 'OPEN',
-      expiresAt: { lte: input.confirmedAt },
+      expiresAt: { lte: matchConfirmedAt },
     },
     data: { status: 'EXPIRED' },
   })
@@ -601,8 +630,8 @@ async function matchIncomingPaymentInTransaction(
       AND "reference" = ${input.reference}
       AND "status" IN ('OPEN', 'EXPIRED')
       AND "matched_incoming_payment_id" IS NULL
-      AND "created_at" <= ${input.confirmedAt}
-      AND ("expires_at" IS NULL OR "expires_at" > ${input.confirmedAt})
+      AND "created_at" <= ${latestReceiveCreation}
+      AND ("expires_at" IS NULL OR "expires_at" > ${matchConfirmedAt})
       AND ("amount_atomic" IS NULL OR "amount_atomic" = ${input.amountAtomic})
     ORDER BY "created_at" ASC, "id" ASC
     LIMIT 1
@@ -625,7 +654,7 @@ async function matchIncomingPaymentInTransaction(
     },
     data: {
       status: 'PAID',
-      paidAt: input.confirmedAt,
+      paidAt: matchConfirmedAt,
       matchedIncomingPaymentId: input.incomingPaymentId,
     },
   })
@@ -1847,6 +1876,58 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           ),
           created: true,
         }
+      })
+    },
+    async reconcileUnmatchedManagedIncoming(limit): Promise<number> {
+      return prisma.$transaction(async (transaction) => {
+        const candidates = await transaction.$queryRaw<
+          readonly {
+            id: string
+            account_id: string
+            amount_atomic: bigint
+            reference: string
+            confirmed_at: Date
+          }[]
+        >`
+          SELECT incoming.id, incoming.account_id, incoming.amount_atomic,
+                 incoming.reference, incoming.confirmed_at
+          FROM "incoming_payments" incoming
+          JOIN "receive_requests" receive
+            ON receive.account_id = incoming.account_id
+           AND receive.reference = incoming.reference
+          WHERE incoming.receive_request_id IS NULL
+            AND receive.status IN ('OPEN', 'EXPIRED')
+            AND receive.matched_incoming_payment_id IS NULL
+            AND (receive.amount_atomic IS NULL OR receive.amount_atomic = incoming.amount_atomic)
+            AND EXISTS (
+              SELECT 1
+              FROM "payment_attempts" attempt
+              JOIN "payments" payment ON payment.id = attempt.payment_id
+              WHERE attempt.rail_transaction_id = incoming.signature
+                AND payment.status = 'CONFIRMED'
+                AND payment.recipient_managed_account_id = incoming.account_id
+                AND payment.external_reference = incoming.reference
+                AND payment.amount_atomic = incoming.amount_atomic
+                AND payment.created_at >= receive.created_at
+                AND payment.confirmed_at IS NOT NULL
+                AND (receive.expires_at IS NULL OR receive.expires_at > payment.confirmed_at)
+            )
+          ORDER BY incoming.created_at ASC
+          LIMIT ${limit}
+          FOR UPDATE OF incoming SKIP LOCKED
+        `
+        let matched = 0
+        for (const candidate of candidates) {
+          const requestId = await matchIncomingPaymentInTransaction(transaction, {
+            incomingPaymentId: candidate.id,
+            accountId: candidate.account_id,
+            amountAtomic: candidate.amount_atomic,
+            reference: candidate.reference,
+            confirmedAt: candidate.confirmed_at,
+          })
+          if (requestId !== null) matched += 1
+        }
+        return matched
       })
     },
     async findIncomingPaymentForOwner(accountId, id) {
