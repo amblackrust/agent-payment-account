@@ -21,11 +21,13 @@ export type {
   V2ApprovalAdminRecord,
   V2ApprovedDestinationRecord as V2AdminApprovedDestinationRecord,
   V2CredentialRecord,
+  V2CustodyKeyVersionRecord,
   V2FundingDestinationRecord,
   V2HistoryRecord,
   V2ProvisionedAccount,
   V2ReceiveRequestAdminRecord,
   V2SpendPolicyAdminRecord,
+  V2SigningRequestRecord,
 } from './v2-admin.js'
 export type {
   V2ApprovedDestinationRecord,

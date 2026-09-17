@@ -184,3 +184,10 @@ export type {
   RailQuote,
   RailStatusResult,
 } from './rail.js'
+
+export {
+  classifyRailFailure,
+  classifyWorkFailure,
+  computeRetryAt,
+} from './retry.js'
+export type { RetryDecision, WorkRetryClass } from './retry.js'

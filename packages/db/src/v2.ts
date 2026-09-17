@@ -1,13 +1,15 @@
+import { randomBytes } from 'node:crypto'
 import {
   ConflictError,
   IdempotencyConflictError,
   InsufficientFundsError,
   InvalidStateError,
   NotFoundError,
+  assertAttemptProgression,
   type PaymentPolicyDecision,
   type SettlementRoute,
 } from '@agent-payment/core'
-import type { PrismaClient } from './generated/client/client.js'
+import type { Prisma, PrismaClient } from './generated/client/client.js'
 
 export interface V2DenominationRecord {
   readonly id: string
@@ -97,6 +99,7 @@ export interface V2PaymentAttemptSnapshot {
   readonly outcome: string
   readonly preparedEffectHash: string | null
   readonly signedPayloadHash: string | null
+  readonly signedPayloadEncrypted?: string | null
   readonly expectedExternalId: string | null
   readonly validityExpiresAt: Date | null
   readonly validitySlot: bigint | null
@@ -172,6 +175,7 @@ export interface V2WorkItemClaim {
   readonly resourceId: string
   readonly attemptCount: number
   readonly payloadJson: string
+  readonly accountId?: string
 }
 
 export interface V2DatabaseRepository {
@@ -282,8 +286,60 @@ export interface V2DatabaseRepository {
     readonly currentRowVersion: number
     readonly status?: string
     readonly externalId?: string
+    readonly expectedExternalId?: string
     readonly evidenceId?: string
+    readonly preparedEffectHash?: string
+    readonly signedPayloadHash?: string
+    readonly signedPayloadEncrypted?: string
+    readonly validityExpiresAt?: Date
+    readonly validitySlot?: bigint
   }): Promise<V2PaymentAttemptSnapshot>
+  updatePaymentExecution(input: {
+    readonly paymentId: string
+    readonly currentRowVersion: number
+    readonly status?: string
+    readonly executionState?: string
+    readonly settlementState?: string
+    readonly outcomeState?: string
+    readonly confirmedAt?: Date | null
+    readonly failedAt?: Date | null
+    readonly failureCode?: string | null
+    readonly failureMessageSafe?: string | null
+  }): Promise<V2PaymentSnapshot>
+  abortPreEffectPayment(input: {
+    readonly paymentId: string
+    readonly attemptId: string
+    readonly paymentRowVersion: number
+    readonly attemptRowVersion: number
+    readonly reason: string
+  }): Promise<V2PaymentView>
+  createReplacementAttempt(input: {
+    readonly paymentId: string
+    readonly paymentRowVersion: number
+    readonly attemptId: string
+    readonly workItemId: string
+    readonly route: SettlementRoute
+  }): Promise<V2PaymentAttemptSnapshot>
+  finalizeV2Payment(input: {
+    readonly paymentId: string
+    readonly attemptId: string
+    readonly paymentRowVersion: number
+    readonly attemptRowVersion: number
+    readonly currentOutcome: string
+    readonly nextOutcome: string
+    readonly attemptStatus: string
+    readonly paymentStatus: string
+    readonly settlementState: string
+    readonly outcomeState: string
+    readonly externalId?: string
+    readonly confirmedAt?: Date
+    readonly failedAt?: Date
+    readonly failureCode?: string
+    readonly failureMessageSafe?: string
+    readonly reservation: 'CONSUME' | 'RELEASE' | 'NONE'
+    readonly evidenceOutcome: string
+    readonly source: string
+  }): Promise<V2PaymentView>
   claimWorkItem(input: {
     readonly kind: string
     readonly owner: string
@@ -291,10 +347,22 @@ export interface V2DatabaseRepository {
     readonly now?: Date
   }): Promise<V2WorkItemClaim | null>
   completeWorkItem(id: string, owner: string): Promise<void>
+  renewWorkItemLease(input: {
+    readonly id: string
+    readonly owner: string
+    readonly leaseSeconds: number
+    readonly now?: Date
+  }): Promise<Date>
   retryWorkItem(input: {
     readonly id: string
     readonly owner: string
     readonly retryAt: Date
+    readonly errorCode: string
+    readonly errorSafe: string
+  }): Promise<void>
+  failWorkItem(input: {
+    readonly id: string
+    readonly owner: string
     readonly errorCode: string
     readonly errorSafe: string
   }): Promise<void>
@@ -865,6 +933,22 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           ...(input.externalId === undefined
             ? {}
             : { railTransactionId: input.externalId }),
+          ...(input.expectedExternalId === undefined
+            ? {}
+            : { expectedExternalId: input.expectedExternalId }),
+          ...(input.preparedEffectHash === undefined
+            ? {}
+            : { preparedEffectHash: input.preparedEffectHash }),
+          ...(input.signedPayloadHash === undefined
+            ? {}
+            : { signedPayloadHash: input.signedPayloadHash }),
+          ...(input.signedPayloadEncrypted === undefined
+            ? {}
+            : { signedPayloadEncrypted: input.signedPayloadEncrypted }),
+          ...(input.validityExpiresAt === undefined
+            ? {}
+            : { validityExpiresAt: input.validityExpiresAt }),
+          ...(input.validitySlot === undefined ? {} : { validitySlot: input.validitySlot }),
         },
       })
       if (result.count !== 1)
@@ -876,6 +960,244 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
       )
     },
 
+    async updatePaymentExecution(input) {
+      const result = await prisma.payment.updateMany({
+        where: { id: input.paymentId, rowVersion: input.currentRowVersion },
+        data: {
+          rowVersion: { increment: 1 },
+          ...(input.status === undefined ? {} : { status: input.status as never }),
+          ...(input.executionState === undefined ? {} : { executionState: input.executionState }),
+          ...(input.settlementState === undefined ? {} : { settlementState: input.settlementState }),
+          ...(input.outcomeState === undefined ? {} : { outcomeState: input.outcomeState }),
+          ...(input.confirmedAt === undefined ? {} : { confirmedAt: input.confirmedAt }),
+          ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
+          ...(input.failureCode === undefined ? {} : { failureCode: input.failureCode }),
+          ...(input.failureMessageSafe === undefined
+            ? {}
+            : { failureMessageSafe: input.failureMessageSafe }),
+        },
+      })
+      if (result.count !== 1) throw new ConflictError('Payment changed concurrently')
+      return toV2PaymentSnapshot(
+        await prisma.payment.findUniqueOrThrow({ where: { id: input.paymentId } }),
+      )
+    },
+
+    async abortPreEffectPayment(input) {
+      return prisma.$transaction(async (transaction) => {
+        const payment = await transaction.payment.findUnique({
+          where: { id: input.paymentId },
+        })
+        if (payment === null) throw new NotFoundError('Payment was not found')
+        const attempt = await transaction.paymentAttempt.findUnique({
+          where: { id: input.attemptId },
+        })
+        if (attempt === null || attempt.paymentId !== payment.id) {
+          throw new NotFoundError('Payment attempt was not found')
+        }
+        if (
+          payment.rowVersion !== input.paymentRowVersion ||
+          attempt.rowVersion !== input.attemptRowVersion
+        ) {
+          throw new ConflictError('Payment changed concurrently')
+        }
+        if (attempt.outcome === 'NOT_STARTED') {
+          assertAttemptProgression('NOT_STARTED', 'PRE_EFFECT_ABORTED')
+          await transaction.paymentAttempt.update({
+            where: { id: attempt.id },
+            data: {
+              outcome: 'PRE_EFFECT_ABORTED',
+              status: 'FAILED',
+              rowVersion: { increment: 1 },
+            },
+          })
+        } else if (attempt.outcome !== 'PRE_EFFECT_ABORTED') {
+          throw new ConflictError('Payment attempt may already have an effect')
+        }
+        await transaction.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: 'PROVED_NO_EFFECT',
+            executionState: 'TERMINAL',
+            settlementState: 'NOT_SUBMITTED',
+            outcomeState: 'PROVED_NO_EFFECT',
+            rowVersion: { increment: 1 },
+          },
+        })
+        await transaction.outgoingReservation.updateMany({
+          where: { paymentId: payment.id, status: 'ACTIVE', lifecycleState: 'HELD' },
+          data: {
+            status: 'RELEASED',
+            lifecycleState: 'RELEASED',
+            releaseReason: input.reason,
+            releasedAt: new Date(),
+            rowVersion: { increment: 1 },
+          },
+        })
+        await transaction.evidenceRecord.create({
+          data: {
+            id: `evidence_${randomId()}`,
+            paymentId: payment.id,
+            attemptId: attempt.id,
+            authority: 'LOCAL_STATE',
+            source: 'ACCOUNT_LIFECYCLE',
+            outcome: 'PROVED_NO_EFFECT',
+            observedAt: new Date(),
+            metadataJson: JSON.stringify({ reason: input.reason }),
+          },
+        })
+        await transaction.operationTimelineEvent.create({
+          data: {
+            id: `timeline_${randomId()}`,
+            accountId: payment.payerAccountId,
+            resourceType: 'PAYMENT',
+            resourceId: payment.id,
+            eventType: 'PAYMENT_PRE_EFFECT_ABORTED',
+            actorType: 'SYSTEM',
+            source: 'V2_OUTGOING_WORKER',
+            occurredAt: new Date(),
+            newStateJson: JSON.stringify({ status: 'PROVED_NO_EFFECT', reason: input.reason }),
+          },
+        })
+        const updated = await transaction.payment.findUniqueOrThrow({
+          where: { id: payment.id },
+        })
+        const decision = await transaction.policyDecision.findUniqueOrThrow({
+          where: { paymentId: payment.id },
+        })
+        const approval = await transaction.approval.findUnique({ where: { paymentId: payment.id } })
+        const reservation = await transaction.outgoingReservation.findUnique({ where: { paymentId: payment.id } })
+        const attempts = await transaction.paymentAttempt.findMany({ where: { paymentId: payment.id }, orderBy: { attemptNumber: 'asc' } })
+        return {
+          payment: toV2PaymentSnapshot(updated),
+          policyDecision: parsePolicyDecision(decision.decision),
+          reasonCodes: parseStringArray(decision.reasonCodesJson, 'policy reason codes'),
+          approvalState: projectApprovalState(approval),
+          reservationStatus: projectReservationStatus(reservation),
+          attempts: attempts.map(toV2AttemptSnapshot),
+        }
+      })
+    },
+
+    async createReplacementAttempt(input) {
+      return prisma.$transaction(async (transaction) => {
+        const payment = await transaction.payment.findUniqueOrThrow({ where: { id: input.paymentId } })
+        if (payment.rowVersion !== input.paymentRowVersion) throw new ConflictError('Payment changed concurrently')
+        const attempts = await transaction.paymentAttempt.findMany({ where: { paymentId: payment.id }, orderBy: { attemptNumber: 'asc' } })
+        if (attempts.some((attempt) => !['PROVED_NO_EFFECT', 'PRE_EFFECT_ABORTED'].includes(attempt.outcome))) {
+          throw new ConflictError('Replacement attempt is unsafe while an earlier attempt may have an effect')
+        }
+        const attempt = await transaction.paymentAttempt.create({
+          data: {
+            id: input.attemptId,
+            paymentId: payment.id,
+            attemptNumber: attempts.length + 1,
+            rail: input.route.rail,
+            routeId: input.route.id,
+            status: 'CREATED',
+            outcome: 'NOT_STARTED',
+          },
+        })
+        await transaction.payment.update({
+          where: { id: payment.id },
+          data: { status: 'ROUTING', executionState: 'QUEUED', rowVersion: { increment: 1 } },
+        })
+        await transaction.durableWorkItem.create({
+          data: {
+            id: input.workItemId,
+            kind: 'OUTGOING_PAYMENT_ATTEMPT',
+            resourceType: 'PAYMENT_ATTEMPT',
+            resourceId: attempt.id,
+            payloadJson: JSON.stringify({ payment_id: payment.id, attempt_id: attempt.id }),
+          },
+        })
+        return toV2AttemptSnapshot(attempt)
+      })
+    },
+
+    async finalizeV2Payment(input) {
+      return prisma.$transaction(async (transaction) => {
+        const payment = await transaction.payment.findUniqueOrThrow({ where: { id: input.paymentId } })
+        const attempt = await transaction.paymentAttempt.findUniqueOrThrow({ where: { id: input.attemptId } })
+        if (
+          payment.rowVersion !== input.paymentRowVersion ||
+          attempt.rowVersion !== input.attemptRowVersion ||
+          attempt.outcome !== input.currentOutcome
+        ) {
+          throw new ConflictError('Payment terminalization changed concurrently')
+        }
+        assertAttemptProgression(
+          input.currentOutcome as Parameters<typeof assertAttemptProgression>[0],
+          input.nextOutcome as Parameters<typeof assertAttemptProgression>[1],
+        )
+        await transaction.paymentAttempt.update({
+          where: { id: input.attemptId },
+          data: {
+            outcome: input.nextOutcome,
+            status: input.attemptStatus as never,
+            rowVersion: { increment: 1 },
+            ...(input.externalId === undefined ? {} : { railTransactionId: input.externalId }),
+          },
+        })
+        await transaction.payment.update({
+          where: { id: input.paymentId },
+          data: {
+            status: input.paymentStatus as never,
+            executionState: 'TERMINAL',
+            settlementState: input.settlementState,
+            outcomeState: input.outcomeState,
+            rowVersion: { increment: 1 },
+            ...(input.externalId === undefined ? {} : { failureCode: null }),
+            ...(input.confirmedAt === undefined ? {} : { confirmedAt: input.confirmedAt }),
+            ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
+            ...(input.failureCode === undefined ? {} : { failureCode: input.failureCode }),
+            ...(input.failureMessageSafe === undefined
+              ? {}
+              : { failureMessageSafe: input.failureMessageSafe }),
+          },
+        })
+        if (input.reservation !== 'NONE') {
+          await transaction.outgoingReservation.updateMany({
+            where: { paymentId: input.paymentId, status: 'ACTIVE', lifecycleState: 'HELD' },
+            data: {
+              status: input.reservation === 'CONSUME' ? 'ACTIVE' : 'RELEASED',
+              lifecycleState: input.reservation === 'CONSUME' ? 'CONSUMED' : 'RELEASED',
+              ...(input.reservation === 'CONSUME'
+                ? { consumedAt: new Date() }
+                : { releaseReason: input.failureCode ?? input.evidenceOutcome, releasedAt: new Date() }),
+              rowVersion: { increment: 1 },
+            },
+          })
+        }
+        await transaction.evidenceRecord.create({
+          data: {
+            id: `evidence_${randomId()}`,
+            paymentId: input.paymentId,
+            attemptId: input.attemptId,
+            authority: 'RAIL',
+            source: input.source,
+            outcome: input.evidenceOutcome,
+            observedAt: new Date(),
+            ...(input.externalId === undefined ? {} : { externalId: input.externalId }),
+            metadataJson: '{}',
+          },
+        })
+        const updated = await transaction.payment.findUniqueOrThrow({ where: { id: input.paymentId } })
+        const decision = await transaction.policyDecision.findUniqueOrThrow({ where: { paymentId: input.paymentId } })
+        const approval = await transaction.approval.findUnique({ where: { paymentId: input.paymentId } })
+        const reservation = await transaction.outgoingReservation.findUnique({ where: { paymentId: input.paymentId } })
+        const attempts = await transaction.paymentAttempt.findMany({ where: { paymentId: input.paymentId }, orderBy: { attemptNumber: 'asc' } })
+        return {
+          payment: toV2PaymentSnapshot(updated),
+          policyDecision: parsePolicyDecision(decision.decision),
+          reasonCodes: parseStringArray(decision.reasonCodesJson, 'policy reason codes'),
+          approvalState: projectApprovalState(approval),
+          reservationStatus: projectReservationStatus(reservation),
+          attempts: attempts.map(toV2AttemptSnapshot),
+        }
+      })
+    },
+
     async claimWorkItem(input) {
       if (input.leaseSeconds <= 0) throw new InvalidStateError('Lease must be positive')
       const now = input.now ?? new Date()
@@ -883,7 +1205,8 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         const rows = await transaction.$queryRaw<Array<{ id: string }>>`
           SELECT id FROM "durable_work_items"
           WHERE kind = ${input.kind}
-            AND (status = 'AVAILABLE' OR (status = 'CLAIMED' AND lease_expires_at <= ${now}))
+            AND (status = 'AVAILABLE' OR status = 'RETRY_WAIT' OR (status = 'CLAIMED' AND lease_expires_at <= ${now}))
+            AND attempt_count < max_attempts
             AND available_at <= ${now}
           ORDER BY available_at ASC, id ASC
           FOR UPDATE SKIP LOCKED
@@ -901,6 +1224,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             attemptCount: { increment: 1 },
           },
         })
+        const accountId = await resolveWorkAccountId(transaction, item.resourceType, item.resourceId)
         return {
           id: item.id,
           kind: item.kind,
@@ -908,6 +1232,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           resourceId: item.resourceId,
           attemptCount: item.attemptCount,
           payloadJson: item.payloadJson,
+          ...(accountId === undefined ? {} : { accountId }),
         }
       })
     },
@@ -926,21 +1251,59 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         throw new ConflictError('Work item lease is no longer owned')
     },
 
-    async retryWorkItem(input) {
+    async renewWorkItemLease(input) {
+      if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
+        throw new InvalidStateError('Lease must be positive')
+      }
+      const now = input.now ?? new Date()
+      const leaseExpiresAt = new Date(now.getTime() + input.leaseSeconds * 1000)
       const result = await prisma.durableWorkItem.updateMany({
-        where: { id: input.id, status: 'CLAIMED', leaseOwner: input.owner },
-        data: {
-          status: 'RETRY_WAIT',
-          retryAfter: input.retryAt,
-          availableAt: input.retryAt,
-          lastErrorCode: input.errorCode,
-          lastErrorSafe: input.errorSafe,
-          leaseOwner: null,
-          leaseExpiresAt: null,
+        where: {
+          id: input.id,
+          status: 'CLAIMED',
+          leaseOwner: input.owner,
+          leaseExpiresAt: { gt: now },
         },
+        data: { leaseExpiresAt },
       })
-      if (result.count !== 1)
-        throw new ConflictError('Work item lease is no longer owned')
+      if (result.count !== 1) throw new ConflictError('Work item lease is no longer owned')
+      return leaseExpiresAt
+    },
+
+    async retryWorkItem(input) {
+      await prisma.$transaction(async (transaction) => {
+        const item = await transaction.durableWorkItem.findFirst({
+          where: { id: input.id, status: 'CLAIMED', leaseOwner: input.owner },
+        })
+        if (item === null) throw new ConflictError('Work item lease is no longer owned')
+        const exhausted = item.attemptCount >= item.maxAttempts
+        if (exhausted) {
+          await markWorkItemExhausted(transaction, item, input.errorCode, input.errorSafe)
+          return
+        }
+        await transaction.durableWorkItem.update({
+          where: { id: item.id },
+          data: {
+            status: 'RETRY_WAIT',
+            retryAfter: input.retryAt,
+            availableAt: input.retryAt,
+            lastErrorCode: input.errorCode,
+            lastErrorSafe: input.errorSafe,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+          },
+        })
+      })
+    },
+
+    async failWorkItem(input) {
+      await prisma.$transaction(async (transaction) => {
+        const item = await transaction.durableWorkItem.findFirst({
+          where: { id: input.id, status: 'CLAIMED', leaseOwner: input.owner },
+        })
+        if (item === null) throw new ConflictError('Work item lease is no longer owned')
+        await markWorkItemExhausted(transaction, item, input.errorCode, input.errorSafe)
+      })
     },
 
     async appendTimelineEvent(input) {
@@ -1049,6 +1412,10 @@ function toV2PaymentSnapshot(payment: {
   return payment
 }
 
+function randomId(): string {
+  return randomBytes(16).toString('hex')
+}
+
 function toV2AttemptSnapshot(attempt: {
   id: string
   paymentId: string
@@ -1058,6 +1425,7 @@ function toV2AttemptSnapshot(attempt: {
   routeId: string | null
   preparedEffectHash: string | null
   signedPayloadHash: string | null
+  signedPayloadEncrypted: string | null
   expectedExternalId: string | null
   validityExpiresAt: Date | null
   validitySlot: bigint | null
@@ -1100,6 +1468,28 @@ async function loadPaymentView(
   }
 }
 
+async function resolveWorkAccountId(
+  transaction: Prisma.TransactionClient,
+  resourceType: string,
+  resourceId: string,
+): Promise<string | undefined> {
+  if (resourceType === 'PAYMENT') {
+    const payment = await transaction.payment.findUnique({
+      where: { id: resourceId },
+      select: { payerAccountId: true },
+    })
+    return payment?.payerAccountId
+  }
+  if (resourceType === 'PAYMENT_ATTEMPT') {
+    const attempt = await transaction.paymentAttempt.findUnique({
+      where: { id: resourceId },
+      select: { payment: { select: { payerAccountId: true } } },
+    })
+    return attempt?.payment.payerAccountId
+  }
+  return undefined
+}
+
 function parsePolicyDecision(value: string): PaymentPolicyDecision {
   if (value === 'ALLOW' || value === 'REQUIRE_APPROVAL' || value === 'DENY') {
     return value
@@ -1140,7 +1530,7 @@ function parseStringArray(value: string, fieldName: string): readonly string[] {
   let parsed: unknown
   try {
     parsed = JSON.parse(value) as unknown
-  } catch (error) {
+  } catch {
     throw new InvalidStateError(`${fieldName} are not valid JSON`)
   }
   if (
@@ -1150,4 +1540,131 @@ function parseStringArray(value: string, fieldName: string): readonly string[] {
     throw new InvalidStateError(`${fieldName} are not a string array`)
   }
   return parsed
+}
+
+async function markWorkItemExhausted(
+  transaction: Prisma.TransactionClient,
+  item: {
+    readonly id: string
+    readonly resourceType: string
+    readonly resourceId: string
+    readonly attemptCount: number
+  },
+  errorCode: string,
+  errorSafe: string,
+): Promise<void> {
+  await transaction.durableWorkItem.update({
+    where: { id: item.id },
+    data: {
+      status: 'EXHAUSTED',
+      retryAfter: null,
+      lastErrorCode: errorCode,
+      lastErrorSafe: errorSafe,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    },
+  })
+
+  const payment = await findWorkPayment(transaction, item.resourceType, item.resourceId)
+  if (payment !== null) {
+    const terminalStatuses = new Set([
+      'CONFIRMED',
+      'PROVED_NO_EFFECT',
+      'FAILED',
+      'REJECTED',
+      'REJECTED_BY_POLICY',
+      'EXPIRED',
+      'CLOSED_UNRESOLVED',
+    ])
+    if (!terminalStatuses.has(payment.status)) {
+      await transaction.payment.update({
+        where: { id: payment.id },
+        data: {
+          status: 'REVIEW_REQUIRED',
+          executionState: 'RECONCILING',
+          settlementState: 'UNKNOWN',
+          outcomeState: 'UNDETERMINED',
+          rowVersion: { increment: 1 },
+        },
+      })
+      await transaction.operationTimelineEvent.create({
+        data: {
+          id: `timeline_${randomId()}`,
+          accountId: payment.accountId,
+          resourceType: 'PAYMENT',
+          resourceId: payment.id,
+          eventType: 'PAYMENT_REVIEW_REQUIRED',
+          actorType: 'SYSTEM',
+          source: 'V2_WORK_ITEM',
+          occurredAt: new Date(),
+          newStateJson: JSON.stringify({ reason: errorCode }),
+        },
+      })
+    }
+    await transaction.operationalException.upsert({
+      where: { activeDedupeKey: `active:payment:${payment.id}:work-exhausted` },
+      create: {
+        id: `opx_${item.id}`,
+        accountId: payment.accountId,
+        resourceType: 'PAYMENT',
+        resourceId: payment.id,
+        dedupeKey: `payment:${payment.id}:work-exhausted`,
+        activeDedupeKey: `active:payment:${payment.id}:work-exhausted`,
+        reasonCode: 'WORK_ITEM_EXHAUSTED',
+        detailsJson: JSON.stringify({ error_code: errorCode, error_safe: errorSafe }),
+      },
+      update: {
+        updatedAt: new Date(),
+        detailsJson: JSON.stringify({ error_code: errorCode, error_safe: errorSafe }),
+      },
+    })
+    return
+  }
+
+  await transaction.operationalException.upsert({
+    where: { activeDedupeKey: `active:work:${item.id}` },
+    create: {
+      id: `opx_${item.id}`,
+      resourceType: item.resourceType,
+      resourceId: item.resourceId,
+      dedupeKey: `work:${item.id}`,
+      activeDedupeKey: `active:work:${item.id}`,
+      reasonCode: 'WORK_ITEM_EXHAUSTED',
+      detailsJson: JSON.stringify({ error_code: errorCode, error_safe: errorSafe }),
+    },
+    update: {
+      updatedAt: new Date(),
+      detailsJson: JSON.stringify({ error_code: errorCode, error_safe: errorSafe }),
+    },
+  })
+}
+
+async function findWorkPayment(
+  transaction: Prisma.TransactionClient,
+  resourceType: string,
+  resourceId: string,
+): Promise<{ readonly id: string; readonly accountId: string; readonly status: string } | null> {
+  if (resourceType === 'PAYMENT') {
+    const payment = await transaction.payment.findUnique({
+      where: { id: resourceId },
+      select: { id: true, payerAccountId: true, status: true },
+    })
+    return payment === null
+      ? null
+      : { id: payment.id, accountId: payment.payerAccountId, status: payment.status }
+  }
+  if (resourceType === 'PAYMENT_ATTEMPT') {
+    const attempt = await transaction.paymentAttempt.findUnique({
+      where: { id: resourceId },
+      select: { payment: { select: { id: true, payerAccountId: true, status: true } } },
+    })
+    return attempt === null
+      ? null
+      : {
+          id: attempt.payment.id,
+          accountId: attempt.payment.payerAccountId,
+          status: attempt.payment.status,
+        }
+  }
+  return null
 }

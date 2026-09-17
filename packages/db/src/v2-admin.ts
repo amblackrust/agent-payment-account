@@ -99,6 +99,34 @@ export interface V2FundingDestinationRecord {
   readonly lastFailureCode: string | null
 }
 
+export interface V2CustodyKeyVersionRecord {
+  readonly id: string
+  readonly accountId: string | null
+  readonly keyVersion: number
+  readonly backendIdentity: string
+  readonly keyReference: string
+  readonly rootKeyFingerprint: string
+  readonly status: string
+}
+
+export interface V2SigningRequestRecord {
+  readonly id: string
+  readonly paymentId: string
+  readonly attemptId: string
+  readonly effectHash: string
+  readonly routeId: string
+  readonly network: string
+  readonly assetReference: string
+  readonly destination: string
+  readonly amountAtomic: bigint
+  readonly feePayerIdentity: string
+  readonly keyVersion: number
+  readonly status: string
+  readonly serviceIdentity: string
+  readonly createdAt: Date
+  readonly completedAt: Date | null
+}
+
 export interface V2HistoryRecord {
   readonly id: string
   readonly direction: 'INCOMING' | 'OUTGOING'
@@ -266,6 +294,35 @@ export interface V2AdminRepository {
     readonly limit: number
     readonly cursor?: { readonly occurredAt: Date; readonly id: string }
   }): Promise<readonly V2HistoryRecord[]>
+  createCustodyKeyVersion(input: {
+    readonly id: string
+    readonly accountId?: string
+    readonly keyVersion: number
+    readonly backendIdentity: string
+    readonly keyReference: string
+    readonly rootKeyFingerprint: string
+  }): Promise<V2CustodyKeyVersionRecord>
+  findActiveCustodyKeyVersion(accountId: string): Promise<V2CustodyKeyVersionRecord | null>
+  createSigningRequest(input: {
+    readonly id: string
+    readonly paymentId: string
+    readonly attemptId: string
+    readonly effectHash: string
+    readonly routeId: string
+    readonly network: string
+    readonly assetReference: string
+    readonly destination: string
+    readonly amountAtomic: bigint
+    readonly feePayerIdentity: string
+    readonly keyVersion: number
+    readonly serviceIdentity: string
+  }): Promise<V2SigningRequestRecord>
+  findSigningRequest(attemptId: string): Promise<V2SigningRequestRecord | null>
+  completeSigningRequest(
+    id: string,
+    effectHash: string,
+    status: 'SIGNED' | 'REJECTED',
+  ): Promise<V2SigningRequestRecord>
   consumeRateLimit(input: {
     readonly subjectType: string
     readonly subjectId: string
@@ -919,6 +976,64 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
         .slice(0, input.limit)
     },
 
+    async createCustodyKeyVersion(input) {
+      const key = await prisma.custodyKeyVersion.create({
+        data: {
+          id: input.id,
+          accountId: input.accountId ?? null,
+          keyVersion: input.keyVersion,
+          backendIdentity: input.backendIdentity,
+          keyReference: input.keyReference,
+          rootKeyFingerprint: input.rootKeyFingerprint,
+        },
+      })
+      return toCustodyKeyVersionRecord(key)
+    },
+
+    async findActiveCustodyKeyVersion(accountId) {
+      const key = await prisma.custodyKeyVersion.findFirst({
+        where: { accountId, status: 'ACTIVE' },
+        orderBy: { keyVersion: 'desc' },
+      })
+      return key === null ? null : toCustodyKeyVersionRecord(key)
+    },
+
+    async createSigningRequest(input) {
+      const request = await prisma.signingRequest.create({
+        data: {
+          id: input.id,
+          paymentId: input.paymentId,
+          attemptId: input.attemptId,
+          effectHash: input.effectHash,
+          routeId: input.routeId,
+          network: input.network,
+          assetReference: input.assetReference,
+          destination: input.destination,
+          amountAtomic: input.amountAtomic,
+          feePayerIdentity: input.feePayerIdentity,
+          keyVersion: input.keyVersion,
+          serviceIdentity: input.serviceIdentity,
+        },
+      })
+      return toSigningRequestRecord(request)
+    },
+
+    async findSigningRequest(attemptId) {
+      const request = await prisma.signingRequest.findUnique({ where: { attemptId } })
+      return request === null ? null : toSigningRequestRecord(request)
+    },
+
+    async completeSigningRequest(id, effectHash, status) {
+      const result = await prisma.signingRequest.updateMany({
+        where: { id, effectHash, status: 'PENDING' },
+        data: { status, completedAt: new Date() },
+      })
+      if (result.count !== 1) throw new ConflictError('Signing request changed concurrently')
+      return toSigningRequestRecord(
+        await prisma.signingRequest.findUniqueOrThrow({ where: { id } }),
+      )
+    },
+
     async consumeRateLimit(input) {
       if (!Number.isInteger(input.windowSeconds) || input.windowSeconds <= 0) {
         throw new InvalidStateError('Rate limit window must be positive')
@@ -1115,5 +1230,37 @@ function toReceiveRequestAdminRecord(request: {
   paidAt: Date | null
   matchedIncomingPaymentId: string | null
 }): V2ReceiveRequestAdminRecord {
+  return request
+}
+
+function toCustodyKeyVersionRecord(key: {
+  id: string
+  accountId: string | null
+  keyVersion: number
+  backendIdentity: string
+  keyReference: string
+  rootKeyFingerprint: string
+  status: string
+}): V2CustodyKeyVersionRecord {
+  return key
+}
+
+function toSigningRequestRecord(request: {
+  id: string
+  paymentId: string
+  attemptId: string
+  effectHash: string
+  routeId: string
+  network: string
+  assetReference: string
+  destination: string
+  amountAtomic: bigint
+  feePayerIdentity: string
+  keyVersion: number
+  status: string
+  serviceIdentity: string
+  createdAt: Date
+  completedAt: Date | null
+}): V2SigningRequestRecord {
   return request
 }

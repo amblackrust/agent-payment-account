@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { generateManagedWallet } from '@agent-payment/solana-rail'
 
 import {
+  ConstrainedCustodyBoundary,
+  type ConstrainedCustodyBackend,
   validateLegacyWalletCustody,
   WalletEncryptionError,
   WalletSecretCipher,
@@ -62,5 +64,54 @@ describe('wallet secret custody', () => {
         solanaPublicKey: '11111111111111111111111111111111',
       }),
     ).rejects.toThrow('runtime identity was not initialized')
+  })
+})
+
+describe('constrained custody boundary', () => {
+  const request = {
+    accountId: 'acct_1',
+    paymentId: 'pay_1',
+    attemptId: 'attempt_1',
+    effectHash: 'a'.repeat(64),
+    network: 'localnet',
+    assetReference: 'mint',
+    destination: 'destination',
+    amountAtomic: 10n,
+    feePayerIdentity: 'fee-payer',
+    keyVersion: 1,
+  }
+
+  it('rejects local custody in production and does not expose generic signing', () => {
+    const backend: ConstrainedCustodyBackend = {
+      identity: 'local-test',
+      mode: 'LOCAL_TEST',
+      signPaymentEffect: async () => ({
+        effectHash: request.effectHash,
+        keyVersion: 1,
+        signedPayload: Uint8Array.from([1]),
+        externalId: 'sig',
+      }),
+    }
+    expect(() => new ConstrainedCustodyBoundary(backend, 'production')).toThrow(
+      'external backend',
+    )
+    expect('sign' in backend).toBe(false)
+  })
+
+  it('rejects provider responses that change the constrained effect', async () => {
+    const boundary = new ConstrainedCustodyBoundary(
+      {
+        identity: 'test',
+        mode: 'LOCAL_TEST',
+        signPaymentEffect: async () => ({
+          effectHash: 'b'.repeat(64),
+          keyVersion: 1,
+          signedPayload: Uint8Array.from([1]),
+          externalId: 'sig',
+        }),
+      },
+      'test',
+    )
+    await expect(boundary.signPaymentEffect(request)).rejects.toThrow('effect hash')
   })
 })
