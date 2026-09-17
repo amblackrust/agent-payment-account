@@ -161,4 +161,13 @@ describe('V2 payment service adapter', () => {
       ),
     ).rejects.toBeInstanceOf(PolicyDeniedError)
   })
+
+  it('uses the configured page-size ceiling for the retained V1 contract', async () => {
+    const harness = createAdapterHarness()
+    const adapter = new V2PaymentServiceAdapter(harness.service, harness.repository, 2)
+
+    await expect(
+      adapter.listPaymentsPage(account.account.id, { limit: 3 }),
+    ).rejects.toThrow('Payment limit must be an integer from 1 to 2')
+  })
 })

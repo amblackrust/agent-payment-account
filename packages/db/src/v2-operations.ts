@@ -80,6 +80,8 @@ export interface V2WebhookDeliveryClaim {
   readonly attemptCount: number
 }
 
+const MAX_WEBHOOK_BATCH_SIZE = 1_000
+
 export interface V2DomainHealthRecord {
   readonly reviewRequiredPayments: number
   readonly exhaustedIncomingIssues: number
@@ -466,9 +468,13 @@ export function createV2OperationsRepository(
 
     async claimWebhookDeliveries(input) {
       const now = input.now ?? new Date()
-      if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
+      if (
+        !Number.isInteger(input.limit) ||
+        input.limit < 1 ||
+        input.limit > MAX_WEBHOOK_BATCH_SIZE
+      ) {
         throw new ValidationError(
-          'Webhook delivery batch size must be an integer from 1 to 100',
+          `Webhook delivery batch size must be an integer from 1 to ${MAX_WEBHOOK_BATCH_SIZE}`,
         )
       }
       if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {

@@ -26,7 +26,17 @@ type TransactionStore = PaymentRepository &
   RecipientRepository
 
 export class TransactionService {
-  public constructor(private readonly repository: TransactionStore) {}
+  private readonly maxPageSize: number
+
+  public constructor(
+    private readonly repository: TransactionStore,
+    options: { readonly maxPageSize?: number } = {},
+  ) {
+    this.maxPageSize = options.maxPageSize ?? MAX_TRANSACTION_LIMIT
+    if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
+      throw new ValidationError('Maximum page size must be a positive integer')
+    }
+  }
 
   public async listTransactions(
     accountId: string,
@@ -35,7 +45,7 @@ export class TransactionService {
     let cursor: string | undefined
     do {
       const page = await this.listTransactionsPage(accountId, {
-        limit: MAX_TRANSACTION_LIMIT,
+        limit: this.maxPageSize,
         ...(cursor === undefined ? {} : { cursor }),
       })
       transactions.push(...page.transactions)
@@ -48,7 +58,7 @@ export class TransactionService {
     accountId: string,
     input: { readonly limit?: number; readonly cursor?: string },
   ): Promise<TransactionPage> {
-    const limit = validateLimit(input.limit)
+    const limit = validateLimit(input.limit, this.maxPageSize)
     const cursor = decodeCursor(input.cursor)
     const [payments, incoming] = await Promise.all([
       readPaymentPage(this.repository, accountId, limit + 1, cursor),
@@ -118,11 +128,11 @@ export class TransactionService {
   }
 }
 
-function validateLimit(value: number | undefined): number {
+function validateLimit(value: number | undefined, maxPageSize: number): number {
   const limit = value ?? DEFAULT_TRANSACTION_LIMIT
-  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_TRANSACTION_LIMIT) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > maxPageSize) {
     throw new ValidationError(
-      `Transaction limit must be an integer from 1 to ${MAX_TRANSACTION_LIMIT}`,
+      `Transaction limit must be an integer from 1 to ${maxPageSize}`,
     )
   }
   return limit

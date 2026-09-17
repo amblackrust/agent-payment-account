@@ -121,15 +121,21 @@ async function startServer(): Promise<void> {
     recoveryCipher,
     fundingProvisioner,
   )
-  const recipientService = new RecipientService(database)
+  const recipientService = new RecipientService(database, {
+    maxPageSize: limits.maxPageSize,
+  })
   const receiveService = new ReceiveService(database, rail)
   const v2ReceiveService = new V2ReceiveService(
     database,
     database.v2,
     database.v2Admin,
     rail,
+    () => new Date(),
+    { maxPageSize: limits.maxPageSize },
   )
-  const transactionService = new TransactionService(database)
+  const transactionService = new TransactionService(database, {
+    maxPageSize: limits.maxPageSize,
+  })
   const v2PaymentService = new V2PaymentService({
     repository: database.v2,
     recipientRepository: database,
@@ -145,6 +151,7 @@ async function startServer(): Promise<void> {
       getSettledAtomic: (input) => getLogicalSettledAtomic(rail, input),
     },
     recoveryCipher,
+    maxPageSize: limits.maxPageSize,
   })
   const v2OperationsService = new V2OperationsService(database.v2Operations, {
     maxPageSize: limits.maxPageSize,
@@ -152,7 +159,11 @@ async function startServer(): Promise<void> {
   const v2OutgoingRuntime = legacyRuntimeEnabled
     ? createV2OutgoingWorker({ config, database, walletCipher })
     : undefined
-  const paymentService = new V2PaymentServiceAdapter(v2PaymentService, database.v2)
+  const paymentService = new V2PaymentServiceAdapter(
+    v2PaymentService,
+    database.v2,
+    limits.maxPageSize,
+  )
   const incomingReader = createSolanaIncomingReader({
     rpc: createSolanaRpc(config.solanaRpcUrl as ClusterUrl),
     readRail: rail,

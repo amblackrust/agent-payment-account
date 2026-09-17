@@ -19,10 +19,18 @@ import type { V2PaymentService } from './payments-v2.js'
  * through the durable V2 orchestrator.
  */
 export class V2PaymentServiceAdapter implements PaymentServiceLike {
+  private readonly maxPageSize: number
+
   public constructor(
     private readonly service: V2PaymentService,
     private readonly repository: V2DatabaseRepository,
-  ) {}
+    maxPageSize = 100,
+  ) {
+    if (!Number.isInteger(maxPageSize) || maxPageSize < 1) {
+      throw new InvalidStateError('Maximum page size must be a positive integer')
+    }
+    this.maxPageSize = maxPageSize
+  }
 
   public async createPayment(
     account: AuthenticatedAccount,
@@ -86,8 +94,10 @@ export class V2PaymentServiceAdapter implements PaymentServiceLike {
     readonly next_cursor: string | null
   }> {
     const limit = input.limit ?? 50
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-      throw new ValidationError('Payment limit must be an integer from 1 to 100')
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.maxPageSize) {
+      throw new ValidationError(
+        `Payment limit must be an integer from 1 to ${this.maxPageSize}`,
+      )
     }
     const cursor =
       input.cursor === undefined

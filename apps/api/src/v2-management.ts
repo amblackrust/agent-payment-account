@@ -31,20 +31,27 @@ import type { RecoveryEnvelopeCipher } from './custody.js'
 import type { V2SettledBalanceProvider } from './payments-v2.js'
 
 const RECOVERY_TTL_MS = 15 * 60 * 1000
+const DEFAULT_MAX_PAGE_SIZE = 100
 
 export interface V2ManagementServiceOptions {
   readonly repository: V2AdminRepository
   readonly financialRepository: V2DatabaseRepository
   readonly settledBalanceProvider?: V2SettledBalanceProvider
   readonly recoveryCipher?: RecoveryEnvelopeCipher
+  readonly maxPageSize?: number
   readonly now?: () => Date
 }
 
 export class V2ManagementService {
   private readonly now: () => Date
+  private readonly maxPageSize: number
 
   public constructor(private readonly options: V2ManagementServiceOptions) {
     this.now = options.now ?? (() => new Date())
+    this.maxPageSize = options.maxPageSize ?? DEFAULT_MAX_PAGE_SIZE
+    if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
+      throw new InvalidStateError('Maximum page size must be a positive integer')
+    }
   }
 
   public async getAccount(accountId: string) {
@@ -110,6 +117,12 @@ export class V2ManagementService {
       throw new DependencyUnavailableError('Credential recovery is unavailable')
     }
     await this.requireAccount(accountId)
+    const existingCredential = (
+      await this.options.repository.listCredentials(accountId)
+    ).find((candidate) => candidate.id === oldCredentialId)
+    if (existingCredential === undefined) {
+      throw new NotFoundError('Credential was not found or already revoked')
+    }
     const credential = generateApiCredential()
     const recovery = this.options.recoveryCipher.encrypt(
       new TextEncoder().encode(credential.rawKey),
@@ -120,7 +133,7 @@ export class V2ManagementService {
       newCredentialId: createCredentialId(),
       keyHash: credential.keyHash,
       keyPrefix: credential.keyPrefix,
-      scopes: scopes ?? ['payments:create', 'payments:read'],
+      scopes: scopes ?? existingCredential.scopes,
       recoveryCiphertext: recovery.ciphertext,
       recoveryNonce: recovery.nonce,
       recoveryAuthTag: recovery.authTag,
@@ -352,8 +365,10 @@ export class V2ManagementService {
     input: { readonly limit?: number; readonly cursor?: string } = {},
   ) {
     const limit = input.limit ?? 50
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-      throw new ValidationError('History limit must be an integer from 1 to 100')
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.maxPageSize) {
+      throw new ValidationError(
+        `History limit must be an integer from 1 to ${this.maxPageSize}`,
+      )
     }
     const cursor = decodeCursor(input.cursor)
     const records = await this.options.repository.listHistory({

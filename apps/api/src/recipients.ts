@@ -8,6 +8,7 @@ import type {
 } from '@agent-payment/db'
 
 const SOLANA_SPL_DESTINATION = 'SOLANA_SPL'
+const DEFAULT_MAX_PAGE_SIZE = 100
 
 export interface CreateRecipientRequest {
   readonly displayName: string
@@ -32,11 +33,19 @@ export interface UpdateRecipientRequest {
 }
 
 export class RecipientService {
+  private readonly maxPageSize: number
+
   public constructor(
     private readonly repository: RecipientRepository & {
       readonly findAccountPublicKey: (accountId: string) => Promise<string | null>
     },
-  ) {}
+    options: { readonly maxPageSize?: number } = {},
+  ) {
+    this.maxPageSize = options.maxPageSize ?? DEFAULT_MAX_PAGE_SIZE
+    if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
+      throw new ValidationError('Maximum page size must be a positive integer')
+    }
+  }
 
   public async createRecipient(
     ownerAccountId: string,
@@ -216,8 +225,10 @@ export class RecipientService {
     input: { readonly limit?: number; readonly cursor?: string },
   ) {
     const limit = input.limit ?? 50
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-      throw new ValidationError('Recipient limit must be an integer from 1 to 100')
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.maxPageSize) {
+      throw new ValidationError(
+        `Recipient limit must be an integer from 1 to ${this.maxPageSize}`,
+      )
     }
     const cursor = decodeRecipientCursor(input.cursor)
     const records =

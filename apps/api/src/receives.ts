@@ -21,6 +21,8 @@ import type {
 } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 
+const DEFAULT_MAX_PAGE_SIZE = 100
+
 export interface CreateReceiveRequest {
   readonly amount?: string
   readonly currency: string
@@ -129,13 +131,21 @@ export class ReceiveService {
 }
 
 export class V2ReceiveService {
+  private readonly maxPageSize: number
+
   public constructor(
     private readonly repository: ReceiveRepository,
     private readonly v2Repository: V2DatabaseRepository,
     private readonly adminRepository: V2AdminRepository,
     private readonly rail: SolanaRail,
     private readonly now: () => Date = () => new Date(),
-  ) {}
+    options: { readonly maxPageSize?: number } = {},
+  ) {
+    this.maxPageSize = options.maxPageSize ?? DEFAULT_MAX_PAGE_SIZE
+    if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
+      throw new ValidationError('Maximum page size must be a positive integer')
+    }
+  }
 
   public async createReceiveRequest(
     accountId: string,
@@ -205,7 +215,6 @@ export class V2ReceiveService {
   }
 
   public async listReceiveRequests(accountId: string, owner: string) {
-    await this.repository.expireOpenReceiveRequests(accountId, this.now())
     const destination = await this.rail.getReceiveDestination(owner)
     const requests = await this.repository.listReceiveRequests(accountId)
     return Promise.all(
@@ -227,12 +236,11 @@ export class V2ReceiveService {
     input: { readonly limit?: number; readonly cursor?: string },
   ) {
     const limit = input.limit ?? 50
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.maxPageSize) {
       throw new ValidationError(
-        'Receive request limit must be an integer from 1 to 100',
+        `Receive request limit must be an integer from 1 to ${this.maxPageSize}`,
       )
     }
-    await this.repository.expireOpenReceiveRequests(accountId, this.now())
     const destination = await this.rail.getReceiveDestination(owner)
     const cursor = decodeReceiveCursor(input.cursor)
     const records =
