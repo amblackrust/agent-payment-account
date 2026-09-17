@@ -164,3 +164,23 @@ export type PayRequest = z.infer<typeof payRequestSchema>
 export type SendRequest = z.infer<typeof sendRequestSchema>
 export type ReceiveRequest = z.infer<typeof receiveRequestSchema>
 export type RefundRequest = z.infer<typeof refundRequestSchema>
+
+export {
+  approvalStateSchema,
+  exactAmountSchema,
+  policyDecisionSchema,
+  v2BalanceResponseSchema,
+  v2ErrorCodeSchema,
+  v2ErrorEnvelopeSchema,
+  v2PaymentCreateRequestSchema,
+  v2PaymentResponseSchema,
+  v2PaymentStatusSchema,
+} from './v2.js'
+export type {
+  V2BalanceResponse,
+  V2ErrorCode,
+  V2ErrorEnvelope,
+  V2PaymentCreateRequest,
+  V2PaymentResponse,
+  V2PaymentStatus,
+} from './v2.js'
