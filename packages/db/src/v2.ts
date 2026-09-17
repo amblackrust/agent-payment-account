@@ -29,6 +29,16 @@ export interface V2SettlementAssetRecord {
   readonly version: number
 }
 
+export interface V2EconomicMappingRecord {
+  readonly id: string
+  readonly denominationId: string
+  readonly settlementAssetId: string
+  readonly numerator: bigint
+  readonly denominator: bigint
+  readonly status: string
+  readonly version: number
+}
+
 export interface V2SpendPolicyRecord {
   readonly id: string
   readonly accountId: string
@@ -67,6 +77,7 @@ export interface V2PaymentSnapshot {
   readonly recipientId: string | null
   readonly recipientManagedAccountId: string | null
   readonly kind: string
+  readonly externalReference: string | null
   readonly amountAtomic: bigint
   readonly amountScale: number | null
   readonly denominationId: string | null
@@ -75,6 +86,7 @@ export interface V2PaymentSnapshot {
   readonly routeId: string | null
   readonly routeSelectionReason: string | null
   readonly settlementAssetId: string | null
+  readonly destinationSnapshotJson: string | null
   readonly policyDecisionId: string | null
   readonly approvalId: string | null
   readonly executionState: string
@@ -98,6 +110,7 @@ export interface V2PaymentAttemptSnapshot {
   readonly status: string
   readonly outcome: string
   readonly preparedEffectHash: string | null
+  readonly preparedEffectJson?: string | null
   readonly signedPayloadHash: string | null
   readonly signedPayloadEncrypted?: string | null
   readonly expectedExternalId: string | null
@@ -187,6 +200,8 @@ export interface V2DatabaseRepository {
   }): Promise<V2DenominationRecord>
   findDenomination(id: string): Promise<V2DenominationRecord | null>
   findSettlementAsset(id: string): Promise<V2SettlementAssetRecord | null>
+  findEconomicMapping(id: string): Promise<V2EconomicMappingRecord | null>
+  findSettlementRoute(id: string): Promise<SettlementRoute | null>
   findActiveSpendPolicy(
     accountId: string,
     denominationId: string,
@@ -291,6 +306,7 @@ export interface V2DatabaseRepository {
     readonly expectedExternalId?: string
     readonly evidenceId?: string
     readonly preparedEffectHash?: string
+    readonly preparedEffectJson?: string | null
     readonly signedPayloadHash?: string
     readonly signedPayloadEncrypted?: string
     readonly validityExpiresAt?: Date
@@ -432,6 +448,27 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
       return prisma.settlementAsset.findUnique({ where: { id } })
     },
 
+    async findEconomicMapping(id) {
+      return prisma.economicMapping.findUnique({ where: { id } })
+    },
+
+    async findSettlementRoute(id) {
+      const route = await prisma.settlementRoute.findUnique({ where: { id } })
+      return route === null
+        ? null
+        : {
+            id: route.id,
+            rail: route.rail,
+            railVersion: route.railVersion,
+            network: route.network,
+            settlementAssetId: route.settlementAssetId,
+            economicMappingId: route.economicMappingId,
+            status: route.status as SettlementRoute['status'],
+            priority: route.priority,
+            configVersion: route.configVersion,
+          }
+    },
+
     async findActiveSpendPolicy(accountId, denominationId) {
       return prisma.spendPolicy.findFirst({
         where: { accountId, denominationId, status: 'ACTIVE' },
@@ -502,7 +539,13 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           originalPaymentId,
           kind: 'REFUND',
           status: {
-            notIn: ['FAILED', 'REJECTED', 'REJECTED_BY_POLICY', 'EXPIRED', 'PROVED_NO_EFFECT'],
+            notIn: [
+              'FAILED',
+              'REJECTED',
+              'REJECTED_BY_POLICY',
+              'EXPIRED',
+              'PROVED_NO_EFFECT',
+            ],
           },
         },
         _sum: { amountAtomic: true },
@@ -700,10 +743,14 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         }
 
         if (input.operation === 'REFUND' && input.originalPaymentId === undefined) {
-          throw new InvalidStateError('Refund payment must reference an original payment')
+          throw new InvalidStateError(
+            'Refund payment must reference an original payment',
+          )
         }
         if (input.operation !== 'REFUND' && input.originalPaymentId !== undefined) {
-          throw new InvalidStateError('Only refund payments may reference an original payment')
+          throw new InvalidStateError(
+            'Only refund payments may reference an original payment',
+          )
         }
         if (input.originalPaymentId !== undefined) {
           const originalRows = await transaction.$queryRaw<
@@ -738,7 +785,10 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             },
             _sum: { amountAtomic: true },
           })
-          if (input.amountAtomic + (refunded._sum.amountAtomic ?? 0n) > original.amount_atomic) {
+          if (
+            input.amountAtomic + (refunded._sum.amountAtomic ?? 0n) >
+            original.amount_atomic
+          ) {
             throw new ConflictError('Refund amount exceeds the original payment amount')
           }
         }
@@ -929,7 +979,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         where: {
           payerAccountId: input.accountId,
           ...(input.status === undefined ? {} : { status: input.status as never }),
-          ...(input.outcomeState === undefined ? {} : { outcomeState: input.outcomeState }),
+          ...(input.outcomeState === undefined
+            ? {}
+            : { outcomeState: input.outcomeState }),
           ...(input.recipientId === undefined
             ? {}
             : { recipientId: input.recipientId }),
@@ -1004,6 +1056,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           ...(input.preparedEffectHash === undefined
             ? {}
             : { preparedEffectHash: input.preparedEffectHash }),
+          ...(input.preparedEffectJson === undefined
+            ? {}
+            : { preparedEffectJson: input.preparedEffectJson }),
           ...(input.signedPayloadHash === undefined
             ? {}
             : { signedPayloadHash: input.signedPayloadHash }),
@@ -1013,7 +1068,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           ...(input.validityExpiresAt === undefined
             ? {}
             : { validityExpiresAt: input.validityExpiresAt }),
-          ...(input.validitySlot === undefined ? {} : { validitySlot: input.validitySlot }),
+          ...(input.validitySlot === undefined
+            ? {}
+            : { validitySlot: input.validitySlot }),
         },
       })
       if (result.count !== 1)
@@ -1031,12 +1088,22 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         data: {
           rowVersion: { increment: 1 },
           ...(input.status === undefined ? {} : { status: input.status as never }),
-          ...(input.executionState === undefined ? {} : { executionState: input.executionState }),
-          ...(input.settlementState === undefined ? {} : { settlementState: input.settlementState }),
-          ...(input.outcomeState === undefined ? {} : { outcomeState: input.outcomeState }),
-          ...(input.confirmedAt === undefined ? {} : { confirmedAt: input.confirmedAt }),
+          ...(input.executionState === undefined
+            ? {}
+            : { executionState: input.executionState }),
+          ...(input.settlementState === undefined
+            ? {}
+            : { settlementState: input.settlementState }),
+          ...(input.outcomeState === undefined
+            ? {}
+            : { outcomeState: input.outcomeState }),
+          ...(input.confirmedAt === undefined
+            ? {}
+            : { confirmedAt: input.confirmedAt }),
           ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
-          ...(input.failureCode === undefined ? {} : { failureCode: input.failureCode }),
+          ...(input.failureCode === undefined
+            ? {}
+            : { failureCode: input.failureCode }),
           ...(input.failureMessageSafe === undefined
             ? {}
             : { failureMessageSafe: input.failureMessageSafe }),
@@ -1121,7 +1188,10 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             actorType: 'SYSTEM',
             source: 'V2_OUTGOING_WORKER',
             occurredAt: new Date(),
-            newStateJson: JSON.stringify({ status: 'PROVED_NO_EFFECT', reason: input.reason }),
+            newStateJson: JSON.stringify({
+              status: 'PROVED_NO_EFFECT',
+              reason: input.reason,
+            }),
           },
         })
         const updated = await transaction.payment.findUniqueOrThrow({
@@ -1139,13 +1209,23 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         const decision = await transaction.policyDecision.findUniqueOrThrow({
           where: { paymentId: payment.id },
         })
-        const approval = await transaction.approval.findUnique({ where: { paymentId: payment.id } })
-        const reservation = await transaction.outgoingReservation.findUnique({ where: { paymentId: payment.id } })
-        const attempts = await transaction.paymentAttempt.findMany({ where: { paymentId: payment.id }, orderBy: { attemptNumber: 'asc' } })
+        const approval = await transaction.approval.findUnique({
+          where: { paymentId: payment.id },
+        })
+        const reservation = await transaction.outgoingReservation.findUnique({
+          where: { paymentId: payment.id },
+        })
+        const attempts = await transaction.paymentAttempt.findMany({
+          where: { paymentId: payment.id },
+          orderBy: { attemptNumber: 'asc' },
+        })
         return {
           payment: toV2PaymentSnapshot(updated),
           policyDecision: parsePolicyDecision(decision.decision),
-          reasonCodes: parseStringArray(decision.reasonCodesJson, 'policy reason codes'),
+          reasonCodes: parseStringArray(
+            decision.reasonCodesJson,
+            'policy reason codes',
+          ),
           approvalState: projectApprovalState(approval),
           reservationStatus: projectReservationStatus(reservation),
           attempts: attempts.map(toV2AttemptSnapshot),
@@ -1155,11 +1235,24 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 
     async createReplacementAttempt(input) {
       return prisma.$transaction(async (transaction) => {
-        const payment = await transaction.payment.findUniqueOrThrow({ where: { id: input.paymentId } })
-        if (payment.rowVersion !== input.paymentRowVersion) throw new ConflictError('Payment changed concurrently')
-        const attempts = await transaction.paymentAttempt.findMany({ where: { paymentId: payment.id }, orderBy: { attemptNumber: 'asc' } })
-        if (attempts.some((attempt) => !['PROVED_NO_EFFECT', 'PRE_EFFECT_ABORTED'].includes(attempt.outcome))) {
-          throw new ConflictError('Replacement attempt is unsafe while an earlier attempt may have an effect')
+        const payment = await transaction.payment.findUniqueOrThrow({
+          where: { id: input.paymentId },
+        })
+        if (payment.rowVersion !== input.paymentRowVersion)
+          throw new ConflictError('Payment changed concurrently')
+        const attempts = await transaction.paymentAttempt.findMany({
+          where: { paymentId: payment.id },
+          orderBy: { attemptNumber: 'asc' },
+        })
+        if (
+          attempts.some(
+            (attempt) =>
+              !['PROVED_NO_EFFECT', 'PRE_EFFECT_ABORTED'].includes(attempt.outcome),
+          )
+        ) {
+          throw new ConflictError(
+            'Replacement attempt is unsafe while an earlier attempt may have an effect',
+          )
         }
         const attempt = await transaction.paymentAttempt.create({
           data: {
@@ -1174,7 +1267,11 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         })
         await transaction.payment.update({
           where: { id: payment.id },
-          data: { status: 'ROUTING', executionState: 'QUEUED', rowVersion: { increment: 1 } },
+          data: {
+            status: 'ROUTING',
+            executionState: 'QUEUED',
+            rowVersion: { increment: 1 },
+          },
         })
         await transaction.durableWorkItem.create({
           data: {
@@ -1182,7 +1279,10 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             kind: 'OUTGOING_PAYMENT_ATTEMPT',
             resourceType: 'PAYMENT_ATTEMPT',
             resourceId: attempt.id,
-            payloadJson: JSON.stringify({ payment_id: payment.id, attempt_id: attempt.id }),
+            payloadJson: JSON.stringify({
+              payment_id: payment.id,
+              attempt_id: attempt.id,
+            }),
           },
         })
         return toV2AttemptSnapshot(attempt)
@@ -1191,8 +1291,12 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 
     async finalizeV2Payment(input) {
       return prisma.$transaction(async (transaction) => {
-        const payment = await transaction.payment.findUniqueOrThrow({ where: { id: input.paymentId } })
-        const attempt = await transaction.paymentAttempt.findUniqueOrThrow({ where: { id: input.attemptId } })
+        const payment = await transaction.payment.findUniqueOrThrow({
+          where: { id: input.paymentId },
+        })
+        const attempt = await transaction.paymentAttempt.findUniqueOrThrow({
+          where: { id: input.attemptId },
+        })
         if (
           payment.rowVersion !== input.paymentRowVersion ||
           attempt.rowVersion !== input.attemptRowVersion ||
@@ -1210,7 +1314,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             outcome: input.nextOutcome,
             status: input.attemptStatus as never,
             rowVersion: { increment: 1 },
-            ...(input.externalId === undefined ? {} : { railTransactionId: input.externalId }),
+            ...(input.externalId === undefined
+              ? {}
+              : { railTransactionId: input.externalId }),
           },
         })
         await transaction.payment.update({
@@ -1222,9 +1328,13 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             outcomeState: input.outcomeState,
             rowVersion: { increment: 1 },
             ...(input.externalId === undefined ? {} : { failureCode: null }),
-            ...(input.confirmedAt === undefined ? {} : { confirmedAt: input.confirmedAt }),
+            ...(input.confirmedAt === undefined
+              ? {}
+              : { confirmedAt: input.confirmedAt }),
             ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
-            ...(input.failureCode === undefined ? {} : { failureCode: input.failureCode }),
+            ...(input.failureCode === undefined
+              ? {}
+              : { failureCode: input.failureCode }),
             ...(input.failureMessageSafe === undefined
               ? {}
               : { failureMessageSafe: input.failureMessageSafe }),
@@ -1232,13 +1342,20 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         })
         if (input.reservation !== 'NONE') {
           await transaction.outgoingReservation.updateMany({
-            where: { paymentId: input.paymentId, status: 'ACTIVE', lifecycleState: 'HELD' },
+            where: {
+              paymentId: input.paymentId,
+              status: 'ACTIVE',
+              lifecycleState: 'HELD',
+            },
             data: {
               status: input.reservation === 'CONSUME' ? 'ACTIVE' : 'RELEASED',
               lifecycleState: input.reservation === 'CONSUME' ? 'CONSUMED' : 'RELEASED',
               ...(input.reservation === 'CONSUME'
                 ? { consumedAt: new Date() }
-                : { releaseReason: input.failureCode ?? input.evidenceOutcome, releasedAt: new Date() }),
+                : {
+                    releaseReason: input.failureCode ?? input.evidenceOutcome,
+                    releasedAt: new Date(),
+                  }),
               rowVersion: { increment: 1 },
             },
           })
@@ -1256,7 +1373,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             metadataJson: '{}',
           },
         })
-        const updated = await transaction.payment.findUniqueOrThrow({ where: { id: input.paymentId } })
+        const updated = await transaction.payment.findUniqueOrThrow({
+          where: { id: input.paymentId },
+        })
         await enqueuePaymentWebhookEvent(transaction, {
           accountId: updated.payerAccountId,
           paymentId: updated.id,
@@ -1266,14 +1385,26 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           amountAtomic: updated.amountAtomic,
           denominationId: updated.denominationId,
         })
-        const decision = await transaction.policyDecision.findUniqueOrThrow({ where: { paymentId: input.paymentId } })
-        const approval = await transaction.approval.findUnique({ where: { paymentId: input.paymentId } })
-        const reservation = await transaction.outgoingReservation.findUnique({ where: { paymentId: input.paymentId } })
-        const attempts = await transaction.paymentAttempt.findMany({ where: { paymentId: input.paymentId }, orderBy: { attemptNumber: 'asc' } })
+        const decision = await transaction.policyDecision.findUniqueOrThrow({
+          where: { paymentId: input.paymentId },
+        })
+        const approval = await transaction.approval.findUnique({
+          where: { paymentId: input.paymentId },
+        })
+        const reservation = await transaction.outgoingReservation.findUnique({
+          where: { paymentId: input.paymentId },
+        })
+        const attempts = await transaction.paymentAttempt.findMany({
+          where: { paymentId: input.paymentId },
+          orderBy: { attemptNumber: 'asc' },
+        })
         return {
           payment: toV2PaymentSnapshot(updated),
           policyDecision: parsePolicyDecision(decision.decision),
-          reasonCodes: parseStringArray(decision.reasonCodesJson, 'policy reason codes'),
+          reasonCodes: parseStringArray(
+            decision.reasonCodesJson,
+            'policy reason codes',
+          ),
           approvalState: projectApprovalState(approval),
           reservationStatus: projectReservationStatus(reservation),
           attempts: attempts.map(toV2AttemptSnapshot),
@@ -1307,7 +1438,11 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             attemptCount: { increment: 1 },
           },
         })
-        const accountId = await resolveWorkAccountId(transaction, item.resourceType, item.resourceId)
+        const accountId = await resolveWorkAccountId(
+          transaction,
+          item.resourceType,
+          item.resourceId,
+        )
         return {
           id: item.id,
           kind: item.kind,
@@ -1349,7 +1484,8 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         },
         data: { leaseExpiresAt },
       })
-      if (result.count !== 1) throw new ConflictError('Work item lease is no longer owned')
+      if (result.count !== 1)
+        throw new ConflictError('Work item lease is no longer owned')
       return leaseExpiresAt
     },
 
@@ -1361,7 +1497,12 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         if (item === null) throw new ConflictError('Work item lease is no longer owned')
         const exhausted = item.attemptCount >= item.maxAttempts
         if (exhausted) {
-          await markWorkItemExhausted(transaction, item, input.errorCode, input.errorSafe)
+          await markWorkItemExhausted(
+            transaction,
+            item,
+            input.errorCode,
+            input.errorSafe,
+          )
           return
         }
         await transaction.durableWorkItem.update({
@@ -1470,6 +1611,7 @@ function toV2PaymentSnapshot(payment: {
   recipientId: string | null
   recipientManagedAccountId: string | null
   kind: string
+  externalReference: string | null
   amountAtomic: bigint
   amountScale: number | null
   denominationId: string | null
@@ -1478,6 +1620,7 @@ function toV2PaymentSnapshot(payment: {
   routeId: string | null
   routeSelectionReason: string | null
   settlementAssetId: string | null
+  destinationSnapshotJson: string | null
   policyDecisionId: string | null
   approvalId: string | null
   executionState: string
@@ -1507,6 +1650,7 @@ function toV2AttemptSnapshot(attempt: {
   outcome: string
   routeId: string | null
   preparedEffectHash: string | null
+  preparedEffectJson: string | null
   signedPayloadHash: string | null
   signedPayloadEncrypted: string | null
   expectedExternalId: string | null
@@ -1738,7 +1882,11 @@ async function findWorkPayment(
   transaction: Prisma.TransactionClient,
   resourceType: string,
   resourceId: string,
-): Promise<{ readonly id: string; readonly accountId: string; readonly status: string } | null> {
+): Promise<{
+  readonly id: string
+  readonly accountId: string
+  readonly status: string
+} | null> {
   if (resourceType === 'PAYMENT') {
     const payment = await transaction.payment.findUnique({
       where: { id: resourceId },
@@ -1805,7 +1953,10 @@ async function enqueuePaymentWebhookEvent(
     where: { accountId: input.accountId, status: 'ACTIVE' },
   })
   for (const subscription of subscriptions) {
-    const eventTypes = parseStringArray(subscription.eventTypesJson, 'webhook event types')
+    const eventTypes = parseStringArray(
+      subscription.eventTypesJson,
+      'webhook event types',
+    )
     if (!eventTypes.includes(input.eventType) && !eventTypes.includes('*')) continue
     await transaction.webhookDelivery.create({
       data: {

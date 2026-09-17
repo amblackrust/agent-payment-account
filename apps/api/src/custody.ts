@@ -24,6 +24,12 @@ export interface ConstrainedEffectSigningRequest {
   readonly amountAtomic: bigint
   readonly feePayerIdentity: string
   readonly keyVersion: number
+  /**
+   * Provider-specific, unsigned effect material. It is included in the
+   * constrained request so a custody backend can sign the exact prepared
+   * effect after a worker restart without receiving an arbitrary message API.
+   */
+  readonly preparedPayload?: string
 }
 
 export interface ConstrainedSignedEffect {
@@ -73,13 +79,21 @@ export class ConstrainedCustodyBoundary {
 }
 
 function validateEffectSigningRequest(request: ConstrainedEffectSigningRequest): void {
-  if (request.accountId.length === 0 || request.paymentId.length === 0 || request.attemptId.length === 0) {
+  if (
+    request.accountId.length === 0 ||
+    request.paymentId.length === 0 ||
+    request.attemptId.length === 0
+  ) {
     throw new ValidationError('Custody signing identity is incomplete')
   }
   if (!/^[0-9a-f]{64}$/u.test(request.effectHash)) {
     throw new ValidationError('Custody effect hash must be SHA-256')
   }
-  if (request.amountAtomic <= 0n || !Number.isInteger(request.keyVersion) || request.keyVersion <= 0) {
+  if (
+    request.amountAtomic <= 0n ||
+    !Number.isInteger(request.keyVersion) ||
+    request.keyVersion <= 0
+  ) {
     throw new ValidationError('Custody signing amount or key version is invalid')
   }
   if (

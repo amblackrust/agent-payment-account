@@ -49,6 +49,7 @@ export type {
   V2ApprovedDestinationRecord,
   V2DatabaseRepository,
   V2DenominationRecord,
+  V2EconomicMappingRecord,
   V2PaymentAttemptSnapshot,
   V2PaymentCreateInput,
   V2PaymentCreateResult,

@@ -12,6 +12,7 @@ function view(): V2PaymentView {
       recipientId: 'rcpt_1',
       recipientManagedAccountId: null,
       kind: 'PAY',
+      externalReference: null,
       amountAtomic: 100n,
       amountScale: 2,
       denominationId: 'denom_usd',
@@ -20,6 +21,12 @@ function view(): V2PaymentView {
       routeId: 'route_1',
       routeSelectionReason: 'priority',
       settlementAssetId: 'asset_1',
+      destinationSnapshotJson: JSON.stringify({
+        rail: 'SOLANA_SPL',
+        network: 'localnet',
+        asset_reference: 'asset_1',
+        wallet_address: 'destination_1',
+      }),
       policyDecisionId: 'decision_1',
       approvalId: null,
       executionState: 'QUEUED',
@@ -141,7 +148,10 @@ describe('V2 outgoing worker', () => {
                 resourceType: 'PAYMENT_ATTEMPT',
                 resourceId: 'attempt_1',
                 attemptCount: 1,
-                payloadJson: JSON.stringify({ payment_id: 'pay_1', attempt_id: 'attempt_1' }),
+                payloadJson: JSON.stringify({
+                  payment_id: 'pay_1',
+                  attempt_id: 'attempt_1',
+                }),
                 accountId: 'acct_1',
               }
             : null
@@ -193,6 +203,7 @@ describe('V2 outgoing worker', () => {
           feePayerIdentity: 'fee-payer-1',
           keyVersion: 1,
           payloadHash: 'a'.repeat(64),
+          preparedPayload: '{}',
         }),
         sign: async () => {
           signCount += 1
@@ -203,7 +214,10 @@ describe('V2 outgoing worker', () => {
             externalId: 'external-1',
           }
         },
-        submit: async () => ({ status: 'CONFIRMED' as const, externalId: 'external-1' }),
+        submit: async () => ({
+          status: 'CONFIRMED' as const,
+          externalId: 'external-1',
+        }),
       },
       owner: 'worker-1',
     })

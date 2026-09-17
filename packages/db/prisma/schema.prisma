@@ -331,6 +331,7 @@ model PaymentAttempt {
   outcome                       String               @default("NOT_STARTED") @db.VarChar(32)
   routeId                       String?              @map("route_id") @db.VarChar(64)
   preparedEffectHash            String?              @map("prepared_effect_hash") @db.Char(64)
+  preparedEffectJson            String?              @map("prepared_effect_json") @db.Text
   signedPayloadHash             String?              @map("signed_payload_hash") @db.Char(64)
   signedPayloadEncrypted        String?              @map("signed_payload_encrypted") @db.Text
   validityExpiresAt             DateTime?            @map("validity_expires_at")

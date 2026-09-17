@@ -27,6 +27,7 @@ export interface V2PreparedEffect extends ConstrainedEffectSigningRequest {
   readonly attemptId: string
   readonly routeId: string
   readonly payloadHash: string
+  readonly preparedPayload: string
   readonly validityExpiresAt?: Date
   readonly validitySlot?: bigint
 }
@@ -133,7 +134,10 @@ export class V2OutgoingWorker {
         throw new InvalidStateError('Outgoing work item has no owning account')
       }
       const paymentId = paymentIdFromClaim(claim)
-      const view = await this.options.repository.findPaymentView(claim.accountId, paymentId)
+      const view = await this.options.repository.findPaymentView(
+        claim.accountId,
+        paymentId,
+      )
       if (view === null) {
         await this.options.repository.completeWorkItem(claim.id, this.options.owner)
         return
@@ -147,35 +151,49 @@ export class V2OutgoingWorker {
         await this.processReconciliation(claim, view, attempt)
         return
       }
-      if (view.payment.status === 'PROVED_NO_EFFECT' || view.payment.status === 'CONFIRMED') {
+      if (
+        view.payment.status === 'PROVED_NO_EFFECT' ||
+        view.payment.status === 'CONFIRMED'
+      ) {
         await this.options.repository.completeWorkItem(claim.id, this.options.owner)
         return
       }
       if (!(await this.ensureActiveBeforeEffect(claim, view, attempt))) return
-      if (this.options.custody === undefined || this.options.signedPayloadCipher === undefined) {
+      if (
+        this.options.custody === undefined ||
+        this.options.signedPayloadCipher === undefined
+      ) {
         throw new CustodyUnavailableError(
           'Outgoing worker requires durable custody and signed-payload encryption',
         )
       }
-      const prepared = await this.options.executor.prepare({ view, attempt })
+      const restoredPrepared = restorePreparedEffect(attempt)
+      const prepared =
+        restoredPrepared ?? (await this.options.executor.prepare({ view, attempt }))
       if (
         attempt.preparedEffectHash !== null &&
         attempt.preparedEffectHash !== prepared.effectHash
       ) {
         throw new InvalidStateError('Prepared effect changed after durable persistence')
       }
-      await this.options.repository.updateAttemptOutcome({
-        attemptId: attempt.id,
-        currentOutcome: attempt.outcome,
-        nextOutcome: attempt.outcome,
-        currentRowVersion: attempt.rowVersion,
-        status: 'PREPARED',
-        preparedEffectHash: prepared.effectHash,
-        ...(prepared.validityExpiresAt === undefined
-          ? {}
-          : { validityExpiresAt: prepared.validityExpiresAt }),
-        ...(prepared.validitySlot === undefined ? {} : { validitySlot: prepared.validitySlot }),
-      })
+      const preparedAttempt =
+        restoredPrepared === undefined
+          ? await this.options.repository.updateAttemptOutcome({
+              attemptId: attempt.id,
+              currentOutcome: attempt.outcome,
+              nextOutcome: attempt.outcome,
+              currentRowVersion: attempt.rowVersion,
+              status: 'PREPARED',
+              preparedEffectHash: prepared.effectHash,
+              preparedEffectJson: serializePreparedEffect(prepared),
+              ...(prepared.validityExpiresAt === undefined
+                ? {}
+                : { validityExpiresAt: prepared.validityExpiresAt }),
+              ...(prepared.validitySlot === undefined
+                ? {}
+                : { validitySlot: prepared.validitySlot }),
+            })
+          : attempt
       const activeKey = await this.options.custody.findActiveCustodyKeyVersion(
         prepared.accountId,
       )
@@ -203,51 +221,59 @@ export class V2OutgoingWorker {
         }))
       if (
         signingRequest.effectHash !== prepared.effectHash ||
-        (signingRequest.status !== 'PENDING' &&
-          !(signingRequest.status === 'SIGNED' &&
-            attempt.signedPayloadEncrypted !== undefined &&
-            attempt.signedPayloadEncrypted !== null))
+        (signingRequest.status !== 'PENDING' && signingRequest.status !== 'SIGNED')
       ) {
-        throw new CustodyUnavailableError('Signing request is not usable for this effect')
+        throw new CustodyUnavailableError(
+          'Signing request is not usable for this effect',
+        )
       }
       let signed: ConstrainedSignedEffect
-      if (attempt.signedPayloadEncrypted !== undefined && attempt.signedPayloadEncrypted !== null) {
+      const signedPayloadIsDurable =
+        preparedAttempt.signedPayloadEncrypted !== undefined &&
+        preparedAttempt.signedPayloadEncrypted !== null
+      if (signedPayloadIsDurable) {
         signed = restoreSignedEffect(
           this.options.signedPayloadCipher,
-          attempt.signedPayloadEncrypted,
+          preparedAttempt.signedPayloadEncrypted,
           prepared,
-          attempt.expectedExternalId,
-          attempt.signedPayloadHash,
+          preparedAttempt.expectedExternalId,
+          preparedAttempt.signedPayloadHash,
         )
       } else {
         try {
           signed = await this.options.executor.sign(prepared)
-          await this.options.custody.completeSigningRequest(
-            signingRequest.id,
-            prepared.effectHash,
-            'SIGNED',
-          )
         } catch (error) {
-          await this.options.custody.completeSigningRequest(
-            signingRequest.id,
-            prepared.effectHash,
-            'REJECTED',
-          )
+          if (signingRequest.status === 'PENDING') {
+            await this.options.custody.completeSigningRequest(
+              signingRequest.id,
+              prepared.effectHash,
+              'REJECTED',
+            )
+          }
           throw error
         }
       }
-      await this.options.repository.updateAttemptOutcome({
-        attemptId: attempt.id,
-        currentOutcome: attempt.outcome,
-        nextOutcome: attempt.outcome,
-        currentRowVersion: attempt.rowVersion + 1,
-        status: 'EXECUTING',
-        signedPayloadHash: hashBytes(signed.signedPayload),
-        expectedExternalId: signed.externalId,
-        signedPayloadEncrypted: serializeEncryptedPayload(
-          this.options.signedPayloadCipher.encrypt(signed.signedPayload),
-        ),
-      })
+      if (!signedPayloadIsDurable) {
+        await this.options.repository.updateAttemptOutcome({
+          attemptId: attempt.id,
+          currentOutcome: attempt.outcome,
+          nextOutcome: attempt.outcome,
+          currentRowVersion: preparedAttempt.rowVersion,
+          status: 'EXECUTING',
+          signedPayloadHash: hashBytes(signed.signedPayload),
+          expectedExternalId: signed.externalId,
+          signedPayloadEncrypted: serializeEncryptedPayload(
+            this.options.signedPayloadCipher.encrypt(signed.signedPayload),
+          ),
+        })
+      }
+      if (signingRequest.status === 'PENDING') {
+        await this.options.custody.completeSigningRequest(
+          signingRequest.id,
+          prepared.effectHash,
+          'SIGNED',
+        )
+      }
       const currentView = await this.options.repository.findPaymentView(
         claim.accountId,
         paymentId,
@@ -271,9 +297,16 @@ export class V2OutgoingWorker {
         })
         return
       }
-      if (!(await this.ensureActiveBeforeEffect(claim, currentView, currentAttempt))) return
+      if (!(await this.ensureActiveBeforeEffect(claim, currentView, currentAttempt)))
+        return
       const result = await this.options.executor.submit({ prepared, signed })
-      await this.handleSubmissionResult(claim, currentView, currentAttempt, prepared, result)
+      await this.handleSubmissionResult(
+        claim,
+        currentView,
+        currentAttempt,
+        prepared,
+        result,
+      )
     } catch (error) {
       await this.handleFailure(claim, error)
     }
@@ -287,9 +320,14 @@ export class V2OutgoingWorker {
     const currentView =
       claim.accountId === undefined
         ? view
-        : (await this.options.repository.findPaymentView(claim.accountId, view.payment.id)) ?? view
+        : ((await this.options.repository.findPaymentView(
+            claim.accountId,
+            view.payment.id,
+          )) ?? view)
     const currentAttempt = currentView.attempts.at(-1) ?? attempt
-    const status = await this.options.accountStatusProvider.getStatus(currentView.payment.payerAccountId)
+    const status = await this.options.accountStatusProvider.getStatus(
+      currentView.payment.payerAccountId,
+    )
     if (status === 'ACTIVE') return true
     if (
       currentAttempt.outcome === 'NOT_STARTED' &&
@@ -305,11 +343,16 @@ export class V2OutgoingWorker {
       await this.options.repository.completeWorkItem(claim.id, this.options.owner)
       return false
     }
-    if (currentAttempt.outcome === 'NOT_STARTED' && currentAttempt.signedPayloadHash !== null) {
+    if (
+      currentAttempt.outcome === 'NOT_STARTED' &&
+      currentAttempt.signedPayloadHash !== null
+    ) {
       await this.markPossibleEffect(claim, currentView, currentAttempt)
       return false
     }
-    throw new CustodyUnavailableError('Account is not active for a possible-effect attempt')
+    throw new CustodyUnavailableError(
+      'Account is not active for a possible-effect attempt',
+    )
   }
 
   private async handleSubmissionResult(
@@ -324,7 +367,7 @@ export class V2OutgoingWorker {
         paymentId: view.payment.id,
         attemptId: attempt.id,
         paymentRowVersion: view.payment.rowVersion,
-        attemptRowVersion: attempt.rowVersion + 2,
+        attemptRowVersion: attempt.rowVersion,
         currentOutcome: attempt.outcome,
         nextOutcome: 'CONFIRMED',
         attemptStatus: 'CONFIRMED',
@@ -345,7 +388,7 @@ export class V2OutgoingWorker {
         attemptId: attempt.id,
         currentOutcome: attempt.outcome,
         nextOutcome: 'SUBMITTED',
-        currentRowVersion: attempt.rowVersion + 2,
+        currentRowVersion: attempt.rowVersion,
         status: 'SUBMITTED',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
       })
@@ -356,7 +399,13 @@ export class V2OutgoingWorker {
         executionState: 'RECONCILING',
         settlementState: 'SUBMITTED',
       })
-      await this.options.repository.completeWorkItem(claim.id, this.options.owner)
+      await this.options.repository.retryWorkItem({
+        id: claim.id,
+        owner: this.options.owner,
+        retryAt: computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
+        errorCode: 'SUBMISSION_OBSERVED',
+        errorSafe: 'Submitted settlement awaits authoritative confirmation',
+      })
       return
     }
     if (result.status === 'UNKNOWN') {
@@ -364,7 +413,7 @@ export class V2OutgoingWorker {
         attemptId: attempt.id,
         currentOutcome: attempt.outcome,
         nextOutcome: 'UNKNOWN',
-        currentRowVersion: attempt.rowVersion + 2,
+        currentRowVersion: attempt.rowVersion,
         status: 'RECONCILING',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
       })
@@ -389,7 +438,7 @@ export class V2OutgoingWorker {
       paymentId: view.payment.id,
       attemptId: attempt.id,
       paymentRowVersion: view.payment.rowVersion,
-      attemptRowVersion: attempt.rowVersion + 2,
+      attemptRowVersion: attempt.rowVersion,
       currentOutcome: attempt.outcome,
       nextOutcome: 'FAILED',
       attemptStatus: 'FAILED',
@@ -573,6 +622,109 @@ function serializeEncryptedPayload(value: {
   readonly authTag: string
 }): string {
   return JSON.stringify(value)
+}
+
+function serializePreparedEffect(prepared: V2PreparedEffect): string {
+  return JSON.stringify({
+    ...prepared,
+    amountAtomic: prepared.amountAtomic.toString(),
+    ...(prepared.validityExpiresAt === undefined
+      ? {}
+      : { validityExpiresAt: prepared.validityExpiresAt.toISOString() }),
+    ...(prepared.validitySlot === undefined
+      ? {}
+      : { validitySlot: prepared.validitySlot.toString() }),
+  })
+}
+
+function restorePreparedEffect(
+  attempt: V2PaymentAttemptSnapshot,
+): V2PreparedEffect | undefined {
+  const serialized = attempt.preparedEffectJson
+  if (serialized === undefined || serialized === null) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(serialized) as unknown
+  } catch {
+    throw new InvalidStateError('Durable prepared effect metadata is invalid JSON')
+  }
+  if (!isRecord(parsed)) {
+    throw new InvalidStateError('Durable prepared effect metadata is incomplete')
+  }
+  const accountId = readRequiredString(parsed, 'accountId')
+  const paymentId = readRequiredString(parsed, 'paymentId')
+  const attemptId = readRequiredString(parsed, 'attemptId')
+  const effectHash = readRequiredString(parsed, 'effectHash')
+  const network = readRequiredString(parsed, 'network')
+  const assetReference = readRequiredString(parsed, 'assetReference')
+  const destination = readRequiredString(parsed, 'destination')
+  const feePayerIdentity = readRequiredString(parsed, 'feePayerIdentity')
+  const preparedPayload = readRequiredString(parsed, 'preparedPayload')
+  const routeId = readRequiredString(parsed, 'routeId')
+  const payloadHash = readRequiredString(parsed, 'payloadHash')
+  const amountAtomic = readRequiredString(parsed, 'amountAtomic')
+  const keyVersion = parsed.keyVersion
+  if (
+    !/^\d+$/u.test(amountAtomic) ||
+    typeof keyVersion !== 'number' ||
+    !Number.isInteger(keyVersion) ||
+    keyVersion <= 0
+  ) {
+    throw new InvalidStateError(
+      'Durable prepared effect amount or key version is invalid',
+    )
+  }
+  const validityExpiresAt = parseOptionalDate(parsed.validityExpiresAt)
+  const validitySlot = parseOptionalBigInt(parsed.validitySlot)
+  return {
+    accountId,
+    paymentId,
+    attemptId,
+    effectHash,
+    network,
+    assetReference,
+    destination,
+    amountAtomic: BigInt(amountAtomic),
+    feePayerIdentity,
+    keyVersion,
+    preparedPayload,
+    routeId,
+    payloadHash,
+    ...(validityExpiresAt === undefined ? {} : { validityExpiresAt }),
+    ...(validitySlot === undefined ? {} : { validitySlot }),
+  }
+}
+
+function readRequiredString(value: Record<string, unknown>, field: string): string {
+  const result = value[field]
+  if (typeof result !== 'string' || result.length === 0) {
+    throw new InvalidStateError('Durable prepared effect metadata is incomplete')
+  }
+  return result
+}
+
+function parseOptionalDate(value: unknown): Date | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string') {
+    throw new InvalidStateError('Durable prepared effect validity is invalid')
+  }
+  const result = new Date(value)
+  if (Number.isNaN(result.getTime())) {
+    throw new InvalidStateError('Durable prepared effect validity is invalid')
+  }
+  return result
+}
+
+function parseOptionalBigInt(value: unknown): bigint | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !/^\d+$/u.test(value)) {
+    throw new InvalidStateError('Durable prepared effect slot is invalid')
+  }
+  return BigInt(value)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function restoreSignedEffect(

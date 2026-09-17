@@ -116,6 +116,15 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     )
   }
   if (
+    runtimeRole === 'outgoing' &&
+    (result.data.CUSTODY_BACKEND_IDENTITY === undefined ||
+      result.data.CUSTODY_BACKEND_MODE === undefined)
+  ) {
+    throw new ConfigurationError(
+      'Outgoing runtime requires an explicit custody backend identity and mode',
+    )
+  }
+  if (
     result.data.NODE_ENV === 'production' &&
     (result.data.CUSTODY_BACKEND_IDENTITY === undefined ||
       result.data.CUSTODY_BACKEND_MODE !== 'EXTERNAL')

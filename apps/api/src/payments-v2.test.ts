@@ -103,6 +103,7 @@ function createHarness(destinationApproved: boolean) {
           recipientId: input.recipientId,
           recipientManagedAccountId: input.recipientManagedAccountId ?? null,
           kind: input.operation,
+          externalReference: input.externalReference ?? null,
           amountAtomic: input.amountAtomic,
           amountScale: input.amountScale,
           denominationId: input.denominationId,
@@ -116,6 +117,7 @@ function createHarness(destinationApproved: boolean) {
           routeId: input.route?.id ?? null,
           routeSelectionReason: input.routeSelectionReason,
           settlementAssetId: input.settlementAssetId,
+          destinationSnapshotJson: input.destinationSnapshotJson,
           policyDecisionId: input.policyDecision.id,
           approvalId: input.approval?.id ?? null,
           executionState:

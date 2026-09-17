@@ -9,24 +9,25 @@ import { promisify } from 'node:util'
 import { createDatabaseClient } from '@agent-payment/db'
 import {
   createSolanaIncomingReader,
-  createSolanaPaymentRail,
   createSolanaRail,
+  createSolanaV2OutgoingExecutor,
+  signSolanaV2PreparedEffect,
 } from '@agent-payment/solana-rail'
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
-import { DependencyUnavailableError, ExternalRailError } from '@agent-payment/core'
+import { DependencyUnavailableError } from '@agent-payment/core'
 
 import { buildApp } from './app.js'
 import { ConfigurationError, loadConfig, redactConfig } from './config.js'
 import { IncomingReconciliationService } from './incoming.js'
-import { OutgoingPaymentReconciliationService } from './outgoing.js'
 import { WebhookDeliveryWorker, type WebhookSigningKeyProvider } from './webhooks.js'
 import {
+  ConstrainedCustodyBoundary,
   fingerprintWalletMasterKey,
-  RecoveryEnvelopeCipher,
   validateLegacyWalletCustody,
   WalletSecretCipher,
 } from './custody.js'
-import { PaymentService } from './payments.js'
+import type { ConstrainedCustodyBackend } from './custody.js'
+import { V2OutgoingWorker } from './outgoing-v2.js'
 
 const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
 const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
@@ -172,7 +173,6 @@ async function startWorker(): Promise<void> {
     settlementMint: config.solanaSettlementMint,
   })
   const walletCipher = new WalletSecretCipher(config.walletMasterKey)
-  const recoveryCipher = new RecoveryEnvelopeCipher(config.recoveryEnvelopeKey)
   await database.initializeRuntimeIdentity(
     {
       rail: 'SOLANA_SPL',
@@ -190,32 +190,10 @@ async function startWorker(): Promise<void> {
     (custody) => validateLegacyWalletCustody(walletCipher, custody),
   )
 
-  const paymentRail =
-    config.runtimeRole === 'outgoing' ? createOutgoingPaymentRail(config) : undefined
-  const paymentService =
-    paymentRail === undefined
-      ? undefined
-      : new PaymentService(
-          database,
-          rail,
-          [paymentRail],
-          async (accountId) => {
-            const custody = await database.findAccountCustody(accountId)
-            if (custody === null) {
-              throw new ExternalRailError('Payer account custody is unavailable')
-            }
-            return walletCipher.decrypt({
-              ciphertext: custody.encryptedSolanaSecret,
-              nonce: custody.encryptionNonce,
-              authTag: custody.encryptionAuthTag,
-            })
-          },
-          undefined,
-          {
-            maxLamportsPerDay: SPONSORSHIP_MAX_LAMPORTS_PER_DAY,
-            maxTransactionsPerHour: SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR,
-          },
-        )
+  const v2OutgoingRuntime =
+    config.runtimeRole === 'outgoing'
+      ? createV2OutgoingWorker({ config, database, walletCipher })
+      : undefined
 
   const incomingReader =
     config.runtimeRole === 'incoming'
@@ -233,7 +211,9 @@ async function startWorker(): Promise<void> {
     role: config.runtimeRole,
     database,
     ...(incomingReader === undefined ? {} : { incomingReader }),
-    ...(paymentService === undefined ? {} : { paymentService }),
+    ...(v2OutgoingRuntime === undefined
+      ? {}
+      : { v2OutgoingWorker: v2OutgoingRuntime.worker }),
     ...(config.runtimeRole === 'webhook'
       ? {
           webhookSigningKeys: new EnvironmentWebhookSigningKeyProvider(
@@ -266,7 +246,7 @@ async function startWorker(): Promise<void> {
       checkReadiness: async () => {
         await database.checkReadiness()
         await rail.checkReadiness?.()
-        await paymentRail?.checkReadiness?.()
+        await v2OutgoingRuntime?.checkReadiness()
       },
     },
     domainHealthDependency: {
@@ -278,10 +258,6 @@ async function startWorker(): Promise<void> {
       }),
     },
   })
-  paymentService?.setEventSink({
-    info: (data, message) => app.log.info(data, message),
-  })
-
   const runWorker = (): void => {
     void worker.runOnce().catch((error: unknown) => {
       lastWorkerError = error instanceof Error ? error.name : 'UNKNOWN'
@@ -317,7 +293,7 @@ async function startWorker(): Promise<void> {
   try {
     await database.checkReadiness()
     await rail.checkReadiness?.()
-    await paymentRail?.checkReadiness?.()
+    await v2OutgoingRuntime?.checkReadiness()
     await app.listen({ host: '0.0.0.0', port: config.port })
     runWorker()
     timer = setInterval(runWorker, WORKER_INTERVAL_MS)
@@ -335,26 +311,11 @@ async function startWorker(): Promise<void> {
   }
 }
 
-function createOutgoingPaymentRail(config: ReturnType<typeof loadConfig>) {
-  if (config.solanaFeePayerSecret === undefined) {
-    throw new DependencyUnavailableError(
-      'SOLANA_FEE_PAYER_SECRET is required for the outgoing worker',
-    )
-  }
-  return createSolanaPaymentRail({
-    rpcUrl: config.solanaRpcUrl,
-    expectedCluster: config.solanaCluster,
-    allowMainnet: config.allowMainnet,
-    settlementMint: config.solanaSettlementMint,
-    feePayerSecret: config.solanaFeePayerSecret,
-  })
-}
-
 function createWorker(input: {
   readonly role: 'outgoing' | 'incoming' | 'webhook' | 'maintenance'
   readonly database: ReturnType<typeof createDatabaseClient>
   readonly incomingReader?: ReturnType<typeof createSolanaIncomingReader>
-  readonly paymentService?: PaymentService
+  readonly v2OutgoingWorker?: V2OutgoingWorker
   readonly webhookSigningKeys?: WebhookSigningKeyProvider
   readonly backupOutputDirectory?: string
   readonly backupAgeRecipient?: string
@@ -370,14 +331,10 @@ function createWorker(input: {
     })
   }
   if (input.role === 'outgoing') {
-    if (input.paymentService === undefined) {
-      throw new ConfigurationError('Outgoing worker payment service is unavailable')
+    if (input.v2OutgoingWorker === undefined) {
+      throw new ConfigurationError('V2 outgoing worker is unavailable')
     }
-    return new OutgoingPaymentReconciliationService(
-      input.database,
-      input.paymentService,
-      { info: () => undefined },
-    )
+    return input.v2OutgoingWorker
   }
   if (input.role === 'webhook') {
     if (input.webhookSigningKeys === undefined) {
@@ -399,6 +356,99 @@ function createWorker(input: {
     input.backupAgeIdentity,
     input.backupVerifyDatabaseUrl,
   )
+}
+
+function createV2OutgoingWorker(input: {
+  readonly config: ReturnType<typeof loadConfig>
+  readonly database: ReturnType<typeof createDatabaseClient>
+  readonly walletCipher: WalletSecretCipher
+}): {
+  readonly worker: V2OutgoingWorker
+  readonly checkReadiness: () => Promise<void>
+} {
+  const feePayerSecret = input.config.solanaFeePayerSecret
+  if (feePayerSecret === undefined) {
+    throw new ConfigurationError(
+      'SOLANA_FEE_PAYER_SECRET is required for the V2 outgoing worker',
+    )
+  }
+  const custodyMode = input.config.custodyBackendMode
+  if (custodyMode !== 'LOCAL_TEST') {
+    throw new DependencyUnavailableError(
+      'The selected external custody backend has no provider adapter configured for Solana V2',
+    )
+  }
+  const custodyIdentity = input.config.custodyBackendIdentity ?? 'local-test-custody'
+  const backend: ConstrainedCustodyBackend = {
+    identity: custodyIdentity,
+    mode: custodyMode,
+    signPaymentEffect: async (request) => {
+      const custody = await input.database.findAccountCustody(request.accountId)
+      if (custody === null) {
+        throw new DependencyUnavailableError('Payer account custody is unavailable')
+      }
+      const payerSecret = input.walletCipher.decrypt({
+        ciphertext: custody.encryptedSolanaSecret,
+        nonce: custody.encryptionNonce,
+        authTag: custody.encryptionAuthTag,
+      })
+      try {
+        return await signSolanaV2PreparedEffect({
+          request,
+          payerSecret,
+          feePayerSecret,
+        })
+      } finally {
+        payerSecret.fill(0)
+      }
+    },
+  }
+  const custodyBoundary = new ConstrainedCustodyBoundary(backend, input.config.nodeEnv)
+  const executor = createSolanaV2OutgoingExecutor({
+    rpc: createSolanaRpc(input.config.solanaRpcUrl as ClusterUrl),
+    settlementMint: input.config.solanaSettlementMint,
+    feePayerSecret,
+    getPayerPublicKey: (accountId) => input.database.findAccountPublicKey(accountId),
+    getDenomination: (denominationId) =>
+      input.database.v2.findDenomination(denominationId),
+    getSettlementAsset: (assetId) => input.database.v2.findSettlementAsset(assetId),
+    getEconomicMapping: (mappingId) => input.database.v2.findEconomicMapping(mappingId),
+    getSettlementRoute: (routeId) => input.database.v2.findSettlementRoute(routeId),
+    getActiveKeyVersion: async (accountId) =>
+      (await input.database.v2Admin.findActiveCustodyKeyVersion(accountId))
+        ?.keyVersion ?? null,
+    reserveSponsorship: (reservation) =>
+      input.database.reserveFeeSponsorship({
+        ...reservation,
+        maxLamportsPerDay: SPONSORSHIP_MAX_LAMPORTS_PER_DAY,
+        maxTransactionsPerHour: SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR,
+      }),
+    signPaymentEffect: (request) => custodyBoundary.signPaymentEffect(request),
+  })
+  const findAccountSummary = input.database.findAccountSummary
+  const worker = new V2OutgoingWorker({
+    repository: input.database.v2,
+    custody: input.database.v2Admin,
+    signedPayloadCipher: input.walletCipher,
+    executor,
+    serviceIdentity: custodyIdentity,
+    owner: `outgoing-v2-${process.pid}`,
+    accountStatusProvider: {
+      getStatus: async (accountId) => {
+        if (findAccountSummary === undefined) {
+          throw new DependencyUnavailableError(
+            'Account lifecycle provider is unavailable',
+          )
+        }
+        const account = await findAccountSummary(accountId)
+        if (account === null) {
+          throw new DependencyUnavailableError('Payer account lifecycle is unavailable')
+        }
+        return account.status
+      },
+    },
+  })
+  return { worker, checkReadiness: executor.checkReadiness }
 }
 
 await startWorker()
