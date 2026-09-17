@@ -1,0 +1,496 @@
+import { randomBytes } from 'node:crypto'
+import {
+  createDenomination,
+  createCredentialId,
+  DependencyUnavailableError,
+  exactMoneyFromAtomicUnits,
+  formatExactMoney,
+  InvalidStateError,
+  NotFoundError,
+  parseExactMoney,
+  ValidationError,
+  type AgentCredentialScope,
+  type AgentAccountLifecycleStatus,
+} from '@agent-payment/core'
+import type {
+  AuthenticatedAccount,
+  V2AdminRepository,
+  V2AccountRecord,
+  V2ApprovalAdminRecord,
+  V2DatabaseRepository,
+  V2HistoryRecord,
+  V2SpendPolicyAdminRecord,
+} from '@agent-payment/db'
+import { generateApiCredential } from './auth.js'
+import type { RecoveryEnvelopeCipher } from './custody.js'
+import type { V2SettledBalanceProvider } from './payments-v2.js'
+
+const RECOVERY_TTL_MS = 15 * 60 * 1000
+
+export interface V2ManagementServiceOptions {
+  readonly repository: V2AdminRepository
+  readonly financialRepository: V2DatabaseRepository
+  readonly settledBalanceProvider?: V2SettledBalanceProvider
+  readonly recoveryCipher?: RecoveryEnvelopeCipher
+  readonly now?: () => Date
+}
+
+export class V2ManagementService {
+  private readonly now: () => Date
+
+  public constructor(private readonly options: V2ManagementServiceOptions) {
+    this.now = options.now ?? (() => new Date())
+  }
+
+  public async getAccount(accountId: string) {
+    const account = await this.options.repository.findAccount(accountId)
+    if (account === null) throw new NotFoundError('Agent account was not found')
+    return {
+      id: account.id,
+      name: account.name,
+      status: account.status,
+      solana_public_key: account.solanaPublicKey,
+      workspace_id: account.workspaceId,
+      runtime_version: account.runtimeVersion,
+      provisioning_failure_code: account.provisioningFailureCode,
+      disabled_at: account.disabledAt?.toISOString() ?? null,
+      disabled_reason: account.disabledReason,
+      row_version: account.rowVersion,
+      created_at: account.createdAt.toISOString(),
+      updated_at: account.updatedAt.toISOString(),
+    }
+  }
+
+  public async transitionAccount(input: {
+    readonly accountId: string
+    readonly currentStatus: AgentAccountLifecycleStatus
+    readonly nextStatus: AgentAccountLifecycleStatus
+    readonly rowVersion: number
+    readonly reason?: string
+  }) {
+    const account = await this.options.repository.transitionAccount(input)
+    return {
+      id: account.id,
+      status: account.status,
+      row_version: account.rowVersion,
+      disabled_at: account.disabledAt?.toISOString() ?? null,
+      disabled_reason: account.disabledReason,
+      provisioning_failure_code: account.provisioningFailureCode,
+    }
+  }
+
+  public async listCredentials(accountId: string) {
+    await this.requireAccount(accountId)
+    const credentials = await this.options.repository.listCredentials(accountId)
+    return credentials.map((credential) => ({
+      id: credential.id,
+      account_id: credential.accountId,
+      status: credential.status,
+      scopes: [...credential.scopes],
+      expires_at: credential.expiresAt?.toISOString() ?? null,
+      rotated_from_id: credential.rotatedFromId,
+      row_version: credential.rowVersion,
+      created_at: credential.createdAt.toISOString(),
+      revoked_at: credential.revokedAt?.toISOString() ?? null,
+    }))
+  }
+
+  public async rotateCredential(
+    accountId: string,
+    oldCredentialId: string,
+    idempotencyKey: string,
+    scopes?: readonly string[],
+  ) {
+    if (this.options.recoveryCipher === undefined) {
+      throw new DependencyUnavailableError('Credential recovery is unavailable')
+    }
+    await this.requireAccount(accountId)
+    const credential = generateApiCredential()
+    const recovery = this.options.recoveryCipher.encrypt(
+      new TextEncoder().encode(credential.rawKey),
+    )
+    const stored = await this.options.repository.rotateCredential({
+        accountId,
+        oldCredentialId,
+        newCredentialId: createCredentialId(),
+        keyHash: credential.keyHash,
+        keyPrefix: credential.keyPrefix,
+        scopes: scopes ?? ['payments:create', 'payments:read'],
+        recoveryCiphertext: recovery.ciphertext,
+        recoveryNonce: recovery.nonce,
+        recoveryAuthTag: recovery.authTag,
+        recoveryIdempotencyKey: `CREDENTIAL_ROTATION:${accountId}:${idempotencyKey}`,
+        recoveryExpiresAt: new Date(this.now().getTime() + RECOVERY_TTL_MS),
+      })
+    return {
+      credential_id: stored.id,
+      account_id: stored.accountId,
+      api_key: credential.rawKey,
+      key_prefix: credential.keyPrefix,
+      scopes: [...stored.scopes],
+      expires_at: stored.expiresAt?.toISOString() ?? null,
+    }
+  }
+
+  public async revokeCredential(accountId: string, credentialId: string): Promise<void> {
+    await this.options.repository.revokeCredential(accountId, credentialId)
+  }
+
+  public async listPolicies(accountId: string) {
+    await this.requireAccount(accountId)
+    return Promise.all(
+      (await this.options.repository.listSpendPolicies(accountId)).map((policy) =>
+        this.serializePolicy(policy),
+      ),
+    )
+  }
+
+  public async createPolicy(input: {
+    readonly accountId: string
+    readonly denominationId: string
+    readonly maxPerPayment?: string | null
+    readonly rollingBudget?: string | null
+    readonly rollingWindowSeconds?: number | null
+    readonly transactionCountCap?: number | null
+    readonly approvalThreshold?: string | null
+    readonly rollingBudgetEscalatable?: boolean
+    readonly transactionCountEscalatable?: boolean
+  }) {
+    const denomination = await this.loadDenomination(input.denominationId)
+    const parseOptional = (value: string | null | undefined) =>
+      value === undefined || value === null
+        ? null
+        : parseExactMoney(value, denomination).atomicUnits
+    const policy = await this.options.repository.createSpendPolicy({
+      id: createId('policy'),
+      accountId: input.accountId,
+      denominationId: denomination.id,
+      maxPerPaymentAtomic: parseOptional(input.maxPerPayment),
+      rollingBudgetAtomic: parseOptional(input.rollingBudget),
+      rollingWindowSeconds: input.rollingWindowSeconds ?? null,
+      transactionCountCap: input.transactionCountCap ?? null,
+      approvalThresholdAtomic: parseOptional(input.approvalThreshold),
+      rollingBudgetEscalatable: input.rollingBudgetEscalatable ?? false,
+      transactionCountEscalatable: input.transactionCountEscalatable ?? false,
+      rulesJson: '{}',
+    })
+    return this.serializePolicy(policy)
+  }
+
+  public async activatePolicy(accountId: string, policyId: string, version?: number) {
+    return this.serializePolicy(
+      await this.options.repository.activateSpendPolicy(accountId, policyId, version),
+    )
+  }
+
+  public async listApprovals(accountId: string) {
+    await this.requireAccount(accountId)
+    return (await this.options.repository.listApprovals(accountId)).map(
+      serializeApproval,
+    )
+  }
+
+  public async decideApproval(input: {
+    readonly accountId: string
+    readonly approvalId: string
+    readonly action: 'APPROVE' | 'REJECT' | 'EXPIRE'
+    readonly actorId: string
+    readonly comment?: string
+    readonly rowVersion: number
+  }) {
+    const approval = await this.findApproval(input.accountId, input.approvalId)
+    let settledAtomic: bigint | undefined
+    if (input.action === 'APPROVE') {
+      if (this.options.settledBalanceProvider === undefined) {
+        throw new DependencyUnavailableError('Settlement balance provider is unavailable')
+      }
+      const view = await this.options.financialRepository.findPaymentView(
+        input.accountId,
+        approval.paymentId,
+      )
+      if (view === null || view.payment.denominationId === null) {
+        throw new InvalidStateError('Approval payment is missing its denomination')
+      }
+      const denomination = await this.loadDenomination(view.payment.denominationId)
+      const account = await this.requireAccount(input.accountId)
+      settledAtomic = await this.options.settledBalanceProvider.getSettledAtomic({
+        account: toAuthenticatedAccount(account),
+        denomination,
+      })
+    }
+    return serializeApproval(
+      await this.options.repository.decideApproval({
+        ...input,
+        ...(settledAtomic === undefined ? {} : { settledAtomic }),
+        now: this.now(),
+      }),
+    )
+  }
+
+  public async listApprovedDestinations(accountId: string) {
+    await this.requireAccount(accountId)
+    return this.options.repository.listApprovedDestinations(accountId)
+  }
+
+  public async createApprovedDestination(input: {
+    readonly accountId: string
+    readonly fingerprint: string
+    readonly rail: string
+    readonly network: string
+    readonly assetReference: string
+    readonly destination: string
+    readonly actorId: string
+    readonly reason?: string
+  }) {
+    return this.options.repository.createApprovedDestination({
+      id: createId('approved'),
+      ...input,
+    })
+  }
+
+  public async revokeApprovedDestination(input: {
+    readonly accountId: string
+    readonly id: string
+    readonly actorId: string
+    readonly reason: string
+  }): Promise<void> {
+    await this.options.repository.revokeApprovedDestination(input)
+  }
+
+  public async archiveRecipient(input: {
+    readonly ownerAccountId: string
+    readonly recipientId: string
+    readonly rowVersion: number
+  }): Promise<void> {
+    await this.options.financialRepository.archiveRecipient(input)
+  }
+
+  public async getFundingDestination(accountId: string, routeId?: string) {
+    const destination = await this.options.repository.findFundingDestination(
+      accountId,
+      routeId,
+    )
+    if (destination === null) throw new NotFoundError('Funding destination is unavailable')
+    return {
+      id: destination.id,
+      account_id: destination.accountId,
+      route_id: destination.routeId,
+      network: destination.network,
+      asset_id: destination.assetId,
+      destination: destination.destination,
+      readiness: destination.readiness,
+      sender_constraints: parseJsonObject(destination.senderConstraintsJson),
+      last_validated_at: destination.lastValidatedAt?.toISOString() ?? null,
+      last_failure_code: destination.lastFailureCode,
+    }
+  }
+
+  public async getBalance(accountId: string, denominationId: string) {
+    if (this.options.settledBalanceProvider === undefined) {
+      throw new DependencyUnavailableError('Settlement balance provider is unavailable')
+    }
+    const account = await this.requireAccount(accountId)
+    if (account.status !== 'ACTIVE') {
+      throw new InvalidStateError('Account is not active')
+    }
+    const denomination = await this.loadDenomination(denominationId)
+    const context = await this.options.financialRepository.getSpendContext(
+      accountId,
+      denominationId,
+      this.now(),
+    )
+    const settledAtomic = await this.options.settledBalanceProvider.getSettledAtomic({
+      account: toAuthenticatedAccount(account),
+      denomination,
+    })
+    if (settledAtomic < 0n) throw new InvalidStateError('Settlement balance cannot be negative')
+    const reservedAtomic = context.heldReservationAtomic
+    const spendableAtomic = settledAtomic > reservedAtomic ? settledAtomic - reservedAtomic : 0n
+    return {
+      account_id: accountId,
+      denomination_id: denominationId,
+      settled: formatExactMoney(exactMoneyFromAtomicUnits(settledAtomic, denomination)),
+      reserved: formatExactMoney(exactMoneyFromAtomicUnits(reservedAtomic, denomination)),
+      spendable: formatExactMoney(exactMoneyFromAtomicUnits(spendableAtomic, denomination)),
+      observed_at: this.now().toISOString(),
+      degraded: false,
+    }
+  }
+
+  public async listHistory(
+    accountId: string,
+    input: { readonly limit?: number; readonly cursor?: string } = {},
+  ) {
+    const limit = input.limit ?? 50
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new ValidationError('History limit must be an integer from 1 to 100')
+    }
+    const cursor = decodeCursor(input.cursor)
+    const records = await this.options.repository.listHistory({
+      accountId,
+      limit: limit + 1,
+      ...(cursor === undefined ? {} : { cursor }),
+    })
+    const visible = records.slice(0, limit)
+    return {
+      items: await Promise.all(visible.map((record) => this.serializeHistory(record))),
+      next_cursor:
+        records.length > limit && visible.at(-1) !== undefined
+          ? encodeCursor(visible.at(-1)!.occurredAt, visible.at(-1)!.id)
+          : null,
+    }
+  }
+
+  private async serializeHistory(record: V2HistoryRecord) {
+    const denomination =
+      record.denominationId === null
+        ? null
+        : await this.loadDenomination(record.denominationId)
+    return {
+      id: record.id,
+      direction: record.direction,
+      kind: record.kind,
+      status: record.status,
+      amount:
+        denomination === null
+          ? record.amountAtomic.toString()
+          : formatExactMoney(exactMoneyFromAtomicUnits(record.amountAtomic, denomination)),
+      denomination_id: record.denominationId,
+      currency: record.currency,
+      recipient_id: record.recipientId,
+      external_id: record.externalId,
+      occurred_at: record.occurredAt.toISOString(),
+    }
+  }
+
+  private async serializePolicy(policy: V2SpendPolicyAdminRecord) {
+    const denomination = await this.loadDenomination(policy.denominationId)
+    const format = (value: bigint | null) =>
+      value === null
+        ? null
+        : formatExactMoney(exactMoneyFromAtomicUnits(value, denomination))
+    return {
+      id: policy.id,
+      account_id: policy.accountId,
+      version: policy.version,
+      status: policy.status,
+      denomination_id: policy.denominationId,
+      max_per_payment: format(policy.maxPerPaymentAtomic),
+      rolling_budget: format(policy.rollingBudgetAtomic),
+      rolling_window_seconds: policy.rollingWindowSeconds,
+      transaction_count_cap: policy.transactionCountCap,
+      approval_threshold: format(policy.approvalThresholdAtomic),
+      rolling_budget_escalatable: policy.rollingBudgetEscalatable,
+      transaction_count_escalatable: policy.transactionCountEscalatable,
+      created_at: policy.createdAt.toISOString(),
+      activated_at: policy.activatedAt?.toISOString() ?? null,
+      retired_at: policy.retiredAt?.toISOString() ?? null,
+    }
+  }
+
+  private async loadDenomination(id: string) {
+    const record = await this.options.financialRepository.findDenomination(id)
+    if (record === null) throw new NotFoundError('Denomination was not found')
+    return createDenomination({
+      id: record.id,
+      symbol: record.symbol,
+      maxScale: record.maxScale,
+      status: record.status as 'ACTIVE' | 'RETIRED',
+      version: record.version,
+    })
+  }
+
+  private async requireAccount(accountId: string) {
+    const account = await this.options.repository.findAccount(accountId)
+    if (account === null) throw new NotFoundError('Agent account was not found')
+    return account
+  }
+
+  private async findApproval(accountId: string, approvalId: string): Promise<V2ApprovalAdminRecord> {
+    const approval = (await this.options.repository.listApprovals(accountId)).find(
+      (candidate) => candidate.id === approvalId,
+    )
+    if (approval === undefined) throw new NotFoundError('Approval was not found')
+    return approval
+  }
+}
+
+function serializeApproval(approval: V2ApprovalAdminRecord) {
+  return {
+    id: approval.id,
+    payment_id: approval.paymentId,
+    account_id: approval.accountId,
+    status: approval.status,
+    expires_at: approval.expiresAt.toISOString(),
+    actor_id: approval.actorId,
+    comment: approval.comment,
+    row_version: approval.rowVersion,
+    created_at: approval.createdAt.toISOString(),
+    decided_at: approval.decidedAt?.toISOString() ?? null,
+  }
+}
+
+function toAuthenticatedAccount(account: V2AccountRecord): AuthenticatedAccount {
+  return {
+    account: {
+      id: account.id,
+      name: account.name,
+      status: account.status,
+      solanaPublicKey: account.solanaPublicKey,
+    },
+    credential: {
+      id: 'operator',
+      accountId: account.id,
+      keyHash: 'operator',
+      keyPrefix: 'operator',
+      status: 'ACTIVE',
+      scopes: [] as readonly AgentCredentialScope[],
+      expiresAt: null,
+      revokedAt: null,
+      lastUsedAt: null,
+    },
+  }
+}
+
+function parseJsonObject(value: string): Readonly<Record<string, unknown>> {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('not an object')
+    }
+    return parsed as Readonly<Record<string, unknown>>
+  } catch {
+    throw new InvalidStateError('Funding destination metadata is corrupt')
+  }
+}
+
+function createId(prefix: string): string {
+  return `${prefix}_${randomBytes(16).toString('hex')}`
+}
+
+function encodeCursor(occurredAt: Date, id: string): string {
+  return Buffer.from(
+    JSON.stringify({ occurred_at: occurredAt.toISOString(), id }),
+    'utf8',
+  ).toString('base64url')
+}
+
+function decodeCursor(value: string | undefined):
+  | { readonly occurredAt: Date; readonly id: string }
+  | undefined {
+  if (value === undefined) return undefined
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as {
+      occurred_at?: unknown
+      id?: unknown
+    }
+    if (typeof parsed.occurred_at !== 'string' || typeof parsed.id !== 'string') {
+      throw new Error('invalid cursor')
+    }
+    const occurredAt = new Date(parsed.occurred_at)
+    if (Number.isNaN(occurredAt.getTime())) throw new Error('invalid cursor')
+    return { occurredAt, id: parsed.id }
+  } catch {
+    throw new ValidationError('History cursor is invalid')
+  }
+}

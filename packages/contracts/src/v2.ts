@@ -132,6 +132,92 @@ export const v2AccountResponseSchema = z
   })
   .strict()
 
+export const v2CredentialResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    account_id: z.string().min(1),
+    status: z.enum(['ACTIVE', 'EXPIRED', 'REVOKED', 'ROTATING']),
+    scopes: z.array(z.string()),
+    expires_at: z.string().nullable(),
+    rotated_from_id: z.string().nullable(),
+    row_version: z.number().int().positive(),
+    created_at: z.string().min(1),
+    revoked_at: z.string().nullable(),
+  })
+  .strict()
+
+export const v2PolicyResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    account_id: z.string().min(1),
+    version: z.number().int().positive(),
+    status: z.enum(['DRAFT', 'ACTIVE', 'RETIRED']),
+    denomination_id: z.string().min(1),
+    max_per_payment: exactAmountSchema.nullable(),
+    rolling_budget: exactAmountSchema.nullable(),
+    rolling_window_seconds: z.number().int().positive().nullable(),
+    transaction_count_cap: z.number().int().positive().nullable(),
+    approval_threshold: exactAmountSchema.nullable(),
+    rolling_budget_escalatable: z.boolean(),
+    transaction_count_escalatable: z.boolean(),
+    created_at: z.string().min(1),
+    activated_at: z.string().nullable(),
+    retired_at: z.string().nullable(),
+  })
+  .strict()
+
+export const v2ApprovalResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    payment_id: z.string().min(1),
+    account_id: z.string().min(1),
+    status: z.enum(['PENDING', 'APPROVED', 'REJECTED', 'EXPIRED']),
+    expires_at: z.string().min(1),
+    actor_id: z.string().nullable(),
+    comment: z.string().nullable(),
+    row_version: z.number().int().positive(),
+    created_at: z.string().min(1),
+    decided_at: z.string().nullable(),
+  })
+  .strict()
+
+export const v2FundingDestinationResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    account_id: z.string().min(1),
+    route_id: z.string().min(1),
+    network: z.string().min(1),
+    asset_id: z.string().min(1),
+    destination: z.string().min(1),
+    readiness: z.enum(['READY', 'PENDING', 'DEGRADED', 'UNAVAILABLE']),
+    sender_constraints: z.record(z.string(), z.unknown()),
+    last_validated_at: z.string().nullable(),
+    last_failure_code: z.string().nullable(),
+  })
+  .strict()
+
+export const v2HistoryItemSchema = z
+  .object({
+    id: z.string().min(1),
+    direction: z.enum(['INCOMING', 'OUTGOING']),
+    kind: z.string().min(1),
+    status: z.string().min(1),
+    amount: z.string().min(1),
+    denomination_id: z.string().nullable(),
+    currency: z.string().min(1),
+    recipient_id: z.string().nullable(),
+    external_id: z.string().nullable(),
+    occurred_at: z.string().min(1),
+  })
+  .strict()
+
+export const v2HistoryResponseSchema = z
+  .object({
+    items: z.array(v2HistoryItemSchema),
+    next_cursor: z.string().nullable(),
+  })
+  .strict()
+
 export type V2PaymentStatus = z.infer<typeof v2PaymentStatusSchema>
 export type V2ErrorCode = z.infer<typeof v2ErrorCodeSchema>
 export type V2ErrorEnvelope = z.infer<typeof v2ErrorEnvelopeSchema>
@@ -140,3 +226,9 @@ export type V2PaymentResponse = z.infer<typeof v2PaymentResponseSchema>
 export type V2BalanceResponse = z.infer<typeof v2BalanceResponseSchema>
 export type V2PaymentListResponse = z.infer<typeof v2PaymentListResponseSchema>
 export type V2AccountResponse = z.infer<typeof v2AccountResponseSchema>
+export type V2CredentialResponse = z.infer<typeof v2CredentialResponseSchema>
+export type V2PolicyResponse = z.infer<typeof v2PolicyResponseSchema>
+export type V2ApprovalResponse = z.infer<typeof v2ApprovalResponseSchema>
+export type V2FundingDestinationResponse = z.infer<typeof v2FundingDestinationResponseSchema>
+export type V2HistoryItem = z.infer<typeof v2HistoryItemSchema>
+export type V2HistoryResponse = z.infer<typeof v2HistoryResponseSchema>

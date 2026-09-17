@@ -10,6 +10,8 @@ const validEnvironment = {
   SOLANA_SETTLEMENT_MINT: 'local-mint',
   SOLANA_FEE_PAYER_SECRET: 'fee-payer-secret',
   WALLET_MASTER_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  RECOVERY_ENVELOPE_KEY:
+    'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
 }
 
 describe('configuration', () => {
@@ -53,6 +55,8 @@ describe('configuration', () => {
       SOLANA_FEE_PAYER_SECRET: 'fee-payer-sentinel-secret',
       WALLET_MASTER_KEY:
         'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      RECOVERY_ENVELOPE_KEY:
+        'feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface',
     })
     const serialized = JSON.stringify(redactConfig(config))
 

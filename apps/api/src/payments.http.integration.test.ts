@@ -25,6 +25,7 @@ const testConfig: AppConfig = {
   solanaSettlementMint: 'test-mint',
   solanaFeePayerSecret: 'test-fee-payer-secret',
   walletMasterKey: masterKey,
+  recoveryEnvelopeKey: masterKey,
   allowMainnet: false,
 }
 

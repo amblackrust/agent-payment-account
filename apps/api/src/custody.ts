@@ -79,6 +79,12 @@ export class WalletSecretCipher {
   }
 }
 
+/**
+ * Recovery envelopes use a separately configured key so API credential
+ * recovery is not coupled to wallet custody key rotation.
+ */
+export class RecoveryEnvelopeCipher extends WalletSecretCipher {}
+
 export function fingerprintWalletMasterKey(masterKey: string): string {
   const key = decodeMasterKey(masterKey)
   try {

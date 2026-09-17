@@ -17,6 +17,7 @@ const projectVariableNames = [
   'SOLANA_SETTLEMENT_MINT',
   'SOLANA_FEE_PAYER_SECRET',
   'WALLET_MASTER_KEY',
+  'RECOVERY_ENVELOPE_KEY',
   'ALLOW_MAINNET',
 ]
 const launcherArgs = process.argv.slice(2)

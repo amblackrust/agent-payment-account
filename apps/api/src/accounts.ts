@@ -6,9 +6,10 @@ import {
   createReceiveId,
 } from '@agent-payment/core'
 import type { AccountRepository, ReceiveRepository } from '@agent-payment/db'
+import type { V2AdminRepository } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 import { generateApiCredential } from './auth.js'
-import type { WalletSecretCipher } from './custody.js'
+import type { RecoveryEnvelopeCipher, WalletSecretCipher } from './custody.js'
 import { generateManagedWallet } from '@agent-payment/solana-rail'
 
 export interface CreatedAccountResponse {
@@ -26,6 +27,8 @@ export class AccountService {
     private readonly repository: AccountRepository & ReceiveRepository,
     private readonly cipher: WalletSecretCipher,
     private readonly rail: SolanaRail,
+    private readonly v2Admin?: V2AdminRepository,
+    private readonly recoveryCipher?: RecoveryEnvelopeCipher,
   ) {}
 
   public async createAccount(name: string): Promise<CreatedAccountResponse> {
@@ -85,6 +88,105 @@ export class AccountService {
       scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
     })
     return { ...stored, apiKey: credential.rawKey }
+  }
+
+  public async createAccountV2(
+    name: string,
+    idempotencyKey: string,
+    now = new Date(),
+  ): Promise<CreatedAccountResponse> {
+    if (this.v2Admin === undefined || this.recoveryCipher === undefined) {
+      throw new Error('V2 account provisioning is unavailable')
+    }
+    const normalizedName = name.trim()
+    if (normalizedName.length === 0 || normalizedName.length > 120) {
+      throw new ValidationError('Account name must contain 1 to 120 characters')
+    }
+    const replay = await this.v2Admin.findProvisioningReplay(idempotencyKey)
+    if (replay !== null) {
+      const envelope = await this.v2Admin.consumeRecoveryEnvelope(
+        replay.accountId,
+        idempotencyKey,
+        now,
+      )
+      if (envelope === null) {
+        throw new ValidationError('Credential recovery window has expired')
+      }
+      const apiKey = decodeOneTimeSecret(
+        this.recoveryCipher.decrypt(envelope),
+      )
+      const account = await this.v2Admin.findAccount(replay.accountId)
+      if (account === null) throw new Error('Provisioned account is unavailable')
+      const requests = await this.repository.listReceiveRequests(account.id)
+      const receiveRequest = requests.find(
+        (request) => request.reference === `account:${account.id}`,
+      )
+      if (receiveRequest === undefined) {
+        throw new Error('Provisioned receive request is unavailable')
+      }
+      return {
+        id: account.id,
+        name: account.name,
+        status: 'ACTIVE',
+        apiKey,
+        credentialId: replay.credentialId,
+        receiveId: receiveRequest.id,
+        destination: await this.rail.getReceiveDestination(account.solanaPublicKey),
+      }
+    }
+
+    const wallet = await generateManagedWallet()
+    try {
+      const encryptedSecret = this.cipher.encrypt(wallet.secretKey)
+      const destination = await this.rail.getReceiveDestination(wallet.publicKey)
+      const credential = generateApiCredential()
+      const credentialId = createCredentialId()
+      const recovery = this.recoveryCipher.encrypt(
+        new TextEncoder().encode(credential.rawKey),
+      )
+      const accountId = createAccountId()
+      const receiveId = createReceiveId()
+      await this.v2Admin.provisionAccount({
+        idempotencyKey,
+        accountId,
+        name: normalizedName,
+        solanaPublicKey: wallet.publicKey,
+        encryptedSolanaSecret: encryptedSecret.ciphertext,
+        encryptionNonce: encryptedSecret.nonce,
+        encryptionAuthTag: encryptedSecret.authTag,
+        credentialId,
+        keyHash: credential.keyHash,
+        keyPrefix: credential.keyPrefix,
+        scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
+        recoveryCiphertext: recovery.ciphertext,
+        recoveryNonce: recovery.nonce,
+        recoveryAuthTag: recovery.authTag,
+        recoveryExpiresAt: new Date(now.getTime() + 15 * 60 * 1000),
+        receiveRequestId: receiveId,
+        receiveReference: `account:${accountId}`,
+      })
+      return {
+        id: accountId,
+        name: normalizedName,
+        status: 'ACTIVE',
+        apiKey: credential.rawKey,
+        credentialId,
+        receiveId,
+        destination,
+      }
+    } finally {
+      wallet.secretKey.fill(0)
+    }
+  }
+}
+
+function decodeOneTimeSecret(secret: Uint8Array): string {
+  try {
+    const value = new TextDecoder().decode(secret)
+    if (value.length === 0) throw new Error('empty secret')
+    return value
+  } finally {
+    secret.fill(0)
   }
 }
 

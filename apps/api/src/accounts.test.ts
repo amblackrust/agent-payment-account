@@ -20,6 +20,7 @@ const config: AppConfig = {
   solanaSettlementMint: 'settlement-mint',
   solanaFeePayerSecret: 'fee-payer-test-secret',
   walletMasterKey: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  recoveryEnvelopeKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
   allowMainnet: false,
 }
 

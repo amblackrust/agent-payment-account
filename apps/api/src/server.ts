@@ -15,15 +15,18 @@ import { loadConfig, redactConfig } from './config.js'
 import {
   fingerprintWalletMasterKey,
   validateLegacyWalletCustody,
+  RecoveryEnvelopeCipher,
   WalletSecretCipher,
 } from './custody.js'
 import { PaymentService } from './payments.js'
 import { RecipientService } from './recipients.js'
 import { ReceiveService } from './receives.js'
+import { V2ReceiveService } from './receives.js'
 import { IncomingReconciliationService } from './incoming.js'
 import { OutgoingPaymentReconciliationService } from './outgoing.js'
 import { TransactionService } from './transactions.js'
 import { V2PaymentService } from './payments-v2.js'
+import { V2ManagementService } from './v2-management.js'
 
 const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
 const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
@@ -38,6 +41,7 @@ async function startServer(): Promise<void> {
     settlementMint: config.solanaSettlementMint,
   })
   const walletCipher = new WalletSecretCipher(config.walletMasterKey)
+  const recoveryCipher = new RecoveryEnvelopeCipher(config.recoveryEnvelopeKey)
   await database.initializeRuntimeIdentity(
     {
       rail: 'SOLANA_SPL',
@@ -48,9 +52,16 @@ async function startServer(): Promise<void> {
     },
     (custody) => validateLegacyWalletCustody(walletCipher, custody),
   )
-  const accountService = new AccountService(database, walletCipher, rail)
+  const accountService = new AccountService(
+    database,
+    walletCipher,
+    rail,
+    database.v2Admin,
+    recoveryCipher,
+  )
   const recipientService = new RecipientService(database)
   const receiveService = new ReceiveService(database, rail)
+  const v2ReceiveService = new V2ReceiveService(database, database.v2, database.v2Admin, rail)
   const payerSecretKeyProvider = async (accountId: string): Promise<Uint8Array> => {
     const custody = await database.findAccountCustody(accountId)
     if (custody === null) {
@@ -97,6 +108,22 @@ async function startServer(): Promise<void> {
       },
     },
   })
+  const v2ManagementService = new V2ManagementService({
+    repository: database.v2Admin,
+    financialRepository: database.v2,
+    settledBalanceProvider: {
+      getSettledAtomic: async ({ account, denomination }) => {
+        if (denomination.symbol !== 'USD' || denomination.maxScale !== 2) {
+          throw new ExternalRailError(
+            'The configured Solana balance provider cannot represent this denomination exactly',
+          )
+        }
+        const balance = await rail.getSettlementBalance(account.account.solanaPublicKey)
+        return balance.settled.atomicUnits
+      },
+    },
+    recoveryCipher,
+  })
   const incomingReader = createSolanaIncomingReader({
     rpc: createSolanaRpc(config.solanaRpcUrl as ClusterUrl),
     readRail: rail,
@@ -122,8 +149,10 @@ async function startServer(): Promise<void> {
     paymentService,
     reservationRepository: database,
     receiveService,
+    v2ReceiveService,
     transactionService,
     v2PaymentService,
+    v2ManagementService,
   })
   paymentService.setEventSink({
     info: (data, message) => app.log.info(data, message),

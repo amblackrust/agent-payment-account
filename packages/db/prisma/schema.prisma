@@ -101,6 +101,7 @@ model AgentAccount {
   feeSponsorships         FeeSponsorship[]
   indexerCheckpoints      IndexerCheckpoint[]
   incomingIssues          IncomingReconciliationIssue[]
+  recoveryEnvelopes       CredentialRecoveryEnvelope[]
 
   @@index([workspaceId])
   @@map("agent_accounts")
@@ -123,6 +124,22 @@ model ApiCredential {
 
   @@index([accountId])
   @@map("api_credentials")
+}
+
+model CredentialRecoveryEnvelope {
+  idempotencyKey String       @id @map("idempotency_key") @db.VarChar(255)
+  accountId      String       @map("account_id") @db.VarChar(64)
+  credentialId   String       @map("credential_id") @db.VarChar(64)
+  ciphertext     String       @db.Text
+  nonce          String       @db.VarChar(64)
+  authTag        String       @map("auth_tag") @db.VarChar(64)
+  expiresAt      DateTime     @map("expires_at")
+  acknowledgedAt DateTime?    @map("acknowledged_at")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  account        AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@index([accountId, expiresAt])
+  @@map("credential_recovery_envelopes")
 }
 
 model Recipient {
@@ -220,6 +237,8 @@ model ReceiveRequest {
   id                       String               @id @db.VarChar(64)
   accountId                String               @map("account_id") @db.VarChar(64)
   amountAtomic             BigInt?              @map("amount_atomic")
+  denominationId           String?              @map("denomination_id") @db.VarChar(64)
+  amountScale              Int?                 @map("amount_scale")
   currency                 String               @db.VarChar(3)
   reference                String               @db.VarChar(255)
   status                   ReceiveRequestStatus @default(OPEN)

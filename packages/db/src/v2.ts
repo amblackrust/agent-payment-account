@@ -191,6 +191,7 @@ export interface V2DatabaseRepository {
     accountId: string,
     denominationId: string,
     now: Date,
+    rollingWindowSeconds?: number | null,
   ): Promise<V2SpendContext>
   findApprovedDestination(
     accountId: string,
@@ -368,8 +369,11 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
       })
     },
 
-    async getSpendContext(accountId, denominationId, now) {
-      const windowStart = new Date(now.getTime() - 86_400_000)
+    async getSpendContext(accountId, denominationId, now, rollingWindowSeconds) {
+      const windowStart =
+        rollingWindowSeconds === null || rollingWindowSeconds === undefined
+          ? new Date(0)
+          : new Date(now.getTime() - rollingWindowSeconds * 1000)
       const [confirmed, held, unresolved, transactionCount] = await Promise.all([
         prisma.payment.aggregate({
           where: { payerAccountId: accountId, denominationId, status: 'CONFIRMED' },

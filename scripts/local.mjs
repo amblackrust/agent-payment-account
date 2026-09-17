@@ -44,6 +44,7 @@ const placeholderValues = new Set([
   'replace-with-local-token-mint',
   'replace-with-64-byte-fee-payer-secret',
   'replace-with-32-byte-hex-master-key',
+  'replace-with-32-byte-hex-recovery-key',
 ])
 
 class LocalSetupError extends Error {
@@ -312,6 +313,16 @@ function writeLocalEnvironment(existing, generated) {
       'WALLET_MASTER_KEY in .env must be 64 hexadecimal characters.',
     )
   }
+  const recoveryEnvelopeKey = isMissingOrPlaceholder(
+    existing.values.RECOVERY_ENVELOPE_KEY,
+  )
+    ? randomBytes(32).toString('hex')
+    : existing.values.RECOVERY_ENVELOPE_KEY
+  if (!/^[0-9a-fA-F]{64}$/.test(recoveryEnvelopeKey)) {
+    throw new LocalSetupError(
+      'RECOVERY_ENVELOPE_KEY in .env must be 64 hexadecimal characters.',
+    )
+  }
 
   const values = {
     ...localEnvironmentDefaults,
@@ -319,6 +330,7 @@ function writeLocalEnvironment(existing, generated) {
     SOLANA_SETTLEMENT_MINT: generated.mintAddress,
     SOLANA_FEE_PAYER_SECRET: generated.feePayerSecret,
     WALLET_MASTER_KEY: walletMasterKey,
+    RECOVERY_ENVELOPE_KEY: recoveryEnvelopeKey,
   }
   let content = existing.content
   if (content === '') {

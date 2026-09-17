@@ -17,6 +17,12 @@ const configSchema = z.object({
       /^[0-9a-fA-F]{64}$/,
       'WALLET_MASTER_KEY must be 32 bytes encoded as 64 hexadecimal characters',
     ),
+  RECOVERY_ENVELOPE_KEY: z
+    .string()
+    .regex(
+      /^[0-9a-fA-F]{64}$/,
+      'RECOVERY_ENVELOPE_KEY must be 32 bytes encoded as 64 hexadecimal characters',
+    ),
   ALLOW_MAINNET: z.preprocess((value: unknown) => {
     if (value === undefined) {
       return false
@@ -41,6 +47,7 @@ export type AppConfig = {
   readonly solanaSettlementMint: string
   readonly solanaFeePayerSecret: string
   readonly walletMasterKey: string
+  readonly recoveryEnvelopeKey: string
   readonly allowMainnet: boolean
 }
 
@@ -78,6 +85,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     solanaSettlementMint: result.data.SOLANA_SETTLEMENT_MINT,
     solanaFeePayerSecret: result.data.SOLANA_FEE_PAYER_SECRET,
     walletMasterKey: result.data.WALLET_MASTER_KEY,
+    recoveryEnvelopeKey: result.data.RECOVERY_ENVELOPE_KEY,
     allowMainnet: result.data.ALLOW_MAINNET,
   }
 }
@@ -91,6 +99,7 @@ export interface RedactedConfig {
   readonly hasAdminApiKey: boolean
   readonly hasSolanaFeePayerSecret: boolean
   readonly hasWalletMasterKey: boolean
+  readonly hasRecoveryEnvelopeKey: boolean
 }
 
 export function redactConfig(config: AppConfig): RedactedConfig {
@@ -103,5 +112,6 @@ export function redactConfig(config: AppConfig): RedactedConfig {
     hasAdminApiKey: config.adminApiKey.length > 0,
     hasSolanaFeePayerSecret: config.solanaFeePayerSecret.length > 0,
     hasWalletMasterKey: config.walletMasterKey.length > 0,
+    hasRecoveryEnvelopeKey: config.recoveryEnvelopeKey.length > 0,
   }
 }

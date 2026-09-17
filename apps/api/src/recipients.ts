@@ -28,6 +28,7 @@ export interface UpdateRecipientRequest {
     readonly walletAddress: string
   }
   readonly managedAccountId?: string | null
+  readonly rowVersion?: number
 }
 
 export class RecipientService {
@@ -160,6 +161,7 @@ export class RecipientService {
                 ? null
                 : validateText(input.managedAccountId, 'Managed account id', 64),
           }),
+      ...(input.rowVersion === undefined ? {} : { rowVersion: input.rowVersion }),
     }
     if (
       input.destination?.type !== undefined &&

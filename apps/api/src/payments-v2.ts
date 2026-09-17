@@ -139,11 +139,6 @@ export class V2PaymentService {
       account.account.id,
       destinationFingerprint,
     )
-    const context = await this.options.repository.getSpendContext(
-      account.account.id,
-      denomination.id,
-      this.now(),
-    )
     const policyRecord = await this.options.repository.findActiveSpendPolicy(
       account.account.id,
       denomination.id,
@@ -151,6 +146,12 @@ export class V2PaymentService {
     if (policyRecord === null) {
       throw new DependencyUnavailableError('No active spend policy is configured')
     }
+    const context = await this.options.repository.getSpendContext(
+      account.account.id,
+      denomination.id,
+      this.now(),
+      policyRecord.rollingWindowSeconds,
+    )
     const policy = toSpendPolicy(policyRecord, denomination)
     const policyDecision = evaluateSpendPolicy({
       policy,

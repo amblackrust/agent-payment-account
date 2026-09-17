@@ -8,10 +8,25 @@ import {
   ExternalRailError,
   InsufficientFundsError,
   RecipientResolutionError,
+  ValidationError,
 } from '@agent-payment/core'
 import { PrismaClient, type Prisma } from './generated/client/client.js'
 import { createV2DatabaseRepository, type V2DatabaseRepository } from './v2.js'
+import { createV2AdminRepository, type V2AdminRepository } from './v2-admin.js'
 export { createV2DatabaseRepository } from './v2.js'
+export { createV2AdminRepository } from './v2-admin.js'
+export type {
+  V2AccountRecord,
+  V2AdminRepository,
+  V2ApprovalAdminRecord,
+  V2ApprovedDestinationRecord as V2AdminApprovedDestinationRecord,
+  V2CredentialRecord,
+  V2FundingDestinationRecord,
+  V2HistoryRecord,
+  V2ProvisionedAccount,
+  V2ReceiveRequestAdminRecord,
+  V2SpendPolicyAdminRecord,
+} from './v2-admin.js'
 export type {
   V2ApprovedDestinationRecord,
   V2DatabaseRepository,
@@ -185,6 +200,7 @@ export interface UpdateRecipientInput {
     readonly type: string
     readonly walletAddress: string
   }
+  readonly rowVersion?: number
 }
 
 export interface RecipientRepository {
@@ -304,6 +320,8 @@ export interface ReceiveRequestRecord {
   readonly id: string
   readonly accountId: string
   readonly amountAtomic: bigint | null
+  readonly denominationId?: string | null
+  readonly amountScale?: number | null
   readonly currency: string
   readonly reference: string
   readonly status: ReceiveRequestStatus
@@ -348,6 +366,8 @@ export interface CreateReceiveRequestInput {
   readonly id: string
   readonly accountId: string
   readonly amountAtomic?: bigint
+  readonly denominationId?: string
+  readonly amountScale?: number
   readonly currency: string
   readonly reference: string
   readonly createdAt?: Date
@@ -386,6 +406,11 @@ export interface ReceiveRepository {
   listReceiveRequests(accountId: string): Promise<readonly ReceiveRequestRecord[]>
   matchIncomingPayment(input: IncomingMatchInput): Promise<string | null>
   expireOpenReceiveRequests(accountId: string, now: Date): Promise<void>
+  readonly cancelReceiveRequest?: (
+    accountId: string,
+    id: string,
+    now?: Date,
+  ) => Promise<ReceiveRequestRecord>
 }
 
 export interface IncomingPaymentRepository {
@@ -608,6 +633,7 @@ export interface DatabaseClient
     ReceiveRepository,
     IncomingPaymentRepository {
   readonly v2: V2DatabaseRepository
+  readonly v2Admin: V2AdminRepository
   initializeRuntimeIdentity(
     input: RuntimeIdentity,
     validateLegacyCustody?: (custody: AccountCustodyRecord) => Promise<void>,
@@ -723,9 +749,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
   const adapter = new PrismaPg({ connectionString: databaseUrl })
   const prisma = new PrismaClient({ adapter })
   const v2 = createV2DatabaseRepository(prisma)
+  const v2Admin = createV2AdminRepository(prisma)
 
   return {
     v2,
+    v2Admin,
     async createAgentAccount(input): Promise<StoredAgentAccount> {
       return prisma.$transaction(async (transaction) => {
         const account = await transaction.agentAccount.create({
@@ -995,7 +1023,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           }
         }
         const result = await transaction.recipient.updateMany({
-          where: { id: input.id, ownerAccountId: input.ownerAccountId },
+          where: {
+            id: input.id,
+            ownerAccountId: input.ownerAccountId,
+            ...(input.rowVersion === undefined ? {} : { rowVersion: input.rowVersion }),
+          },
           data: {
             ...(input.displayName === undefined
               ? {}
@@ -1004,6 +1036,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ...(input.managedAccountId === undefined
               ? {}
               : { managedAccountId: input.managedAccountId }),
+            ...(input.rowVersion === undefined ? {} : { rowVersion: { increment: 1 } }),
           },
         })
         if (result.count !== 1) {
@@ -1748,6 +1781,10 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ...(input.amountAtomic === undefined
               ? {}
               : { amountAtomic: input.amountAtomic }),
+            ...(input.denominationId === undefined
+              ? {}
+              : { denominationId: input.denominationId }),
+            ...(input.amountScale === undefined ? {} : { amountScale: input.amountScale }),
             currency: input.currency,
             reference: input.reference,
             ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
@@ -1780,6 +1817,19 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         where: { accountId, status: 'OPEN', expiresAt: { lte: now } },
         data: { status: 'EXPIRED' },
       })
+    },
+    async cancelReceiveRequest(accountId, id, now = new Date()) {
+      const result = await prisma.receiveRequest.updateMany({
+        where: { id, accountId, status: 'OPEN' },
+        data: { status: 'CANCELLED', updatedAt: now },
+      })
+      if (result.count !== 1) {
+        const current = await prisma.receiveRequest.findFirst({ where: { id, accountId } })
+        if (current === null) throw new ValidationError('Receive request was not found')
+        throw new ConflictError('Receive request is already terminal')
+      }
+      const request = await prisma.receiveRequest.findUniqueOrThrow({ where: { id } })
+      return toReceiveRequestRecord(request)
     },
     async matchIncomingPayment(input): Promise<string | null> {
       return prisma.$transaction((transaction) =>
@@ -2187,6 +2237,8 @@ function toReceiveRequestRecord(request: {
   id: string
   accountId: string
   amountAtomic: bigint | null
+  denominationId?: string | null
+  amountScale?: number | null
   currency: string
   reference: string
   status: ReceiveRequestStatus
