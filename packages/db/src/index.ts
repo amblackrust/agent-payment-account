@@ -9,8 +9,22 @@ import {
   RecipientResolutionError,
 } from '@agent-payment/core'
 import { PrismaClient, type Prisma } from './generated/client/client.js'
+import { createV2DatabaseRepository, type V2DatabaseRepository } from './v2.js'
+export { createV2DatabaseRepository } from './v2.js'
+export type {
+  V2DatabaseRepository,
+  V2DenominationRecord,
+  V2PaymentAttemptSnapshot,
+  V2PaymentCreateInput,
+  V2PaymentCreateResult,
+  V2PolicyDecisionInput,
+  V2PaymentSnapshot,
+  V2SettlementAssetRecord,
+  V2WorkItemClaim,
+} from './v2.js'
 
-export type AgentAccountStatus = 'ACTIVE' | 'DISABLED'
+export type AgentAccountStatus =
+  'PROVISIONING' | 'ACTIVE' | 'DISABLED' | 'PROVISIONING_FAILED'
 
 export interface StoredAgentAccount {
   readonly id: string
@@ -202,7 +216,19 @@ export interface ReservationRepository {
 
 export type PaymentKind = 'PAY' | 'SEND' | 'REFUND'
 export type PaymentStatus =
-  'CREATED' | 'ROUTING' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
+  | 'CREATED'
+  | 'ROUTING'
+  | 'AWAITING_APPROVAL'
+  | 'REJECTED_BY_POLICY'
+  | 'REJECTED'
+  | 'SUBMITTED'
+  | 'RECONCILING'
+  | 'CONFIRMED'
+  | 'PROVED_NO_EFFECT'
+  | 'REVIEW_REQUIRED'
+  | 'CLOSED_UNRESOLVED'
+  | 'FAILED'
+  | 'EXPIRED'
 export type PaymentAttemptStatus =
   | 'CREATED'
   | 'PREPARED'
@@ -242,6 +268,17 @@ export interface PaymentRecord {
   readonly nextRecoveryAt: Date | null
   readonly recoveryCount: number
   readonly stuckSince: Date | null
+  readonly denominationId?: string | null
+  readonly amountScale?: number | null
+  readonly routeId?: string | null
+  readonly settlementAssetId?: string | null
+  readonly destinationSnapshotJson?: string | null
+  readonly policyDecisionId?: string | null
+  readonly approvalId?: string | null
+  readonly executionState?: string
+  readonly settlementState?: string
+  readonly outcomeState?: string
+  readonly rowVersion?: number
 }
 
 export type ReceiveRequestStatus = 'OPEN' | 'PAID' | 'EXPIRED' | 'CANCELLED'
@@ -553,6 +590,7 @@ export interface DatabaseClient
     ReservationRepository,
     ReceiveRepository,
     IncomingPaymentRepository {
+  readonly v2: V2DatabaseRepository
   initializeRuntimeIdentity(
     input: RuntimeIdentity,
     validateLegacyCustody?: (custody: AccountCustodyRecord) => Promise<void>,
@@ -667,8 +705,10 @@ async function matchIncomingPaymentInTransaction(
 export function createDatabaseClient(databaseUrl: string): DatabaseClient {
   const adapter = new PrismaPg({ connectionString: databaseUrl })
   const prisma = new PrismaClient({ adapter })
+  const v2 = createV2DatabaseRepository(prisma)
 
   return {
+    v2,
     async createAgentAccount(input): Promise<StoredAgentAccount> {
       return prisma.$transaction(async (transaction) => {
         const account = await transaction.agentAccount.create({

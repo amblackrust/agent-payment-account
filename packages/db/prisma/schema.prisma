@@ -8,8 +8,17 @@ datasource db {
 }
 
 enum AgentAccountStatus {
+  PROVISIONING
   ACTIVE
   DISABLED
+  PROVISIONING_FAILED
+}
+
+enum AgentCredentialStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+  ROTATING
 }
 
 enum PaymentKind {
@@ -21,10 +30,17 @@ enum PaymentKind {
 enum PaymentStatus {
   CREATED
   ROUTING
+  AWAITING_APPROVAL
+  REJECTED_BY_POLICY
+  REJECTED
   SUBMITTED
   RECONCILING
   CONFIRMED
+  PROVED_NO_EFFECT
+  REVIEW_REQUIRED
+  CLOSED_UNRESOLVED
   FAILED
+  EXPIRED
 }
 
 enum PaymentAttemptStatus {
@@ -59,39 +75,51 @@ enum IncomingReconciliationIssueStatus {
 }
 
 model AgentAccount {
-  id                    String                @id @db.VarChar(64)
-  name                  String                @db.VarChar(120)
-  status                AgentAccountStatus    @default(ACTIVE)
-  solanaPublicKey       String                @unique @map("solana_public_key") @db.VarChar(64)
-  encryptedSolanaSecret String                @map("encrypted_solana_secret") @db.Text
-  encryptionNonce       String                @map("encryption_nonce") @db.VarChar(32)
-  encryptionAuthTag     String                @map("encryption_auth_tag") @db.VarChar(32)
-  createdAt             DateTime              @default(now()) @map("created_at")
-  updatedAt             DateTime              @updatedAt @map("updated_at")
-  credentials           ApiCredential[]
-  recipients            Recipient[]
-  managedRecipients     Recipient[]           @relation("ManagedRecipients")
-  outgoingPayments      Payment[]             @relation("PayerPayments")
-  incomingPayments      IncomingPayment[]
-  receiveRequests       ReceiveRequest[]
-  idempotencyRecords    IdempotencyRecord[]
-  outgoingReservations  OutgoingReservation[]
-  feeSponsorships       FeeSponsorship[]
-  indexerCheckpoints    IndexerCheckpoint[]
-  incomingIssues        IncomingReconciliationIssue[]
+  id                      String                        @id @db.VarChar(64)
+  name                    String                        @db.VarChar(120)
+  status                  AgentAccountStatus            @default(ACTIVE)
+  solanaPublicKey         String                        @unique @map("solana_public_key") @db.VarChar(64)
+  encryptedSolanaSecret   String                        @map("encrypted_solana_secret") @db.Text
+  encryptionNonce         String                        @map("encryption_nonce") @db.VarChar(32)
+  encryptionAuthTag       String                        @map("encryption_auth_tag") @db.VarChar(32)
+  workspaceId             String?                       @map("workspace_id") @db.VarChar(64)
+  runtimeVersion          String?                       @map("runtime_version") @db.VarChar(64)
+  provisioningFailureCode String?                       @map("provisioning_failure_code") @db.VarChar(128)
+  disabledAt              DateTime?                     @map("disabled_at")
+  disabledReason          String?                       @map("disabled_reason") @db.Text
+  rowVersion              Int                           @default(1) @map("row_version")
+  createdAt               DateTime                      @default(now()) @map("created_at")
+  updatedAt               DateTime                      @updatedAt @map("updated_at")
+  credentials             ApiCredential[]
+  recipients              Recipient[]
+  managedRecipients       Recipient[]                   @relation("ManagedRecipients")
+  outgoingPayments        Payment[]                     @relation("PayerPayments")
+  incomingPayments        IncomingPayment[]
+  receiveRequests         ReceiveRequest[]
+  idempotencyRecords      IdempotencyRecord[]
+  outgoingReservations    OutgoingReservation[]
+  feeSponsorships         FeeSponsorship[]
+  indexerCheckpoints      IndexerCheckpoint[]
+  incomingIssues          IncomingReconciliationIssue[]
 
+  @@index([workspaceId])
   @@map("agent_accounts")
 }
 
 model ApiCredential {
-  id         String       @id @db.VarChar(64)
-  accountId  String       @map("account_id") @db.VarChar(64)
-  keyHash    String       @unique @map("key_hash") @db.VarChar(128)
-  keyPrefix  String       @map("key_prefix") @db.VarChar(32)
-  createdAt  DateTime     @default(now()) @map("created_at")
-  revokedAt  DateTime?    @map("revoked_at")
-  lastUsedAt DateTime?    @map("last_used_at")
-  account    AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  id            String                @id @db.VarChar(64)
+  accountId     String                @map("account_id") @db.VarChar(64)
+  keyHash       String                @unique @map("key_hash") @db.VarChar(128)
+  keyPrefix     String                @map("key_prefix") @db.VarChar(32)
+  status        AgentCredentialStatus @default(ACTIVE)
+  scopes        String                @default("[]") @db.Text
+  expiresAt     DateTime?             @map("expires_at")
+  rotatedFromId String?               @map("rotated_from_id") @db.VarChar(64)
+  rowVersion    Int                   @default(1) @map("row_version")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  revokedAt     DateTime?             @map("revoked_at")
+  lastUsedAt    DateTime?             @map("last_used_at")
+  account       AgentAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
   @@index([accountId])
   @@map("api_credentials")
@@ -103,6 +131,8 @@ model Recipient {
   managedAccountId String?                @map("managed_account_id") @db.VarChar(64)
   displayName      String                 @map("display_name") @db.VarChar(120)
   type             String                 @db.VarChar(64)
+  archivedAt       DateTime?              @map("archived_at")
+  rowVersion       Int                    @default(1) @map("row_version")
   createdAt        DateTime               @default(now()) @map("created_at")
   updatedAt        DateTime               @updatedAt @map("updated_at")
   ownerAccount     AgentAccount           @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
@@ -136,11 +166,23 @@ model Payment {
   recipientId               String?              @map("recipient_id") @db.VarChar(64)
   kind                      PaymentKind
   amountAtomic              BigInt               @map("amount_atomic")
+  denominationId            String?              @map("denomination_id") @db.VarChar(64)
+  amountScale               Int?                 @map("amount_scale")
   currency                  String               @db.VarChar(3)
   status                    PaymentStatus        @default(CREATED)
   description               String?              @db.Text
   externalReference         String?              @map("external_reference") @db.VarChar(255)
   route                     String?              @db.VarChar(64)
+  routeId                   String?              @map("route_id") @db.VarChar(64)
+  routeSelectionReason      String?              @map("route_selection_reason") @db.VarChar(64)
+  settlementAssetId         String?              @map("settlement_asset_id") @db.VarChar(64)
+  destinationSnapshotJson   String?              @map("destination_snapshot_json") @db.Text
+  policyDecisionId          String?              @map("policy_decision_id") @db.VarChar(64)
+  approvalId                String?              @map("approval_id") @db.VarChar(64)
+  executionState            String               @default("NOT_STARTED") @map("execution_state") @db.VarChar(32)
+  settlementState           String               @default("NOT_SUBMITTED") @map("settlement_state") @db.VarChar(32)
+  outcomeState              String               @default("NONE") @map("outcome_state") @db.VarChar(32)
+  rowVersion                Int                  @default(1) @map("row_version")
   createdAt                 DateTime             @default(now()) @map("created_at")
   updatedAt                 DateTime             @updatedAt @map("updated_at")
   confirmedAt               DateTime?            @map("confirmed_at")
@@ -169,6 +211,8 @@ model Payment {
   @@index([recipientId, createdAt])
   @@index([payerAccountId, status])
   @@index([status, nextRecoveryAt, lastRecoveryAttemptAt])
+  @@index([payerAccountId, denominationId, createdAt])
+  @@index([policyDecisionId])
   @@map("payments")
 }
 
@@ -186,7 +230,7 @@ model ReceiveRequest {
   matchedIncomingPaymentId String?              @unique @map("matched_incoming_payment_id") @db.VarChar(64)
   account                  AgentAccount         @relation(fields: [accountId], references: [id], onDelete: Restrict)
   matchedIncomingPayment   IncomingPayment?     @relation("ReceiveMatch", fields: [matchedIncomingPaymentId], references: [id], onDelete: Restrict)
-  incomingPayments         IncomingPayment?    @relation("ReceiveIncoming")
+  incomingPayments         IncomingPayment?     @relation("ReceiveIncoming")
 
   @@unique([accountId, reference])
   @@index([accountId, status])
@@ -213,9 +257,9 @@ model IncomingPayment {
   receiveRequest   ReceiveRequest?       @relation("ReceiveIncoming", fields: [receiveRequestId], references: [id], onDelete: Restrict)
   matchedByRequest ReceiveRequest?       @relation("ReceiveMatch")
 
+  @@unique([accountId, signature])
   @@index([accountId, createdAt])
   @@index([accountId, receiveRequestId])
-  @@unique([accountId, signature])
   @@map("incoming_payments")
 }
 
@@ -254,7 +298,7 @@ model IncomingReconciliationIssue {
 
 model PaymentAttempt {
   id                            String               @id @db.VarChar(64)
-  paymentId                     String               @unique @map("payment_id") @db.VarChar(64)
+  paymentId                     String               @map("payment_id") @db.VarChar(64)
   attemptNumber                 Int                  @map("attempt_number")
   rail                          String               @db.VarChar(64)
   status                        PaymentAttemptStatus @default(CREATED)
@@ -264,6 +308,14 @@ model PaymentAttempt {
   expectedExternalId            String?              @map("expected_external_id") @db.VarChar(255)
   recoveryMetadata              String?              @map("recovery_metadata") @db.Text
   confirmationMetadata          String?              @map("confirmation_metadata") @db.Text
+  outcome                       String               @default("NOT_STARTED") @db.VarChar(32)
+  routeId                       String?              @map("route_id") @db.VarChar(64)
+  preparedEffectHash            String?              @map("prepared_effect_hash") @db.Char(64)
+  signedPayloadHash             String?              @map("signed_payload_hash") @db.Char(64)
+  signedPayloadEncrypted        String?              @map("signed_payload_encrypted") @db.Text
+  validityExpiresAt             DateTime?            @map("validity_expires_at")
+  validitySlot                  BigInt?              @map("validity_slot")
+  rowVersion                    Int                  @default(1) @map("row_version")
   legacySignedTransactionBase64 String?              @map("signed_transaction_base64") @db.Text
   legacyExpectedSignature       String?              @map("expected_signature") @db.VarChar(128)
   legacyBlockhash               String?              @map("blockhash") @db.VarChar(128)
@@ -279,15 +331,18 @@ model PaymentAttempt {
 }
 
 model IdempotencyRecord {
-  id             String       @id @db.VarChar(64)
-  ownerAccountId String       @map("owner_account_id") @db.VarChar(64)
-  operation      String       @db.VarChar(32)
-  key            String       @db.VarChar(255)
-  requestHash    String       @map("request_hash") @db.Char(64)
-  resourceId     String       @map("resource_id") @db.VarChar(64)
-  createdAt      DateTime     @default(now()) @map("created_at")
-  updatedAt      DateTime     @updatedAt @map("updated_at")
-  ownerAccount   AgentAccount @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
+  id               String       @id @db.VarChar(64)
+  ownerAccountId   String       @map("owner_account_id") @db.VarChar(64)
+  operation        String       @db.VarChar(32)
+  key              String       @db.VarChar(255)
+  requestHash      String       @map("request_hash") @db.Char(64)
+  fingerprint      String?      @db.Char(64)
+  resourceId       String       @map("resource_id") @db.VarChar(64)
+  responseSnapshot String?      @map("response_snapshot") @db.Text
+  expiresAt        DateTime?    @map("expires_at")
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  ownerAccount     AgentAccount @relation(fields: [ownerAccountId], references: [id], onDelete: Restrict)
 
   @@unique([ownerAccountId, operation, key])
   @@index([ownerAccountId, createdAt])
@@ -301,6 +356,10 @@ model OutgoingReservation {
   amountAtomic   BigInt            @map("amount_atomic")
   currency       String            @db.VarChar(3)
   status         ReservationStatus @default(ACTIVE)
+  lifecycleState String            @default("HELD") @map("lifecycle_state") @db.VarChar(16)
+  releaseReason  String?           @map("release_reason") @db.VarChar(128)
+  consumedAt     DateTime?         @map("consumed_at")
+  rowVersion     Int               @default(1) @map("row_version")
   createdAt      DateTime          @default(now()) @map("created_at")
   releasedAt     DateTime?         @map("released_at")
   payment        Payment           @relation(fields: [paymentId], references: [id], onDelete: Restrict)
@@ -311,12 +370,12 @@ model OutgoingReservation {
 }
 
 model FeeSponsorship {
-  id             String       @id @db.VarChar(64)
-  accountId      String       @map("account_id") @db.VarChar(64)
-  paymentId      String       @unique @map("payment_id") @db.VarChar(64)
-  lamports       BigInt
-  createdAt      DateTime     @default(now()) @map("created_at")
-  account        AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  id        String       @id @db.VarChar(64)
+  accountId String       @map("account_id") @db.VarChar(64)
+  paymentId String       @unique @map("payment_id") @db.VarChar(64)
+  lamports  BigInt
+  createdAt DateTime     @default(now()) @map("created_at")
+  account   AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
   @@index([accountId, createdAt])
   @@map("fee_sponsorships")
@@ -327,4 +386,381 @@ model RuntimeMetadata {
   value     String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model Denomination {
+  id        String   @id @db.VarChar(64)
+  symbol    String   @db.VarChar(32)
+  maxScale  Int      @map("max_scale")
+  status    String   @default("ACTIVE") @db.VarChar(16)
+  version   Int      @default(1)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([symbol, version])
+  @@map("denominations")
+}
+
+model SettlementAsset {
+  id             String   @id @db.VarChar(64)
+  rail           String   @db.VarChar(64)
+  network        String   @db.VarChar(64)
+  assetReference String   @map("asset_reference") @db.VarChar(255)
+  decimals       Int
+  status         String   @default("ACTIVE") @db.VarChar(16)
+  version        Int      @default(1)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@unique([rail, network, assetReference, version])
+  @@map("settlement_assets")
+}
+
+model EconomicMapping {
+  id                String   @id @db.VarChar(64)
+  denominationId    String   @map("denomination_id") @db.VarChar(64)
+  settlementAssetId String   @map("settlement_asset_id") @db.VarChar(64)
+  numerator         BigInt
+  denominator       BigInt
+  status            String   @default("ACTIVE") @db.VarChar(16)
+  version           Int      @default(1)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@index([denominationId, status])
+  @@index([settlementAssetId, status])
+  @@map("economic_mappings")
+}
+
+model SettlementRoute {
+  id                String   @id @db.VarChar(64)
+  rail              String   @db.VarChar(64)
+  railVersion       String   @map("rail_version") @db.VarChar(64)
+  network           String   @db.VarChar(64)
+  settlementAssetId String   @map("settlement_asset_id") @db.VarChar(64)
+  economicMappingId String   @map("economic_mapping_id") @db.VarChar(64)
+  status            String   @default("ACTIVE") @db.VarChar(16)
+  priority          Int      @default(0)
+  configVersion     String   @map("config_version") @db.VarChar(64)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@index([status, priority, id])
+  @@map("settlement_routes")
+}
+
+model SpendPolicy {
+  id                          String    @id @db.VarChar(64)
+  accountId                   String    @map("account_id") @db.VarChar(64)
+  version                     Int
+  status                      String    @default("DRAFT") @db.VarChar(16)
+  denominationId              String    @map("denomination_id") @db.VarChar(64)
+  maxPerPaymentAtomic         BigInt?   @map("max_per_payment_atomic")
+  rollingBudgetAtomic         BigInt?   @map("rolling_budget_atomic")
+  rollingWindowSeconds        Int?      @map("rolling_window_seconds")
+  transactionCountCap         Int?      @map("transaction_count_cap")
+  approvalThresholdAtomic     BigInt?   @map("approval_threshold_atomic")
+  rollingBudgetEscalatable    Boolean   @default(false) @map("rolling_budget_escalatable")
+  transactionCountEscalatable Boolean   @default(false) @map("transaction_count_escalatable")
+  rulesJson                   String    @default("{}") @map("rules_json") @db.Text
+  createdAt                   DateTime  @default(now()) @map("created_at")
+  activatedAt                 DateTime? @map("activated_at")
+  retiredAt                   DateTime? @map("retired_at")
+
+  @@unique([accountId, version])
+  @@index([accountId, status])
+  @@map("spend_policies")
+}
+
+model PolicyDecision {
+  id              String   @id @db.VarChar(64)
+  paymentId       String   @unique @map("payment_id") @db.VarChar(64)
+  accountId       String   @map("account_id") @db.VarChar(64)
+  policyId        String   @map("policy_id") @db.VarChar(64)
+  policyVersion   Int      @map("policy_version")
+  decision        String   @db.VarChar(32)
+  reasonCodesJson String   @map("reason_codes_json") @db.Text
+  contextJson     String   @map("context_json") @db.Text
+  fingerprint     String   @db.Char(64)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([accountId, createdAt])
+  @@map("policy_decisions")
+}
+
+model ApprovedDestination {
+  id             String    @id @db.VarChar(64)
+  accountId      String    @map("account_id") @db.VarChar(64)
+  fingerprint    String    @db.Char(64)
+  rail           String    @db.VarChar(64)
+  network        String    @db.VarChar(64)
+  assetReference String    @map("asset_reference") @db.VarChar(255)
+  destination    String    @db.VarChar(255)
+  status         String    @default("ACTIVE") @db.VarChar(16)
+  actorId        String    @map("actor_id") @db.VarChar(128)
+  reason         String?   @db.Text
+  createdAt      DateTime  @default(now()) @map("created_at")
+  revokedAt      DateTime? @map("revoked_at")
+
+  @@unique([accountId, fingerprint])
+  @@index([accountId, status])
+  @@map("approved_destinations")
+}
+
+model Approval {
+  id               String    @id @db.VarChar(64)
+  paymentId        String    @unique @map("payment_id") @db.VarChar(64)
+  accountId        String    @map("account_id") @db.VarChar(64)
+  fingerprint      String    @db.Char(64)
+  policyDecisionId String    @map("policy_decision_id") @db.VarChar(64)
+  status           String    @default("PENDING") @db.VarChar(16)
+  expiresAt        DateTime  @map("expires_at")
+  actorId          String?   @map("actor_id") @db.VarChar(128)
+  comment          String?   @db.Text
+  rowVersion       Int       @default(1) @map("row_version")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  decidedAt        DateTime? @map("decided_at")
+
+  @@index([accountId, status, expiresAt])
+  @@map("approvals")
+}
+
+model DurableWorkItem {
+  id             String    @id @db.VarChar(64)
+  kind           String    @db.VarChar(64)
+  resourceType   String    @map("resource_type") @db.VarChar(64)
+  resourceId     String    @map("resource_id") @db.VarChar(64)
+  status         String    @default("AVAILABLE") @db.VarChar(16)
+  availableAt    DateTime  @default(now()) @map("available_at")
+  leaseOwner     String?   @map("lease_owner") @db.VarChar(128)
+  leaseExpiresAt DateTime? @map("lease_expires_at")
+  attemptCount   Int       @default(0) @map("attempt_count")
+  maxAttempts    Int       @default(10) @map("max_attempts")
+  lastErrorCode  String?   @map("last_error_code") @db.VarChar(128)
+  lastErrorSafe  String?   @map("last_error_safe") @db.Text
+  retryAfter     DateTime? @map("retry_after")
+  payloadJson    String    @default("{}") @map("payload_json") @db.Text
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  completedAt    DateTime? @map("completed_at")
+
+  @@unique([kind, resourceType, resourceId])
+  @@index([status, availableAt, leaseExpiresAt])
+  @@map("durable_work_items")
+}
+
+model EvidenceRecord {
+  id                  String   @id @db.VarChar(64)
+  paymentId           String   @map("payment_id") @db.VarChar(64)
+  attemptId           String?  @map("attempt_id") @db.VarChar(64)
+  authority           String   @db.VarChar(64)
+  source              String   @db.VarChar(64)
+  outcome             String   @db.VarChar(32)
+  observedAt          DateTime @map("observed_at")
+  externalId          String?  @map("external_id") @db.VarChar(255)
+  expectedExternalId  String?  @map("expected_external_id") @db.VarChar(255)
+  payloadHash         String?  @map("payload_hash") @db.Char(64)
+  providerCorrelation String?  @map("provider_correlation") @db.VarChar(255)
+  metadataJson        String   @default("{}") @map("metadata_json") @db.Text
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@index([paymentId, observedAt])
+  @@index([attemptId, observedAt])
+  @@map("evidence_records")
+}
+
+model CustodyKeyVersion {
+  id                 String    @id @db.VarChar(64)
+  accountId          String?   @map("account_id") @db.VarChar(64)
+  keyVersion         Int       @map("key_version")
+  backendIdentity    String    @map("backend_identity") @db.VarChar(128)
+  keyReference       String    @map("key_reference") @db.VarChar(255)
+  rootKeyFingerprint String    @map("root_key_fingerprint") @db.Char(64)
+  status             String    @default("ACTIVE") @db.VarChar(16)
+  createdAt          DateTime  @default(now()) @map("created_at")
+  retiredAt          DateTime? @map("retired_at")
+
+  @@unique([accountId, keyVersion])
+  @@index([status])
+  @@map("custody_key_versions")
+}
+
+model SigningRequest {
+  id               String    @id @db.VarChar(64)
+  paymentId        String    @map("payment_id") @db.VarChar(64)
+  attemptId        String    @unique @map("attempt_id") @db.VarChar(64)
+  effectHash       String    @map("effect_hash") @db.Char(64)
+  routeId          String    @map("route_id") @db.VarChar(64)
+  network          String    @db.VarChar(64)
+  assetReference   String    @map("asset_reference") @db.VarChar(255)
+  destination      String    @db.VarChar(255)
+  amountAtomic     BigInt    @map("amount_atomic")
+  feePayerIdentity String    @map("fee_payer_identity") @db.VarChar(255)
+  keyVersion       Int       @map("key_version")
+  status           String    @default("PENDING") @db.VarChar(16)
+  serviceIdentity  String    @map("service_identity") @db.VarChar(255)
+  createdAt        DateTime  @default(now()) @map("created_at")
+  completedAt      DateTime? @map("completed_at")
+
+  @@index([paymentId, createdAt])
+  @@map("signing_requests")
+}
+
+model OperationTimelineEvent {
+  id            String   @id @db.VarChar(64)
+  accountId     String?  @map("account_id") @db.VarChar(64)
+  resourceType  String   @map("resource_type") @db.VarChar(64)
+  resourceId    String   @map("resource_id") @db.VarChar(64)
+  eventType     String   @map("event_type") @db.VarChar(128)
+  actorType     String   @map("actor_type") @db.VarChar(64)
+  actorId       String?  @map("actor_id") @db.VarChar(255)
+  requestId     String?  @map("request_id") @db.VarChar(255)
+  correlationId String?  @map("correlation_id") @db.VarChar(255)
+  oldStateJson  String?  @map("old_state_json") @db.Text
+  newStateJson  String?  @map("new_state_json") @db.Text
+  source        String   @db.VarChar(64)
+  occurredAt    DateTime @map("occurred_at")
+  metadataJson  String   @default("{}") @map("metadata_json") @db.Text
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([accountId, occurredAt, id])
+  @@index([resourceType, resourceId, occurredAt])
+  @@map("operation_timeline_events")
+}
+
+model PlatformCostRecord {
+  id                   String    @id @db.VarChar(64)
+  accountId            String    @map("account_id") @db.VarChar(64)
+  paymentId            String?   @map("payment_id") @db.VarChar(64)
+  attemptId            String?   @map("attempt_id") @db.VarChar(64)
+  assetId              String    @map("asset_id") @db.VarChar(64)
+  estimatedAmount      BigInt    @map("estimated_amount")
+  actualAmount         BigInt?   @map("actual_amount")
+  reconciliationStatus String    @default("ESTIMATED") @map("reconciliation_status") @db.VarChar(32)
+  observedAt           DateTime? @map("observed_at")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  @@index([accountId, createdAt])
+  @@index([paymentId])
+  @@map("platform_cost_records")
+}
+
+model OperationalException {
+  id              String    @id @db.VarChar(64)
+  accountId       String?   @map("account_id") @db.VarChar(64)
+  resourceType    String    @map("resource_type") @db.VarChar(64)
+  resourceId      String    @map("resource_id") @db.VarChar(64)
+  dedupeKey       String    @map("dedupe_key") @db.VarChar(255)
+  activeDedupeKey String?   @unique @map("active_dedupe_key") @db.VarChar(255)
+  status          String    @default("OPEN") @db.VarChar(32)
+  severity        String    @default("ERROR") @db.VarChar(16)
+  reasonCode      String    @map("reason_code") @db.VarChar(128)
+  detailsJson     String    @default("{}") @map("details_json") @db.Text
+  assignedTo      String?   @map("assigned_to") @db.VarChar(255)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  acknowledgedAt  DateTime? @map("acknowledged_at")
+  resolvedAt      DateTime? @map("resolved_at")
+
+  @@index([status, severity, createdAt])
+  @@index([resourceType, resourceId])
+  @@map("operational_exceptions")
+}
+
+model WebhookSubscription {
+  id                String    @id @db.VarChar(64)
+  accountId         String    @map("account_id") @db.VarChar(64)
+  endpoint          String    @db.VarChar(2048)
+  eventTypesJson    String    @map("event_types_json") @db.Text
+  status            String    @default("ACTIVE") @db.VarChar(16)
+  signingKeyRef     String    @map("signing_key_ref") @db.VarChar(255)
+  signingKeyVersion Int       @map("signing_key_version")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  archivedAt        DateTime? @map("archived_at")
+
+  @@index([accountId, status])
+  @@map("webhook_subscriptions")
+}
+
+model WebhookEvent {
+  id              String   @id @db.VarChar(64)
+  eventId         String   @unique @map("event_id") @db.VarChar(128)
+  resourceType    String   @map("resource_type") @db.VarChar(64)
+  resourceId      String   @map("resource_id") @db.VarChar(64)
+  resourceVersion Int      @map("resource_version")
+  eventType       String   @map("event_type") @db.VarChar(128)
+  eventVersion    String   @map("event_version") @db.VarChar(32)
+  rawBody         String   @map("raw_body") @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([resourceType, resourceId, createdAt])
+  @@map("webhook_events")
+}
+
+model WebhookDelivery {
+  id             String    @id @db.VarChar(64)
+  eventId        String    @map("event_id") @db.VarChar(128)
+  subscriptionId String    @map("subscription_id") @db.VarChar(64)
+  deliveryNumber Int       @map("delivery_number")
+  status         String    @default("AVAILABLE") @db.VarChar(16)
+  availableAt    DateTime  @default(now()) @map("available_at")
+  attemptCount   Int       @default(0) @map("attempt_count")
+  nextRetryAt    DateTime? @map("next_retry_at")
+  responseStatus Int?      @map("response_status")
+  errorSafe      String?   @map("error_safe") @db.Text
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@unique([eventId, subscriptionId])
+  @@index([status, availableAt, nextRetryAt])
+  @@map("webhook_deliveries")
+}
+
+model FundingDestination {
+  id                    String    @id @db.VarChar(64)
+  accountId             String    @map("account_id") @db.VarChar(64)
+  routeId               String    @map("route_id") @db.VarChar(64)
+  network               String    @db.VarChar(64)
+  assetId               String    @map("asset_id") @db.VarChar(64)
+  destination           String    @db.VarChar(255)
+  readiness             String    @default("PENDING") @db.VarChar(16)
+  senderConstraintsJson String    @default("{}") @map("sender_constraints_json") @db.Text
+  lastValidatedAt       DateTime? @map("last_validated_at")
+  lastFailureCode       String?   @map("last_failure_code") @db.VarChar(128)
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  @@unique([accountId, routeId, assetId])
+  @@index([accountId, readiness])
+  @@map("funding_destinations")
+}
+
+model BackupRestoreVerification {
+  id                   String    @id @db.VarChar(64)
+  backupReference      String    @map("backup_reference") @db.VarChar(255)
+  environment          String    @db.VarChar(64)
+  status               String    @default("RUNNING") @db.VarChar(32)
+  schemaVersion        String    @map("schema_version") @db.VarChar(64)
+  invariantSummaryJson String    @default("{}") @map("invariant_summary_json") @db.Text
+  custodyIdentity      String?   @map("custody_identity") @db.VarChar(255)
+  verifiedAt           DateTime? @map("verified_at")
+  failureSafe          String?   @map("failure_safe") @db.Text
+  createdAt            DateTime  @default(now()) @map("created_at")
+
+  @@index([status, createdAt])
+  @@map("backup_restore_verifications")
+}
+
+model RateLimitBucket {
+  id              String   @id @db.VarChar(255)
+  subjectType     String   @map("subject_type") @db.VarChar(64)
+  subjectId       String   @map("subject_id") @db.VarChar(255)
+  bucket          String   @db.VarChar(64)
+  windowStartedAt DateTime @map("window_started_at")
+  requestCount    Int      @default(0) @map("request_count")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@unique([subjectType, subjectId, bucket, windowStartedAt])
+  @@map("rate_limit_buckets")
 }
