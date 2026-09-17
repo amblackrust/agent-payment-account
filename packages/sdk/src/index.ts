@@ -998,14 +998,18 @@ export class AgentPaymentAccount {
       readonly limit?: number
       readonly cursor?: string
       readonly status?: V2PaymentStatus
+      readonly outcomeState?: string
       readonly recipientId?: string
+      readonly denominationId?: string
     } = {},
   ): Promise<V2PaymentPage> {
     const query = new URLSearchParams()
     if (input.limit !== undefined) query.set('limit', String(input.limit))
     if (input.cursor !== undefined) query.set('cursor', input.cursor)
     if (input.status !== undefined) query.set('status', input.status)
+    if (input.outcomeState !== undefined) query.set('outcome_state', input.outcomeState)
     if (input.recipientId !== undefined) query.set('recipient_id', input.recipientId)
+    if (input.denominationId !== undefined) query.set('denomination_id', input.denominationId)
     const suffix = query.toString()
     return parseV2PaymentPage(
       await this.request(`/v2/payments${suffix === '' ? '' : `?${suffix}`}`, 'GET'),

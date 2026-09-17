@@ -3,9 +3,14 @@ import {
   AuthenticationError,
   formatMoney,
   moneyFromAtomicUnits,
+  RateLimitedError,
   ValidationError,
 } from '@agent-payment/core'
-import type { AccountRepository, ReservationRepository } from '@agent-payment/db'
+import type {
+  AccountRepository,
+  ReservationRepository,
+  V2AdminRepository,
+} from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 
 import type { AppConfig } from './config.js'
@@ -25,6 +30,8 @@ import type { V2ReceiveService } from './receives.js'
 import type { TransactionService } from './transactions.js'
 import { type V2CreatePaymentInput, type V2PaymentService } from './payments-v2.js'
 import type { V2ManagementService } from './v2-management.js'
+import { registerV2OperationsRoutes } from './v2-operations-routes.js'
+import type { V2OperationsService } from './v2-operations.js'
 
 export interface ReadinessDependency {
   checkReadiness(): Promise<void>
@@ -44,6 +51,8 @@ export interface BuildAppOptions {
   readonly transactionService?: TransactionService
   readonly v2PaymentService?: V2PaymentService
   readonly v2ManagementService?: V2ManagementService
+  readonly v2OperationsService?: V2OperationsService
+  readonly v2AdminRepository?: Pick<V2AdminRepository, 'consumeRateLimit'>
 }
 
 interface ErrorWithCode {
@@ -793,7 +802,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           type: 'object',
           additionalProperties: false,
           properties: {
-            kind: { type: 'string', enum: ['PAY', 'SEND', 'REFUND'], default: 'PAY' },
+            kind: { type: 'string', enum: ['PAY', 'SEND'], default: 'PAY' },
             recipient_id: { type: 'string', minLength: 1, maxLength: 64 },
             amount: { type: 'string', minLength: 1, maxLength: 256 },
             denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
@@ -814,7 +823,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
       app.post<{
         Body: {
-          kind?: 'PAY' | 'SEND' | 'REFUND'
+          kind?: 'PAY' | 'SEND'
           recipient_id: string
           amount: string
           denomination_id: string
@@ -825,8 +834,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       }>(
         '/v2/payments',
         {
-          preHandler: async (request) =>
-            authenticateAgentWithScope(request, accountRepository, 'payments:create'),
+          preHandler: async (request) => {
+            await authenticateAgentWithScope(request, accountRepository, 'payments:create')
+            await enforceRateLimit(options.v2AdminRepository, request, 'payment:create', 60)
+          },
           schema: v2PaymentSchema,
         },
         async (request, reply) => {
@@ -897,7 +908,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           limit?: number
           cursor?: string
           status?: string
+          outcome_state?: string
           recipient_id?: string
+          denomination_id?: string
         }
       }>(
         '/v2/payments',
@@ -912,7 +925,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                 limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
                 cursor: { type: 'string', minLength: 1 },
                 status: { type: 'string', minLength: 1, maxLength: 32 },
+                outcome_state: { type: 'string', minLength: 1, maxLength: 32 },
                 recipient_id: { type: 'string', minLength: 1, maxLength: 64 },
+                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
               },
             },
           },
@@ -930,9 +945,15 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               ...(request.query.status === undefined
                 ? {}
                 : { status: request.query.status }),
+              ...(request.query.outcome_state === undefined
+                ? {}
+                : { outcomeState: request.query.outcome_state }),
               ...(request.query.recipient_id === undefined
                 ? {}
                 : { recipientId: request.query.recipient_id }),
+              ...(request.query.denomination_id === undefined
+                ? {}
+                : { denominationId: request.query.denomination_id }),
             },
           )
           return {
@@ -956,8 +977,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       }>(
         '/v2/payments/:paymentId/refunds',
         {
-          preHandler: async (request) =>
-            authenticateAgentWithScope(request, accountRepository, 'payments:create'),
+          preHandler: async (request) => {
+            await authenticateAgentWithScope(request, accountRepository, 'payments:create')
+            await enforceRateLimit(options.v2AdminRepository, request, 'payment:create', 60)
+          },
           schema: {
             headers: v2PaymentSchema.headers,
             body: {
@@ -1414,7 +1437,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       }>(
         '/v2/accounts/:accountId/receive-requests',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          preHandler: async (request) => {
+            await authenticateAgentWithScope(request, accountRepository, 'receive:manage')
+            await enforceRateLimit(options.v2AdminRepository, request, 'receive:create', 120)
+          },
           schema: {
             params: receiveParams,
             headers: {
@@ -1437,7 +1463,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       }>(
         '/v2/receive-requests',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          preHandler: async (request) => {
+            await authenticateAgentWithScope(request, accountRepository, 'receive:manage')
+            await enforceRateLimit(options.v2AdminRepository, request, 'receive:create', 120)
+          },
           schema: {
             headers: {
               type: 'object',
@@ -1504,6 +1533,14 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           return receive.cancelReceiveRequest(account.account.id, account.account.solanaPublicKey, request.params.receiveId)
         },
       )
+    }
+
+    if (options.v2OperationsService !== undefined) {
+      registerV2OperationsRoutes(app, {
+        config: options.config,
+        accountRepository,
+        service: options.v2OperationsService,
+      })
     }
   }
 
@@ -1578,6 +1615,24 @@ function getIdempotencyKey(request: Parameters<typeof authenticateAgent>[0]): st
     throw new ValidationError('Idempotency-Key header is required')
   }
   return key
+}
+
+async function enforceRateLimit(
+  repository: Pick<V2AdminRepository, 'consumeRateLimit'> | undefined,
+  request: Parameters<typeof authenticateAgent>[0],
+  bucket: string,
+  limit: number,
+): Promise<void> {
+  if (repository === undefined) return
+  const account = requireAgentAccount(request)
+  const result = await repository.consumeRateLimit({
+    subjectType: 'AGENT_ACCOUNT',
+    subjectId: account.account.id,
+    bucket,
+    windowSeconds: 60,
+    limit,
+  })
+  if (!result.allowed) throw new RateLimitedError()
 }
 
 function toPaymentRequest(body: PaymentBody) {

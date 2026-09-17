@@ -248,4 +248,55 @@ describe('incoming reconciliation worker', () => {
     expect(persistedSignatures).toEqual(new Set(['signature-b', 'signature-a']))
     expect(issues.size).toBe(0)
   })
+
+  it('exhausts an issue after the bounded final inspection instead of leaving it pending', async () => {
+    let exhausted: { id: string; reason: string } | undefined
+    let reasonUpdates = 0
+    const repository = {
+      listActiveAccountSettlements: async () => [
+        { accountId: 'acct_1', solanaPublicKey: 'owner' },
+      ],
+      getIncomingCursor: async () => null,
+      saveIncomingCursor: async () => undefined,
+      expireOpenReceiveRequests: async () => undefined,
+      createIncomingPayment: async () => ({ payment: {} as never, created: true }),
+      claimIncomingReconciliationIssues: async () => [
+        {
+          id: 'issue_1',
+          accountId: 'acct_1',
+          accountPublicKey: 'owner',
+          signature: 'signature-ambiguous',
+          reason: 'TRANSACTION_UNAVAILABLE',
+          retryCount: 8,
+        },
+      ],
+      resolveIncomingReconciliationIssue: async () => undefined,
+      updateIncomingReconciliationIssueReason: async () => {
+        reasonUpdates += 1
+      },
+      exhaustIncomingReconciliationIssue: async (id: string, reason: string) => {
+        exhausted = { id, reason }
+      },
+    }
+    const service = new IncomingReconciliationService(
+      repository as never,
+      {
+        scan: async () => [],
+        scanWithCursor: async () => ({ transfers: [], nextCursor: null }),
+        inspectSignature: async () => ({
+          kind: 'UNRESOLVED' as const,
+          reason: 'TRANSACTION_UNAVAILABLE' as const,
+        }),
+      },
+      { error: () => undefined },
+    )
+
+    await service.runOnce()
+
+    expect(exhausted).toEqual({
+      id: 'issue_1',
+      reason: 'INCOMING_ISSUE_RETRY_EXHAUSTED',
+    })
+    expect(reasonUpdates).toBe(0)
+  })
 })

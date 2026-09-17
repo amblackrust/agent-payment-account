@@ -100,8 +100,12 @@ function tokenToUsdMoney(tokenAtomicUnits: bigint, tokenDecimals: number): Money
   }
 
   if (tokenDecimals >= USD_DECIMAL_PLACES) {
-    // Sub-cent token atoms remain in the rail result; spendable USD is truncated.
     const divisor = 10n ** BigInt(tokenDecimals - USD_DECIMAL_PLACES)
+    if (tokenAtomicUnits % divisor !== 0n) {
+      throw new ExternalRailError(
+        'Settlement balance cannot be represented exactly in the configured denomination',
+      )
+    }
     return moneyFromAtomicUnits(tokenAtomicUnits / divisor)
   }
 

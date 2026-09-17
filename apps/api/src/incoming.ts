@@ -9,6 +9,7 @@ interface IndexedAccount {
 
 type IncomingStore = IncomingPaymentRepository & ReceiveRepository
 const ISSUE_RETRY_BATCH_SIZE = 50
+const MAX_ISSUE_RETRIES = 8
 
 export class IncomingReconciliationService {
   private stopped = false
@@ -43,9 +44,7 @@ export class IncomingReconciliationService {
   private async reconcileAllAccounts(): Promise<void> {
     const accounts: readonly IndexedAccount[] =
       await this.repository.listActiveAccountSettlements()
-    for (const account of accounts) {
-      await this.reconcileAccount(account)
-    }
+    await Promise.all(accounts.map((account) => this.reconcileAccount(account)))
     await this.reconcilePendingIssues()
     await this.repository.reconcileUnmatchedManagedIncoming?.(ISSUE_RETRY_BATCH_SIZE)
   }
@@ -120,11 +119,25 @@ export class IncomingReconciliationService {
     const issues = await claimIssues(ISSUE_RETRY_BATCH_SIZE)
     for (const issue of issues) {
       try {
+        if (issue.retryCount > MAX_ISSUE_RETRIES) {
+          await this.repository.exhaustIncomingReconciliationIssue(
+            issue.id,
+            'INCOMING_ISSUE_RETRY_EXHAUSTED',
+          )
+          continue
+        }
         const inspection = await inspectSignature(
           issue.accountPublicKey,
           issue.signature,
         )
         if (inspection.kind === 'UNRESOLVED') {
+          if (issue.retryCount >= MAX_ISSUE_RETRIES) {
+            await this.repository.exhaustIncomingReconciliationIssue(
+              issue.id,
+              'INCOMING_ISSUE_RETRY_EXHAUSTED',
+            )
+            continue
+          }
           await updateReason(issue.id, inspection.reason)
           continue
         }
@@ -133,6 +146,24 @@ export class IncomingReconciliationService {
         }
         await resolveIssue(issue.id)
       } catch (error) {
+        if (issue.retryCount >= MAX_ISSUE_RETRIES) {
+          try {
+            await this.repository.exhaustIncomingReconciliationIssue(
+              issue.id,
+              'INCOMING_ISSUE_RETRY_EXHAUSTED',
+            )
+          } catch (exhaustionError) {
+            this.logger.error(
+              {
+                accountId: issue.accountId,
+                signature: issue.signature,
+                errorCode:
+                  exhaustionError instanceof Error ? exhaustionError.name : 'UNKNOWN',
+              },
+              'Incoming reconciliation issue exhaustion failed',
+            )
+          }
+        }
         this.logger.error(
           {
             accountId: issue.accountId,

@@ -81,13 +81,15 @@ describe('Solana settlement read rail', () => {
   it('converts raw SPL units to canonical USD cents without floating point arithmetic', () => {
     expect(formatMoney(tokenToUsdMoney(0n, 6))).toBe('0.00')
     expect(formatMoney(tokenToUsdMoney(12_500_000n, 6))).toBe('12.50')
-    expect(formatMoney(tokenToUsdMoney(12_500_001n, 6))).toBe('12.50')
+    expect(() => tokenToUsdMoney(12_500_001n, 6)).toThrow(
+      'Settlement balance cannot be represented exactly',
+    )
     expect(formatMoney(tokenToUsdMoney(1250n, 2))).toBe('12.50')
     expect(formatMoney(tokenToUsdMoney(12n, 1))).toBe('1.20')
     expect(formatMoney(tokenToUsdMoney(12n, 0))).toBe('12.00')
     expect(formatMoney(tokenToUsdMoney(120n, 1))).toBe('12.00')
-    expect(formatMoney(tokenToUsdMoney(18446744073709551615n, 6))).toBe(
-      '18446744073709.55',
+    expect(() => tokenToUsdMoney(18446744073709551615n, 6)).toThrow(
+      'Settlement balance cannot be represented exactly',
     )
   })
 
@@ -118,7 +120,7 @@ describe('Solana settlement read rail', () => {
       settlementMint: mint,
     })
     const destination = await destinationRail.getReceiveDestination(owner)
-    const amount = 18446744073709551615n
+    const amount = 18446744073709551610n
     const accounts = new Map<string, MockRpcAccount>([
       [mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(3))],
       [

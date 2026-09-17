@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto'
 import {
+  DependencyUnavailableError,
   ValidationError,
   DEFAULT_AGENT_CREDENTIAL_SCOPES,
   createAccountId,
@@ -22,6 +24,13 @@ export interface CreatedAccountResponse {
   readonly destination: ReceiveDestination
 }
 
+export interface V2FundingProvisioner {
+  provision(input: {
+    readonly accountId: string
+    readonly owner: string
+  }): Promise<void>
+}
+
 export class AccountService {
   public constructor(
     private readonly repository: AccountRepository & ReceiveRepository,
@@ -29,6 +38,7 @@ export class AccountService {
     private readonly rail: SolanaRail,
     private readonly v2Admin?: V2AdminRepository,
     private readonly recoveryCipher?: RecoveryEnvelopeCipher,
+    private readonly v2FundingProvisioner?: V2FundingProvisioner,
   ) {}
 
   public async createAccount(name: string): Promise<CreatedAccountResponse> {
@@ -102,8 +112,12 @@ export class AccountService {
     if (normalizedName.length === 0 || normalizedName.length > 120) {
       throw new ValidationError('Account name must contain 1 to 120 characters')
     }
-    const replay = await this.v2Admin.findProvisioningReplay(idempotencyKey)
+    const requestHash = hashProvisioningRequest(normalizedName)
+    const replay = await this.v2Admin.findProvisioningReplay({ idempotencyKey, requestHash })
     if (replay !== null) {
+      const existingAccount = await this.v2Admin.findAccount(replay.accountId)
+      if (existingAccount === null) throw new Error('Provisioned account is unavailable')
+      await this.finishV2Provisioning(existingAccount.id, existingAccount.solanaPublicKey)
       const envelope = await this.v2Admin.consumeRecoveryEnvelope(
         replay.accountId,
         idempotencyKey,
@@ -148,6 +162,7 @@ export class AccountService {
       const receiveId = createReceiveId()
       await this.v2Admin.provisionAccount({
         idempotencyKey,
+        requestHash,
         accountId,
         name: normalizedName,
         solanaPublicKey: wallet.publicKey,
@@ -165,6 +180,7 @@ export class AccountService {
         receiveRequestId: receiveId,
         receiveReference: `account:${accountId}`,
       })
+      await this.finishV2Provisioning(accountId, wallet.publicKey)
       return {
         id: accountId,
         name: normalizedName,
@@ -178,6 +194,61 @@ export class AccountService {
       wallet.secretKey.fill(0)
     }
   }
+
+  private async finishV2Provisioning(accountId: string, owner: string): Promise<void> {
+    if (this.v2Admin === undefined) {
+      throw new DependencyUnavailableError('V2 account provisioning is unavailable')
+    }
+    let account = await this.v2Admin.findAccount(accountId)
+    if (account === null) throw new Error('Provisioned account is unavailable')
+    if (account.status === 'ACTIVE') return
+    if (account.status === 'PROVISIONING_FAILED') {
+      await this.v2Admin.transitionAccount({
+        accountId,
+        currentStatus: account.status,
+        nextStatus: 'PROVISIONING',
+        rowVersion: account.rowVersion,
+        reason: 'PROVISIONING_RETRY',
+      })
+      account = await this.v2Admin.findAccount(accountId)
+      if (account === null) throw new Error('Provisioned account is unavailable')
+    }
+    if (account.status !== 'PROVISIONING') {
+      throw new ValidationError('Account is not in a resumable provisioning state')
+    }
+    try {
+      if (this.v2FundingProvisioner === undefined) {
+        throw new DependencyUnavailableError('Funding destination provisioning is unavailable')
+      }
+      await this.v2FundingProvisioner.provision({ accountId, owner })
+      const current = await this.v2Admin.findAccount(accountId)
+      if (current === null) throw new Error('Provisioned account is unavailable')
+      await this.v2Admin.transitionAccount({
+        accountId,
+        currentStatus: 'PROVISIONING',
+        nextStatus: 'ACTIVE',
+        rowVersion: current.rowVersion,
+      })
+    } catch (error) {
+      const current = await this.v2Admin.findAccount(accountId)
+      if (current !== null && current.status === 'PROVISIONING') {
+        await this.v2Admin.transitionAccount({
+          accountId,
+          currentStatus: 'PROVISIONING',
+          nextStatus: 'PROVISIONING_FAILED',
+          rowVersion: current.rowVersion,
+          reason: error instanceof Error ? error.name : 'PROVISIONING_FAILED',
+        })
+      }
+      throw error
+    }
+  }
+}
+
+function hashProvisioningRequest(name: string): string {
+  return createHash('sha256')
+    .update(JSON.stringify({ name }), 'utf8')
+    .digest('hex')
 }
 
 function decodeOneTimeSecret(secret: Uint8Array): string {

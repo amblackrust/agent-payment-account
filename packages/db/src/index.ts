@@ -13,8 +13,15 @@ import {
 import { PrismaClient, type Prisma } from './generated/client/client.js'
 import { createV2DatabaseRepository, type V2DatabaseRepository } from './v2.js'
 import { createV2AdminRepository, type V2AdminRepository } from './v2-admin.js'
+import {
+  createV2OperationsRepository,
+  type V2OperationsRepository,
+} from './v2-operations.js'
+
+const MAX_INCOMING_ISSUE_RETRIES = 8
 export { createV2DatabaseRepository } from './v2.js'
 export { createV2AdminRepository } from './v2-admin.js'
+export { createV2OperationsRepository } from './v2-operations.js'
 export type {
   V2AccountRecord,
   V2AdminRepository,
@@ -29,6 +36,15 @@ export type {
   V2SpendPolicyAdminRecord,
   V2SigningRequestRecord,
 } from './v2-admin.js'
+export type {
+  V2BackupRestoreVerificationRecord,
+  V2OperationalExceptionRecord,
+  V2OperationsRepository,
+  V2PlatformCostRecord,
+  V2TimelineRecord,
+  V2WebhookDeliveryClaim,
+  V2WebhookSubscriptionRecord,
+} from './v2-operations.js'
 export type {
   V2ApprovedDestinationRecord,
   V2DatabaseRepository,
@@ -460,6 +476,11 @@ export interface IncomingPaymentRepository {
     issueId: string,
     reason: string,
   ) => Promise<void>
+  readonly exhaustIncomingReconciliationIssue: (
+    issueId: string,
+    reason: string,
+    now?: Date,
+  ) => Promise<void>
 }
 
 export interface IncomingReconciliationIssueRecord {
@@ -636,6 +657,7 @@ export interface DatabaseClient
     IncomingPaymentRepository {
   readonly v2: V2DatabaseRepository
   readonly v2Admin: V2AdminRepository
+  readonly v2Operations: V2OperationsRepository
   initializeRuntimeIdentity(
     input: RuntimeIdentity,
     validateLegacyCustody?: (custody: AccountCustodyRecord) => Promise<void>,
@@ -752,10 +774,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
   const prisma = new PrismaClient({ adapter })
   const v2 = createV2DatabaseRepository(prisma)
   const v2Admin = createV2AdminRepository(prisma)
+  const v2Operations = createV2OperationsRepository(prisma)
 
   return {
     v2,
     v2Admin,
+    v2Operations,
     async createAgentAccount(input): Promise<StoredAgentAccount> {
       return prisma.$transaction(async (transaction) => {
         const account = await transaction.agentAccount.create({
@@ -1915,6 +1939,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           FROM "incoming_reconciliation_issues" issue
           JOIN "agent_accounts" account ON account.id = issue.account_id
           WHERE issue.status = 'PENDING'
+            AND issue.retry_count <= ${MAX_INCOMING_ISSUE_RETRIES}
             AND issue.next_retry_at <= ${now}
           ORDER BY issue.next_retry_at ASC, issue.id ASC
           LIMIT ${limit}
@@ -1955,6 +1980,48 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       await prisma.incomingReconciliationIssue.updateMany({
         where: { id: issueId, status: 'PENDING' },
         data: { reason },
+      })
+    },
+    async exhaustIncomingReconciliationIssue(issueId, reason, now = new Date()) {
+      await prisma.$transaction(async (transaction) => {
+        const updated = await transaction.incomingReconciliationIssue.updateMany({
+          where: { id: issueId, status: 'PENDING' },
+          data: { status: 'EXHAUSTED', reason },
+        })
+        if (updated.count !== 1) return
+        const issue = await transaction.incomingReconciliationIssue.findUniqueOrThrow({
+          where: { id: issueId },
+        })
+        await transaction.operationalException.upsert({
+          where: { activeDedupeKey: `active:incoming-issue:${issue.id}` },
+          create: {
+            id: `opx_incoming_${randomBytes(16).toString('hex')}`,
+            accountId: issue.accountId,
+            resourceType: 'INCOMING_RECONCILIATION_ISSUE',
+            resourceId: issue.id,
+            dedupeKey: `incoming-issue:${issue.id}`,
+            activeDedupeKey: `active:incoming-issue:${issue.id}`,
+            reasonCode: 'INCOMING_ISSUE_RETRY_EXHAUSTED',
+            detailsJson: JSON.stringify({ signature: issue.signature, reason }),
+          },
+          update: {
+            updatedAt: now,
+            detailsJson: JSON.stringify({ signature: issue.signature, reason }),
+          },
+        })
+        await transaction.operationTimelineEvent.create({
+          data: {
+            id: `timeline_${randomBytes(16).toString('hex')}`,
+            accountId: issue.accountId,
+            resourceType: 'INCOMING_RECONCILIATION_ISSUE',
+            resourceId: issue.id,
+            eventType: 'INCOMING_ISSUE_EXHAUSTED',
+            actorType: 'SYSTEM',
+            source: 'INCOMING_RECONCILIATION',
+            occurredAt: now,
+            newStateJson: JSON.stringify({ status: 'EXHAUSTED', reason }),
+          },
+        })
       })
     },
     async createIncomingPayment(input) {

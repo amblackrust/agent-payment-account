@@ -158,7 +158,7 @@ export interface V2ReceiveRequestAdminRecord {
 
 export interface V2AdminRepository {
   findProvisioningReplay(
-    idempotencyKey: string,
+    input: { readonly idempotencyKey: string; readonly requestHash: string },
   ): Promise<{ readonly accountId: string; readonly credentialId: string } | null>
   createReceiveRequestIdempotent(input: {
     readonly id: string
@@ -175,6 +175,7 @@ export interface V2AdminRepository {
   }): Promise<V2ReceiveRequestAdminRecord>
   provisionAccount(input: {
     readonly idempotencyKey: string
+    readonly requestHash: string
     readonly accountId: string
     readonly name: string
     readonly solanaPublicKey: string
@@ -386,7 +387,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           data: {
             id: input.accountId,
             name: input.name,
-            status: 'ACTIVE',
+            status: 'PROVISIONING',
             solanaPublicKey: input.solanaPublicKey,
             encryptedSolanaSecret: input.encryptedSolanaSecret,
             encryptionNonce: input.encryptionNonce,
@@ -429,8 +430,8 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             ownerAccountId: input.accountId,
             operation: 'ACCOUNT_PROVISION',
             key: input.idempotencyKey,
-            requestHash: input.idempotencyKey.padEnd(64, '0').slice(0, 64),
-            fingerprint: input.idempotencyKey.padEnd(64, '0').slice(0, 64),
+            requestHash: input.requestHash,
+            fingerprint: input.requestHash,
             resourceId: account.id,
             responseSnapshot: credential.id,
             expiresAt: input.recoveryExpiresAt,
@@ -445,12 +446,13 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
       })
     },
 
-    async findProvisioningReplay(idempotencyKey) {
+    async findProvisioningReplay(input) {
       const record = await prisma.idempotencyRecord.findFirst({
-        where: { operation: 'ACCOUNT_PROVISION', key: idempotencyKey },
-        select: { resourceId: true, responseSnapshot: true },
+        where: { operation: 'ACCOUNT_PROVISION', key: input.idempotencyKey },
+        select: { resourceId: true, responseSnapshot: true, requestHash: true },
       })
       if (record === null || record.responseSnapshot === null) return null
+      if (record.requestHash !== input.requestHash) throw new IdempotencyConflictError()
       return { accountId: record.resourceId, credentialId: record.responseSnapshot }
     },
 
@@ -738,7 +740,12 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           where: { id: approval.paymentId, payerAccountId: input.accountId },
         })
         if (payment === null) throw new NotFoundError('Approval payment was not found')
-        const nextStatus = input.action === 'APPROVE' ? 'APPROVED' : input.action
+        const nextStatus =
+          input.action === 'APPROVE'
+            ? 'APPROVED'
+            : input.action === 'EXPIRE'
+              ? 'EXPIRED'
+              : 'REJECTED'
         if (input.action === 'APPROVE') {
           if (approval.expiresAt <= now) throw new ConflictError('Approval has expired')
           if (payment.status !== 'AWAITING_APPROVAL') {
@@ -750,7 +757,11 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           })
           if (account.status !== 'ACTIVE') throw new InvalidStateError('Agent account is not active')
           const reserved = await transaction.outgoingReservation.aggregate({
-            where: { ownerAccountId: input.accountId, status: 'ACTIVE' },
+            where: {
+              ownerAccountId: input.accountId,
+              status: 'ACTIVE',
+              lifecycleState: 'HELD',
+            },
             _sum: { amountAtomic: true },
           })
           const available = (input.settledAtomic ?? 0n) - (reserved._sum.amountAtomic ?? 0n)
@@ -793,9 +804,10 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           await transaction.payment.update({
             where: { id: payment.id },
             data: {
-              status: 'PROVED_NO_EFFECT',
+              status: nextStatus === 'EXPIRED' ? 'EXPIRED' : 'REJECTED',
               executionState: 'TERMINAL',
               outcomeState: 'PROVED_NO_EFFECT',
+              settlementState: 'NOT_SUBMITTED',
               rowVersion: { increment: 1 },
             },
           })

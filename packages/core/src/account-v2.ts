@@ -27,6 +27,7 @@ export const AGENT_CREDENTIAL_SCOPES = {
   RECEIVE_MANAGE: 'receive:manage',
   BALANCE_READ: 'balance:read',
   HISTORY_READ: 'history:read',
+  WEBHOOKS_MANAGE: 'webhooks:manage',
 } as const
 
 export type AgentCredentialScope =
@@ -39,6 +40,7 @@ export const DEFAULT_AGENT_CREDENTIAL_SCOPES: readonly AgentCredentialScope[] = 
   AGENT_CREDENTIAL_SCOPES.RECEIVE_MANAGE,
   AGENT_CREDENTIAL_SCOPES.BALANCE_READ,
   AGENT_CREDENTIAL_SCOPES.HISTORY_READ,
+  AGENT_CREDENTIAL_SCOPES.WEBHOOKS_MANAGE,
 ]
 
 export function canTransitionAgentAccount(

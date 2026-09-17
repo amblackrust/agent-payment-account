@@ -269,7 +269,9 @@ export interface V2DatabaseRepository {
     readonly limit: number
     readonly cursor?: { readonly createdAt: Date; readonly id: string }
     readonly status?: string
+    readonly outcomeState?: string
     readonly recipientId?: string
+    readonly denominationId?: string
   }): Promise<readonly V2PaymentView[]>
   listPayments(input: {
     readonly accountId: string
@@ -499,7 +501,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         where: {
           originalPaymentId,
           kind: 'REFUND',
-          status: { notIn: ['FAILED', 'REJECTED', 'REJECTED_BY_POLICY', 'EXPIRED'] },
+          status: {
+            notIn: ['FAILED', 'REJECTED', 'REJECTED_BY_POLICY', 'EXPIRED', 'PROVED_NO_EFFECT'],
+          },
         },
         _sum: { amountAtomic: true },
       })
@@ -695,6 +699,50 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           }
         }
 
+        if (input.operation === 'REFUND' && input.originalPaymentId === undefined) {
+          throw new InvalidStateError('Refund payment must reference an original payment')
+        }
+        if (input.operation !== 'REFUND' && input.originalPaymentId !== undefined) {
+          throw new InvalidStateError('Only refund payments may reference an original payment')
+        }
+        if (input.originalPaymentId !== undefined) {
+          const originalRows = await transaction.$queryRaw<
+            Array<{ amount_atomic: bigint; status: string; kind: string }>
+          >`
+            SELECT amount_atomic, status, kind
+            FROM "payments"
+            WHERE id = ${input.originalPaymentId}
+            FOR UPDATE
+          `
+          const original = originalRows[0]
+          if (
+            original === undefined ||
+            original.status !== 'CONFIRMED' ||
+            original.kind === 'REFUND'
+          ) {
+            throw new InvalidStateError('Original payment is not refundable')
+          }
+          const refunded = await transaction.payment.aggregate({
+            where: {
+              originalPaymentId: input.originalPaymentId,
+              kind: 'REFUND',
+              status: {
+                notIn: [
+                  'FAILED',
+                  'REJECTED',
+                  'REJECTED_BY_POLICY',
+                  'EXPIRED',
+                  'PROVED_NO_EFFECT',
+                ],
+              },
+            },
+            _sum: { amountAtomic: true },
+          })
+          if (input.amountAtomic + (refunded._sum.amountAtomic ?? 0n) > original.amount_atomic) {
+            throw new ConflictError('Refund amount exceeds the original payment amount')
+          }
+        }
+
         const decision = input.policyDecision.decision
         if (
           decision === 'ALLOW' &&
@@ -706,7 +754,11 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         }
         if (decision === 'ALLOW') {
           const reservations = await transaction.outgoingReservation.aggregate({
-            where: { ownerAccountId: input.accountId, status: 'ACTIVE' },
+            where: {
+              ownerAccountId: input.accountId,
+              status: 'ACTIVE',
+              lifecycleState: 'HELD',
+            },
             _sum: { amountAtomic: true },
           })
           const reservedAtomic = reservations._sum.amountAtomic ?? 0n
@@ -845,6 +897,15 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             newStateJson: JSON.stringify({ status, policy_decision: decision }),
           },
         })
+        await enqueuePaymentWebhookEvent(transaction, {
+          accountId: input.accountId,
+          paymentId: payment.id,
+          resourceVersion: payment.rowVersion,
+          eventType: 'payment.created',
+          status,
+          amountAtomic: payment.amountAtomic,
+          denominationId: payment.denominationId,
+        })
         return { payment: toV2PaymentSnapshot(payment), created: true }
       })
     },
@@ -868,9 +929,13 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         where: {
           payerAccountId: input.accountId,
           ...(input.status === undefined ? {} : { status: input.status as never }),
+          ...(input.outcomeState === undefined ? {} : { outcomeState: input.outcomeState }),
           ...(input.recipientId === undefined
             ? {}
             : { recipientId: input.recipientId }),
+          ...(input.denominationId === undefined
+            ? {}
+            : { denominationId: input.denominationId }),
           ...(input.cursor === undefined
             ? {}
             : {
@@ -1062,6 +1127,15 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         const updated = await transaction.payment.findUniqueOrThrow({
           where: { id: payment.id },
         })
+        await enqueuePaymentWebhookEvent(transaction, {
+          accountId: payment.payerAccountId,
+          paymentId: payment.id,
+          resourceVersion: updated.rowVersion,
+          eventType: 'payment.updated',
+          status: updated.status,
+          amountAtomic: updated.amountAtomic,
+          denominationId: updated.denominationId,
+        })
         const decision = await transaction.policyDecision.findUniqueOrThrow({
           where: { paymentId: payment.id },
         })
@@ -1183,6 +1257,15 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           },
         })
         const updated = await transaction.payment.findUniqueOrThrow({ where: { id: input.paymentId } })
+        await enqueuePaymentWebhookEvent(transaction, {
+          accountId: updated.payerAccountId,
+          paymentId: updated.id,
+          resourceVersion: updated.rowVersion,
+          eventType: 'payment.updated',
+          status: updated.status,
+          amountAtomic: updated.amountAtomic,
+          denominationId: updated.denominationId,
+        })
         const decision = await transaction.policyDecision.findUniqueOrThrow({ where: { paymentId: input.paymentId } })
         const approval = await transaction.approval.findUnique({ where: { paymentId: input.paymentId } })
         const reservation = await transaction.outgoingReservation.findUnique({ where: { paymentId: input.paymentId } })
@@ -1587,6 +1670,18 @@ async function markWorkItemExhausted(
           rowVersion: { increment: 1 },
         },
       })
+      const updatedPayment = await transaction.payment.findUniqueOrThrow({
+        where: { id: payment.id },
+      })
+      await enqueuePaymentWebhookEvent(transaction, {
+        accountId: updatedPayment.payerAccountId,
+        paymentId: updatedPayment.id,
+        resourceVersion: updatedPayment.rowVersion,
+        eventType: 'payment.updated',
+        status: updatedPayment.status,
+        amountAtomic: updatedPayment.amountAtomic,
+        denominationId: updatedPayment.denominationId,
+      })
       await transaction.operationTimelineEvent.create({
         data: {
           id: `timeline_${randomId()}`,
@@ -1604,7 +1699,7 @@ async function markWorkItemExhausted(
     await transaction.operationalException.upsert({
       where: { activeDedupeKey: `active:payment:${payment.id}:work-exhausted` },
       create: {
-        id: `opx_${item.id}`,
+        id: `opx_${randomId()}`,
         accountId: payment.accountId,
         resourceType: 'PAYMENT',
         resourceId: payment.id,
@@ -1624,7 +1719,7 @@ async function markWorkItemExhausted(
   await transaction.operationalException.upsert({
     where: { activeDedupeKey: `active:work:${item.id}` },
     create: {
-      id: `opx_${item.id}`,
+      id: `opx_${randomId()}`,
       resourceType: item.resourceType,
       resourceId: item.resourceId,
       dedupeKey: `work:${item.id}`,
@@ -1667,4 +1762,58 @@ async function findWorkPayment(
         }
   }
   return null
+}
+
+async function enqueuePaymentWebhookEvent(
+  transaction: Prisma.TransactionClient,
+  input: {
+    readonly accountId: string
+    readonly paymentId: string
+    readonly resourceVersion: number
+    readonly eventType: string
+    readonly status: string
+    readonly amountAtomic: bigint
+    readonly denominationId: string | null
+  },
+): Promise<void> {
+  const eventId = `payment:${input.paymentId}:${input.resourceVersion}:${input.eventType}`
+  const existing = await transaction.webhookEvent.findUnique({ where: { eventId } })
+  if (existing !== null) return
+  const event = await transaction.webhookEvent.create({
+    data: {
+      id: `webhook_${randomId()}`,
+      eventId,
+      resourceType: 'PAYMENT',
+      resourceId: input.paymentId,
+      resourceVersion: input.resourceVersion,
+      eventType: input.eventType,
+      eventVersion: 'v2',
+      rawBody: JSON.stringify({
+        id: eventId,
+        type: input.eventType,
+        version: 'v2',
+        resource: {
+          id: input.paymentId,
+          status: input.status,
+          amount_atomic: input.amountAtomic.toString(),
+          denomination_id: input.denominationId,
+        },
+      }),
+    },
+  })
+  const subscriptions = await transaction.webhookSubscription.findMany({
+    where: { accountId: input.accountId, status: 'ACTIVE' },
+  })
+  for (const subscription of subscriptions) {
+    const eventTypes = parseStringArray(subscription.eventTypesJson, 'webhook event types')
+    if (!eventTypes.includes(input.eventType) && !eventTypes.includes('*')) continue
+    await transaction.webhookDelivery.create({
+      data: {
+        id: `delivery_${randomId()}`,
+        eventId: event.eventId,
+        subscriptionId: subscription.id,
+        deliveryNumber: 1,
+      },
+    })
+  }
 }

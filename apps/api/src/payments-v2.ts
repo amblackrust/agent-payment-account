@@ -301,7 +301,9 @@ export class V2PaymentService {
       readonly limit?: number
       readonly cursor?: string
       readonly status?: string
+      readonly outcomeState?: string
       readonly recipientId?: string
+      readonly denominationId?: string
     } = {},
   ): Promise<V2PaymentPage> {
     const limit = input.limit ?? 50
@@ -313,15 +315,23 @@ export class V2PaymentService {
     const cursor = decodeCursor(input.cursor)
     const payments = await this.options.repository.listPaymentViews({
       accountId,
-      limit,
+      limit: limit + 1,
       ...(cursor === undefined ? {} : { cursor }),
       ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.outcomeState === undefined ? {} : { outcomeState: input.outcomeState }),
       ...(input.recipientId === undefined ? {} : { recipientId: input.recipientId }),
+      ...(input.denominationId === undefined
+        ? {}
+        : { denominationId: input.denominationId }),
     })
-    const last = payments.at(-1)?.payment
+    const visible = payments.slice(0, limit)
+    const last = visible.at(-1)?.payment
     return {
-      payments,
-      nextCursor: last === undefined ? null : encodeCursor(last.createdAt, last.id),
+      payments: visible,
+      nextCursor:
+        payments.length > limit && last !== undefined
+          ? encodeCursor(last.createdAt, last.id)
+          : null,
     }
   }
 
@@ -346,6 +356,12 @@ export class V2PaymentService {
     }
     const denomination = await this.loadDenomination(input.denominationId)
     const amount = parseAmount(input.amount, denomination)
+    if (
+      input.routePreference !== undefined &&
+      input.routePreference !== original.payment.routeId
+    ) {
+      throw new ValidationError('Refund route must match the original payment')
+    }
     const refundedAtomic =
       await this.options.repository.getRefundedAtomic(originalPaymentId)
     if (amount.atomicUnits + refundedAtomic > original.payment.amountAtomic) {
@@ -375,6 +391,9 @@ export class V2PaymentService {
             walletAddress: payerPublicKey,
           },
         },
+        ...(original.payment.routeId === null
+          ? {}
+          : { routePreference: original.payment.routeId }),
       },
       idempotencyKey,
       requestId,
@@ -491,7 +510,7 @@ function decodeCursor(
       throw new Error('invalid cursor')
     }
     return { createdAt, id: decoded.id }
-  } catch (error) {
+  } catch {
     throw new InvalidStateError('Payment cursor is invalid')
   }
 }

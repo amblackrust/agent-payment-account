@@ -63,7 +63,7 @@ export const v2ErrorEnvelopeSchema = z
 
 export const v2PaymentCreateRequestSchema = z
   .object({
-    kind: z.enum(['PAY', 'SEND', 'REFUND']).default('PAY'),
+    kind: z.enum(['PAY', 'SEND']).default('PAY'),
     recipient_id: z.string().min(1),
     amount: exactAmountSchema,
     denomination_id: z.string().min(1),

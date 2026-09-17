@@ -72,6 +72,7 @@ enum IncomingPaymentStatus {
 enum IncomingReconciliationIssueStatus {
   PENDING
   RESOLVED
+  EXHAUSTED
 }
 
 model AgentAccount {
@@ -681,6 +682,7 @@ model OperationalException {
   updatedAt       DateTime  @updatedAt @map("updated_at")
   acknowledgedAt  DateTime? @map("acknowledged_at")
   resolvedAt      DateTime? @map("resolved_at")
+  rowVersion      Int       @default(1) @map("row_version")
 
   @@index([status, severity, createdAt])
   @@index([resourceType, resourceId])
@@ -725,6 +727,8 @@ model WebhookDelivery {
   status         String    @default("AVAILABLE") @db.VarChar(16)
   availableAt    DateTime  @default(now()) @map("available_at")
   attemptCount   Int       @default(0) @map("attempt_count")
+  leaseOwner     String?   @map("lease_owner") @db.VarChar(128)
+  leaseExpiresAt DateTime? @map("lease_expires_at")
   nextRetryAt    DateTime? @map("next_retry_at")
   responseStatus Int?      @map("response_status")
   errorSafe      String?   @map("error_safe") @db.Text
