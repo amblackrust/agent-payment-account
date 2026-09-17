@@ -183,7 +183,10 @@ async function startWorker(): Promise<void> {
     allowMainnet: config.allowMainnet,
     settlementMint: config.solanaSettlementMint,
   })
-  const walletCipher = new WalletSecretCipher(config.walletMasterKey)
+  const walletCipher =
+    config.runtimeRole === 'outgoing'
+      ? new WalletSecretCipher(config.walletMasterKey)
+      : undefined
   await database.initializeRuntimeIdentity(
     {
       rail: 'SOLANA_SPL',
@@ -198,7 +201,9 @@ async function startWorker(): Promise<void> {
         ? {}
         : { custodyBackendMode: config.custodyBackendMode }),
     },
-    (custody) => validateLegacyWalletCustody(walletCipher, custody),
+    config.runtimeRole === 'outgoing'
+      ? (custody) => validateLegacyWalletCustody(walletCipher!, custody)
+      : undefined,
   )
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
@@ -206,7 +211,11 @@ async function startWorker(): Promise<void> {
 
   const v2OutgoingRuntime =
     config.runtimeRole === 'outgoing' || config.runtimeRole === 'reconcile'
-      ? createV2OutgoingWorker({ config, database, walletCipher })
+      ? createV2OutgoingWorker({
+          config,
+          database,
+          ...(walletCipher === undefined ? {} : { walletCipher }),
+        })
       : undefined
 
   const incomingReader =

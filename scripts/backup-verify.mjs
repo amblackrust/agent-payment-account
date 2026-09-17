@@ -121,9 +121,9 @@ function verifyBackup(inputArgument) {
     )
     runSql(
       targetDatabaseUrl,
-      `UPDATE runtime_metadata
-          SET value = 'RESTORE_RECONCILIATION_REQUIRED', updated_at = NOW()
-        WHERE key = 'money_worker_gate'`,
+      `UPDATE "RuntimeMetadata"
+          SET "value" = 'RESTORE_RECONCILIATION_REQUIRED', "updatedAt" = NOW()
+        WHERE "key" = 'money_worker_gate'`,
     )
     process.stdout.write(
       `Restore verification passed for ${backupReference}; external reconciliation is required before promotion\n`,
@@ -158,6 +158,7 @@ function completeReconciliation(evidenceArgument) {
   const environment = requiredEnvironment('BACKUP_VERIFY_ENVIRONMENT')
   const custodyIdentity = requiredEnvironment('BACKUP_VERIFY_CUSTODY_IDENTITY')
   const runtimeAuthorityId = requiredEnvironment('BACKUP_VERIFY_RUNTIME_AUTHORITY_ID')
+  const verificationId = process.env.BACKUP_VERIFY_VERIFICATION_ID?.trim() || ''
   const evidenceReference = requiredArgument(
     evidenceArgument,
     'reconciliation evidence reference',
@@ -167,51 +168,128 @@ function completeReconciliation(evidenceArgument) {
       'Restore reconciliation must be completed in the promoted non-production gate environment',
     )
   }
-  const verification = runSql(
-    databaseUrl,
-    `SELECT count(*)
-       FROM backup_restore_verifications
-      WHERE status = 'VERIFIED'
-        AND environment = :'environment'
-        AND custody_identity = :'custody_identity'
-        AND EXISTS (
-          SELECT 1 FROM runtime_metadata
-           WHERE key = 'runtime_authority'
-             AND value = :'runtime_authority'
-        )`,
-    {
-      environment,
-      custody_identity: custodyIdentity,
-      runtime_authority: runtimeAuthorityId,
-    },
-  )
-  const verifiedCount = Number(verification)
-  if (!Number.isSafeInteger(verifiedCount) || verifiedCount < 1) {
-    throw new Error(
-      'No verified restore exists for the requested environment and custody identity',
-    )
-  }
-  runSql(
-    databaseUrl,
-    `INSERT INTO runtime_metadata (key, value, created_at, updated_at)
-      VALUES ('restore_reconciliation_evidence', :'evidence', NOW(), NOW())
-      ON CONFLICT (key) DO UPDATE
-        SET value = EXCLUDED.value, updated_at = NOW();
-     UPDATE runtime_metadata
-        SET value = 'RESTORE_VERIFIED', updated_at = NOW()
-      WHERE key = 'money_worker_gate';`,
-    {
-      evidence: JSON.stringify({
-        reference: evidenceReference,
-        environment,
-        custody_identity: custodyIdentity,
-        runtime_authority: runtimeAuthorityId,
-      }),
-    },
-  )
+  runSql(databaseUrl, completeReconciliationSql(), {
+    environment,
+    custody_identity: custodyIdentity,
+    runtime_authority: runtimeAuthorityId,
+    evidence: evidenceReference,
+    verification_id: verificationId,
+  })
   process.stdout.write(
     `Restore reconciliation evidence ${evidenceReference} recorded; money workers may be promoted\n`,
   )
+}
+
+function completeReconciliationSql() {
+  return `BEGIN;
+  SELECT
+    set_config('mux_restore.environment', :'environment', false),
+    set_config('mux_restore.custody_identity', :'custody_identity', false),
+    set_config('mux_restore.runtime_authority', :'runtime_authority', false),
+    set_config('mux_restore.evidence', :'evidence', false),
+    set_config('mux_restore.verification_id', :'verification_id', false);
+  DO $restore_reconciliation_fence$
+  DECLARE
+    requested_environment TEXT := current_setting('mux_restore.environment');
+    requested_custody_identity TEXT := current_setting('mux_restore.custody_identity');
+    requested_runtime_authority TEXT := current_setting('mux_restore.runtime_authority');
+    requested_evidence TEXT := current_setting('mux_restore.evidence');
+    requested_verification_id TEXT := current_setting('mux_restore.verification_id');
+    gate_status TEXT;
+    authority_value TEXT;
+    latest_id TEXT;
+    latest_backup_reference TEXT;
+    latest_environment TEXT;
+    latest_status TEXT;
+    latest_custody_identity TEXT;
+    latest_verified_at TIMESTAMPTZ;
+    existing_evidence JSONB;
+    expected_evidence JSONB;
+  BEGIN
+    SELECT value
+      INTO gate_status
+      FROM "RuntimeMetadata"
+     WHERE "key" = 'money_worker_gate'
+     FOR UPDATE;
+
+    SELECT value
+      INTO authority_value
+      FROM "RuntimeMetadata"
+     WHERE "key" = 'runtime_authority';
+
+    SELECT id, backup_reference, environment, status, custody_identity, verified_at
+      INTO latest_id, latest_backup_reference, latest_environment, latest_status,
+        latest_custody_identity, latest_verified_at
+      FROM backup_restore_verifications
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1;
+
+    IF latest_id IS NULL
+      OR latest_status IS DISTINCT FROM 'VERIFIED'
+      OR latest_verified_at IS NULL THEN
+      RAISE EXCEPTION 'No current verified restore exists for reconciliation';
+    END IF;
+    IF latest_environment IS DISTINCT FROM requested_environment
+      OR latest_custody_identity IS DISTINCT FROM requested_custody_identity THEN
+      RAISE EXCEPTION 'Current restore verification does not match the requested environment or custody identity';
+    END IF;
+    IF authority_value IS DISTINCT FROM requested_runtime_authority THEN
+      RAISE EXCEPTION 'Runtime authority does not match the requested restore authority';
+    END IF;
+    IF requested_verification_id <> ''
+      AND requested_verification_id IS DISTINCT FROM latest_id THEN
+      RAISE EXCEPTION 'Requested restore verification is stale or does not match the current verification';
+    END IF;
+
+    expected_evidence := jsonb_build_object(
+      'reference', requested_evidence,
+      'verification_id', latest_id,
+      'backup_reference', latest_backup_reference,
+      'environment', requested_environment,
+      'custody_identity', requested_custody_identity,
+      'runtime_authority', requested_runtime_authority
+    );
+
+    IF gate_status = 'RESTORE_VERIFIED' THEN
+      SELECT value::jsonb
+        INTO existing_evidence
+        FROM "RuntimeMetadata"
+       WHERE "key" = 'restore_reconciliation_evidence';
+      IF existing_evidence IS NULL
+        OR existing_evidence->>'reference' IS DISTINCT FROM expected_evidence->>'reference'
+        OR existing_evidence->>'verification_id' IS DISTINCT FROM expected_evidence->>'verification_id'
+        OR existing_evidence->>'backup_reference' IS DISTINCT FROM expected_evidence->>'backup_reference'
+        OR existing_evidence->>'environment' IS DISTINCT FROM expected_evidence->>'environment'
+        OR existing_evidence->>'custody_identity' IS DISTINCT FROM expected_evidence->>'custody_identity'
+        OR existing_evidence->>'runtime_authority' IS DISTINCT FROM expected_evidence->>'runtime_authority' THEN
+        RAISE EXCEPTION 'Restore reconciliation is already complete with different evidence';
+      END IF;
+      RETURN;
+    END IF;
+
+    IF gate_status IS DISTINCT FROM 'RESTORE_RECONCILIATION_REQUIRED' THEN
+      RAISE EXCEPTION 'Restore reconciliation requires money_worker_gate=RESTORE_RECONCILIATION_REQUIRED';
+    END IF;
+
+    INSERT INTO "RuntimeMetadata" ("key", "value", "createdAt", "updatedAt")
+      VALUES ('restore_reconciliation_evidence', expected_evidence::TEXT, NOW(), NOW())
+      ON CONFLICT ("key") DO UPDATE
+        SET "value" = EXCLUDED."value", "updatedAt" = NOW()
+      WHERE "RuntimeMetadata"."value" = EXCLUDED."value";
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Restore reconciliation evidence already exists with different contents';
+    END IF;
+
+    UPDATE "RuntimeMetadata"
+       SET "value" = 'RESTORE_VERIFIED', "updatedAt" = NOW()
+     WHERE "key" = 'money_worker_gate'
+       AND "value" = 'RESTORE_RECONCILIATION_REQUIRED';
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Restore reconciliation gate changed before completion';
+    END IF;
+  END
+  $restore_reconciliation_fence$;
+  COMMIT;`
 }
 
 function restoreInvariantQuery() {
@@ -221,7 +299,7 @@ function restoreInvariantQuery() {
         AND table_name IN (
           'agent_accounts', 'payments', 'payment_attempts', 'outgoing_reservations',
           'evidence_records', 'operation_timeline_events', 'operational_exceptions',
-          'webhook_events', 'backup_restore_verifications', 'runtime_metadata'
+          'webhook_events', 'backup_restore_verifications', 'RuntimeMetadata'
         )) AS required_table_count,
     (SELECT count(*) FROM outgoing_reservations r
       JOIN payments p ON p.id = r.payment_id
@@ -229,28 +307,29 @@ function restoreInvariantQuery() {
     (SELECT count(*) FROM payment_attempts a
       LEFT JOIN payments p ON p.id = a.payment_id
       WHERE p.id IS NULL) AS missing_attempt_links,
-    (SELECT count(*) FROM runtime_metadata WHERE key = 'runtime_identity') AS runtime_identity_rows,
-    (SELECT count(*) FROM runtime_metadata
-      WHERE key = 'runtime_authority' AND value = :'runtime_authority') AS runtime_authority_rows,
-    (SELECT count(*) FROM runtime_metadata
-      WHERE key = 'runtime_identity'
-        AND value::jsonb ->> 'custodyBackendIdentity' = :'custody_identity') AS custody_identity_rows;`
+    (SELECT count(*) FROM "RuntimeMetadata" WHERE "key" = 'runtime_identity') AS runtime_identity_rows,
+    (SELECT count(*) FROM "RuntimeMetadata"
+      WHERE "key" = 'runtime_authority' AND "value" = :'runtime_authority') AS runtime_authority_rows,
+    (SELECT count(*) FROM "RuntimeMetadata"
+      WHERE "key" = 'runtime_identity'
+        AND "value"::jsonb ->> 'custodyBackendIdentity' = :'custody_identity') AS custody_identity_rows;`
 }
 
 function setRestoredRuntimePendingSql() {
-  return `INSERT INTO runtime_metadata (key, value, created_at, updated_at)
+  return `INSERT INTO "RuntimeMetadata" ("key", "value", "createdAt", "updatedAt")
     VALUES ('money_worker_gate', 'RESTORE_PENDING', NOW(), NOW())
-    ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = NOW();
-  INSERT INTO runtime_metadata (key, value, created_at, updated_at)
+    ON CONFLICT ("key") DO UPDATE
+      SET "value" = EXCLUDED."value", "updatedAt" = NOW();
+  INSERT INTO "RuntimeMetadata" ("key", "value", "createdAt", "updatedAt")
     VALUES ('runtime_authority', :'runtime_authority', NOW(), NOW())
-    ON CONFLICT (key) DO UPDATE
-      SET value = EXCLUDED.value, updated_at = NOW();`
+    ON CONFLICT ("key") DO UPDATE
+      SET "value" = EXCLUDED."value", "updatedAt" = NOW();`
 }
 
 function runSql(databaseUrl, sql, variables = {}) {
   const args = [
     '--no-psqlrc',
+    '--set=ON_ERROR_STOP=1',
     '--quiet',
     '--tuples-only',
     '--no-align',

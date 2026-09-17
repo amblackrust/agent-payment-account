@@ -201,7 +201,7 @@ async function startServer(): Promise<void> {
         if (health === undefined) return { status: 'ok', checks: {} }
         const alerts = evaluateDomainAlerts({
           reviewRequiredPayments: health.reviewRequiredPayments,
-          oldestReviewRequiredAgeSeconds: null,
+          oldestReviewRequiredAgeSeconds: health.oldestReviewRequiredAgeSeconds ?? null,
           exhaustedIncomingIssues: health.exhaustedIncomingIssues,
           custodyFailures: 0,
           noProgressSeconds: null,

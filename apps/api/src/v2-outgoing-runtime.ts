@@ -17,7 +17,7 @@ const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
 export function createV2OutgoingWorker(input: {
   readonly config: AppConfig
   readonly database: ReturnType<typeof createDatabaseClient>
-  readonly walletCipher: WalletSecretCipher
+  readonly walletCipher?: WalletSecretCipher
 }): {
   readonly worker: V2OutgoingWorker
   readonly checkReadiness: () => Promise<void>
@@ -27,6 +27,11 @@ export function createV2OutgoingWorker(input: {
   if (feePayerSecret === undefined && !reconcileOnly) {
     throw new ConfigurationError(
       'SOLANA_FEE_PAYER_SECRET is required for the V2 outgoing worker',
+    )
+  }
+  if (!reconcileOnly && input.walletCipher === undefined) {
+    throw new ConfigurationError(
+      'Outgoing runtime requires wallet custody encryption material',
     )
   }
   const custodyMode = input.config.custodyBackendMode ?? 'LOCAL_TEST'
@@ -51,7 +56,7 @@ export function createV2OutgoingWorker(input: {
                 'Payer account custody is unavailable',
               )
             }
-            const payerSecret = input.walletCipher.decrypt({
+            const payerSecret = input.walletCipher!.decrypt({
               ciphertext: custody.encryptedSolanaSecret,
               nonce: custody.encryptionNonce,
               authTag: custody.encryptionAuthTag,
@@ -108,7 +113,9 @@ export function createV2OutgoingWorker(input: {
   const worker = new V2OutgoingWorker({
     repository: input.database.v2,
     custody: input.database.v2Admin,
-    signedPayloadCipher: input.walletCipher,
+    ...(input.walletCipher === undefined
+      ? {}
+      : { signedPayloadCipher: input.walletCipher }),
     executor,
     serviceIdentity: custodyIdentity,
     capacity,

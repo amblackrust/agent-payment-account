@@ -84,6 +84,11 @@ const MAX_WEBHOOK_BATCH_SIZE = 1_000
 
 export interface V2DomainHealthRecord {
   readonly reviewRequiredPayments: number
+  /**
+   * Age since the oldest currently review-required payment was last durably
+   * updated. Optional so existing repository test doubles remain compatible.
+   */
+  readonly oldestReviewRequiredAgeSeconds?: number | null
   readonly exhaustedIncomingIssues: number
   readonly pendingWebhookDeliveries: number
 }
@@ -221,17 +226,33 @@ export function createV2OperationsRepository(
     async getDomainHealth() {
       const [
         reviewRequiredPayments,
+        oldestReviewRequiredPayment,
         exhaustedIncomingIssues,
         pendingWebhookDeliveries,
       ] = await Promise.all([
         prisma.payment.count({ where: { status: 'REVIEW_REQUIRED' } }),
+        prisma.payment.findFirst({
+          where: { status: 'REVIEW_REQUIRED' },
+          orderBy: { updatedAt: 'asc' },
+          select: { updatedAt: true },
+        }),
         prisma.incomingReconciliationIssue.count({ where: { status: 'EXHAUSTED' } }),
         prisma.webhookDelivery.count({
           where: { status: { in: ['AVAILABLE', 'RETRY_WAIT', 'CLAIMED'] } },
         }),
       ])
+      const oldestReviewRequiredAgeSeconds =
+        oldestReviewRequiredPayment === null
+          ? null
+          : Math.max(
+              0,
+              Math.floor(
+                (Date.now() - oldestReviewRequiredPayment.updatedAt.getTime()) / 1_000,
+              ),
+            )
       return {
         reviewRequiredPayments,
+        oldestReviewRequiredAgeSeconds,
         exhaustedIncomingIssues,
         pendingWebhookDeliveries,
       }
