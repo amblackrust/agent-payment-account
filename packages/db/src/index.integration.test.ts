@@ -506,6 +506,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           amountAtomic: 500n,
           currency: 'USD',
           reference: 'late-reconciled-before-expiry',
+          createdAt: new Date('2026-09-06T11:00:00.000Z'),
           expiresAt,
         })
         await database.expireOpenReceiveRequests(
