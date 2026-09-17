@@ -21,6 +21,7 @@ describe('configuration', () => {
     expect(config.port).toBe(3000)
     expect(config.nodeEnv).toBe('development')
     expect(config.runtimeRole).toBe('all')
+    expect(config.restoreGateRequired).toBe(false)
     expect(config.allowMainnet).toBe(false)
   })
 
@@ -60,12 +61,29 @@ describe('configuration', () => {
       ...validEnvironment,
       NODE_ENV: 'production',
       RUNTIME_ROLE: 'api',
+      RUNTIME_AUTHORITY_ID: 'runtime-api-1',
       SOLANA_FEE_PAYER_SECRET: undefined,
       CUSTODY_BACKEND_IDENTITY: 'external-custody',
       CUSTODY_BACKEND_MODE: 'EXTERNAL',
     })
     expect(config.runtimeRole).toBe('api')
     expect(config.solanaFeePayerSecret).toBeUndefined()
+  })
+
+  it('requires an explicit authority and isolated environment for the restore gate', () => {
+    expect(() =>
+      loadConfig({ ...validEnvironment, RESTORE_GATE_REQUIRED: 'true' }),
+    ).toThrow('RUNTIME_AUTHORITY_ID')
+
+    const config = loadConfig({
+      ...validEnvironment,
+      RESTORE_GATE_REQUIRED: 'true',
+      RUNTIME_AUTHORITY_ID: 'runtime-restore-1',
+      RESTORE_GATE_ENVIRONMENT: 'isolated-restore',
+      CUSTODY_BACKEND_IDENTITY: 'local-test-custody',
+    })
+    expect(config.restoreGateRequired).toBe(true)
+    expect(config.runtimeAuthorityId).toBe('runtime-restore-1')
   })
 
   it('redacts secrets from the serialized configuration', () => {

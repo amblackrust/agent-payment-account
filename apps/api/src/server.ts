@@ -61,6 +61,9 @@ async function startServer(): Promise<void> {
     },
     (custody) => validateLegacyWalletCustody(walletCipher, custody),
   )
+  if (config.runtimeAuthorityId !== undefined) {
+    await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
+  }
   const fundingProvisioner = {
     provision: async (input: {
       readonly accountId: string

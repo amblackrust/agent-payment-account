@@ -110,18 +110,18 @@ export class V2ManagementService {
       new TextEncoder().encode(credential.rawKey),
     )
     const stored = await this.options.repository.rotateCredential({
-        accountId,
-        oldCredentialId,
-        newCredentialId: createCredentialId(),
-        keyHash: credential.keyHash,
-        keyPrefix: credential.keyPrefix,
-        scopes: scopes ?? ['payments:create', 'payments:read'],
-        recoveryCiphertext: recovery.ciphertext,
-        recoveryNonce: recovery.nonce,
-        recoveryAuthTag: recovery.authTag,
-        recoveryIdempotencyKey: `CREDENTIAL_ROTATION:${accountId}:${idempotencyKey}`,
-        recoveryExpiresAt: new Date(this.now().getTime() + RECOVERY_TTL_MS),
-      })
+      accountId,
+      oldCredentialId,
+      newCredentialId: createCredentialId(),
+      keyHash: credential.keyHash,
+      keyPrefix: credential.keyPrefix,
+      scopes: scopes ?? ['payments:create', 'payments:read'],
+      recoveryCiphertext: recovery.ciphertext,
+      recoveryNonce: recovery.nonce,
+      recoveryAuthTag: recovery.authTag,
+      recoveryIdempotencyKey: `CREDENTIAL_ROTATION:${accountId}:${idempotencyKey}`,
+      recoveryExpiresAt: new Date(this.now().getTime() + RECOVERY_TTL_MS),
+    })
     return {
       credential_id: stored.id,
       account_id: stored.accountId,
@@ -132,7 +132,11 @@ export class V2ManagementService {
     }
   }
 
-  public async revokeCredential(accountId: string, credentialId: string): Promise<void> {
+  public async revokeCredential(
+    accountId: string,
+    credentialId: string,
+  ): Promise<void> {
+    await this.requireAccount(accountId)
     await this.options.repository.revokeCredential(accountId, credentialId)
   }
 
@@ -156,6 +160,7 @@ export class V2ManagementService {
     readonly rollingBudgetEscalatable?: boolean
     readonly transactionCountEscalatable?: boolean
   }) {
+    await this.requireAccount(input.accountId)
     const denomination = await this.loadDenomination(input.denominationId)
     const parseOptional = (value: string | null | undefined) =>
       value === undefined || value === null
@@ -178,6 +183,7 @@ export class V2ManagementService {
   }
 
   public async activatePolicy(accountId: string, policyId: string, version?: number) {
+    await this.requireAccount(accountId)
     return this.serializePolicy(
       await this.options.repository.activateSpendPolicy(accountId, policyId, version),
     )
@@ -202,7 +208,9 @@ export class V2ManagementService {
     let settledAtomic: bigint | undefined
     if (input.action === 'APPROVE') {
       if (this.options.settledBalanceProvider === undefined) {
-        throw new DependencyUnavailableError('Settlement balance provider is unavailable')
+        throw new DependencyUnavailableError(
+          'Settlement balance provider is unavailable',
+        )
       }
       const view = await this.options.financialRepository.findPaymentView(
         input.accountId,
@@ -242,6 +250,7 @@ export class V2ManagementService {
     readonly actorId: string
     readonly reason?: string
   }) {
+    await this.requireAccount(input.accountId)
     return this.options.repository.createApprovedDestination({
       id: createId('approved'),
       ...input,
@@ -254,6 +263,7 @@ export class V2ManagementService {
     readonly actorId: string
     readonly reason: string
   }): Promise<void> {
+    await this.requireAccount(input.accountId)
     await this.options.repository.revokeApprovedDestination(input)
   }
 
@@ -266,11 +276,13 @@ export class V2ManagementService {
   }
 
   public async getFundingDestination(accountId: string, routeId?: string) {
+    await this.requireAccount(accountId)
     const destination = await this.options.repository.findFundingDestination(
       accountId,
       routeId,
     )
-    if (destination === null) throw new NotFoundError('Funding destination is unavailable')
+    if (destination === null)
+      throw new NotFoundError('Funding destination is unavailable')
     return {
       id: destination.id,
       account_id: destination.accountId,
@@ -303,15 +315,21 @@ export class V2ManagementService {
       account: toAuthenticatedAccount(account),
       denomination,
     })
-    if (settledAtomic < 0n) throw new InvalidStateError('Settlement balance cannot be negative')
+    if (settledAtomic < 0n)
+      throw new InvalidStateError('Settlement balance cannot be negative')
     const reservedAtomic = context.heldReservationAtomic
-    const spendableAtomic = settledAtomic > reservedAtomic ? settledAtomic - reservedAtomic : 0n
+    const spendableAtomic =
+      settledAtomic > reservedAtomic ? settledAtomic - reservedAtomic : 0n
     return {
       account_id: accountId,
       denomination_id: denominationId,
       settled: formatExactMoney(exactMoneyFromAtomicUnits(settledAtomic, denomination)),
-      reserved: formatExactMoney(exactMoneyFromAtomicUnits(reservedAtomic, denomination)),
-      spendable: formatExactMoney(exactMoneyFromAtomicUnits(spendableAtomic, denomination)),
+      reserved: formatExactMoney(
+        exactMoneyFromAtomicUnits(reservedAtomic, denomination),
+      ),
+      spendable: formatExactMoney(
+        exactMoneyFromAtomicUnits(spendableAtomic, denomination),
+      ),
       observed_at: this.now().toISOString(),
       degraded: false,
     }
@@ -354,7 +372,9 @@ export class V2ManagementService {
       amount:
         denomination === null
           ? record.amountAtomic.toString()
-          : formatExactMoney(exactMoneyFromAtomicUnits(record.amountAtomic, denomination)),
+          : formatExactMoney(
+              exactMoneyFromAtomicUnits(record.amountAtomic, denomination),
+            ),
       denomination_id: record.denominationId,
       currency: record.currency,
       recipient_id: record.recipientId,
@@ -406,7 +426,10 @@ export class V2ManagementService {
     return account
   }
 
-  private async findApproval(accountId: string, approvalId: string): Promise<V2ApprovalAdminRecord> {
+  private async findApproval(
+    accountId: string,
+    approvalId: string,
+  ): Promise<V2ApprovalAdminRecord> {
     const approval = (await this.options.repository.listApprovals(accountId)).find(
       (candidate) => candidate.id === approvalId,
     )
@@ -475,9 +498,9 @@ function encodeCursor(occurredAt: Date, id: string): string {
   ).toString('base64url')
 }
 
-function decodeCursor(value: string | undefined):
-  | { readonly occurredAt: Date; readonly id: string }
-  | undefined {
+function decodeCursor(
+  value: string | undefined,
+): { readonly occurredAt: Date; readonly id: string } | undefined {
   if (value === undefined) return undefined
   try {
     const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as {

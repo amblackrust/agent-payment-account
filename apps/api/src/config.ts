@@ -26,6 +26,14 @@ const configSchema = z.object({
   RUNTIME_ROLE: z
     .enum(['api', 'outgoing', 'incoming', 'webhook', 'maintenance', 'all'])
     .optional(),
+  RUNTIME_AUTHORITY_ID: z.string().trim().min(1).optional(),
+  RESTORE_GATE_REQUIRED: z.preprocess((value: unknown) => {
+    if (value === undefined) return false
+    if (value === 'true' || value === true) return true
+    if (value === 'false' || value === false) return false
+    return value
+  }, z.boolean()),
+  RESTORE_GATE_ENVIRONMENT: z.string().trim().min(1).optional(),
   WEBHOOK_SIGNING_KEYS_JSON: z.string().min(1).optional(),
   BACKUP_AGE_RECIPIENT: z.string().min(1).optional(),
   BACKUP_AGE_IDENTITY: z.string().min(1).optional(),
@@ -55,6 +63,9 @@ export type AppConfig = {
   readonly port: number
   readonly nodeEnv: 'development' | 'test' | 'production'
   readonly runtimeRole: RuntimeRole
+  readonly runtimeAuthorityId?: string
+  readonly restoreGateRequired: boolean
+  readonly restoreGateEnvironment?: string
   readonly adminApiKey: string
   readonly solanaRpcUrl: string
   readonly solanaCluster: 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
@@ -107,6 +118,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       'Production must select an explicit runtime role; RUNTIME_ROLE=all is development-only',
     )
   }
+  if (result.data.NODE_ENV === 'production' && result.data.RUNTIME_AUTHORITY_ID === undefined) {
+    throw new ConfigurationError(
+      'Production requires an explicit RUNTIME_AUTHORITY_ID',
+    )
+  }
   if (
     (runtimeRole === 'outgoing' || runtimeRole === 'all') &&
     result.data.SOLANA_FEE_PAYER_SECRET === undefined
@@ -149,12 +165,49 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       'BACKUP_AGE_IDENTITY and BACKUP_VERIFY_DATABASE_URL must be configured together',
     )
   }
+  if (result.data.RESTORE_GATE_REQUIRED) {
+    if (
+      result.data.RUNTIME_AUTHORITY_ID === undefined ||
+      result.data.RESTORE_GATE_ENVIRONMENT === undefined
+    ) {
+      throw new ConfigurationError(
+        'Restore gate requires RUNTIME_AUTHORITY_ID and RESTORE_GATE_ENVIRONMENT',
+      )
+    }
+    if (result.data.RESTORE_GATE_ENVIRONMENT === 'production') {
+      throw new ConfigurationError(
+        'Restore gate verification must use a non-production environment',
+      )
+    }
+    if (result.data.CUSTODY_BACKEND_IDENTITY === undefined) {
+      throw new ConfigurationError(
+        'Restore gate requires CUSTODY_BACKEND_IDENTITY for custody re-association',
+      )
+    }
+  }
+  if (
+    runtimeRole === 'maintenance' &&
+    result.data.BACKUP_AGE_IDENTITY !== undefined &&
+    (result.data.RUNTIME_AUTHORITY_ID === undefined ||
+      result.data.CUSTODY_BACKEND_IDENTITY === undefined)
+  ) {
+    throw new ConfigurationError(
+      'Verified restore requires RUNTIME_AUTHORITY_ID and CUSTODY_BACKEND_IDENTITY',
+    )
+  }
 
   return {
     databaseUrl: result.data.DATABASE_URL,
     port: result.data.PORT,
     nodeEnv: result.data.NODE_ENV,
     runtimeRole,
+    ...(result.data.RUNTIME_AUTHORITY_ID === undefined
+      ? {}
+      : { runtimeAuthorityId: result.data.RUNTIME_AUTHORITY_ID }),
+    restoreGateRequired: result.data.RESTORE_GATE_REQUIRED,
+    ...(result.data.RESTORE_GATE_ENVIRONMENT === undefined
+      ? {}
+      : { restoreGateEnvironment: result.data.RESTORE_GATE_ENVIRONMENT }),
     adminApiKey: result.data.ADMIN_API_KEY,
     solanaRpcUrl: result.data.SOLANA_RPC_URL,
     solanaCluster: result.data.SOLANA_CLUSTER,
@@ -191,6 +244,9 @@ export interface RedactedConfig {
   readonly port: number
   readonly nodeEnv: AppConfig['nodeEnv']
   readonly runtimeRole: RuntimeRole
+  readonly runtimeAuthorityId?: string
+  readonly restoreGateRequired: boolean
+  readonly restoreGateEnvironment?: string
   readonly solanaCluster: AppConfig['solanaCluster']
   readonly solanaSettlementMint: string
   readonly allowMainnet: boolean
@@ -209,6 +265,13 @@ export function redactConfig(config: AppConfig): RedactedConfig {
     port: config.port,
     nodeEnv: config.nodeEnv,
     runtimeRole: config.runtimeRole,
+    ...(config.runtimeAuthorityId === undefined
+      ? {}
+      : { runtimeAuthorityId: config.runtimeAuthorityId }),
+    restoreGateRequired: config.restoreGateRequired,
+    ...(config.restoreGateEnvironment === undefined
+      ? {}
+      : { restoreGateEnvironment: config.restoreGateEnvironment }),
     solanaCluster: config.solanaCluster,
     solanaSettlementMint: config.solanaSettlementMint,
     allowMainnet: config.allowMainnet,

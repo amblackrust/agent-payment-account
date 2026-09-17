@@ -44,6 +44,8 @@ function verifyBackup(inputArgument) {
   const sourceDatabaseUrl = requiredEnvironment('DATABASE_URL')
   const targetDatabaseUrl = requiredEnvironment('BACKUP_VERIFY_DATABASE_URL')
   const identity = requiredEnvironment('BACKUP_AGE_IDENTITY')
+  const custodyIdentity = requiredEnvironment('BACKUP_VERIFY_CUSTODY_IDENTITY')
+  const runtimeAuthorityId = requiredEnvironment('BACKUP_VERIFY_RUNTIME_AUTHORITY_ID')
   const environment =
     process.env.BACKUP_VERIFY_ENVIRONMENT?.trim() || 'isolated-restore'
   const input = requiredArgument(inputArgument, 'encrypted input path')
@@ -73,15 +75,23 @@ function verifyBackup(inputArgument) {
       targetDatabaseUrl,
       dumpPath,
     ])
-    const summary = runSql(targetDatabaseUrl, restoreInvariantQuery())
+    runSql(targetDatabaseUrl, setRestoredRuntimePendingSql(), {
+      runtime_authority: runtimeAuthorityId,
+    })
+    const summary = runSql(targetDatabaseUrl, restoreInvariantQuery(), {
+      runtime_authority: runtimeAuthorityId,
+      custody_identity: custodyIdentity,
+    })
     const values = summary.split('\t').map((value) => Number(value))
     if (
-      values.length !== 4 ||
+      values.length !== 6 ||
       values.some((value) => !Number.isInteger(value) || value < 0) ||
       values[0] < 10 ||
       values[1] !== 0 ||
       values[2] !== 0 ||
-      values[3] !== 1
+      values[3] !== 1 ||
+      values[4] !== 1 ||
+      values[5] !== 1
     ) {
       throw new Error(`Restore invariant validation failed: ${summary}`)
     }
@@ -90,19 +100,28 @@ function verifyBackup(inputArgument) {
       invalid_held_reservations: values[1],
       missing_attempt_links: values[2],
       runtime_identity_rows: values[3],
+      runtime_authority_rows: values[4],
+      custody_identity_rows: values[5],
     })
     runSql(
       targetDatabaseUrl,
       `INSERT INTO backup_restore_verifications
-        (id, backup_reference, environment, status, schema_version, invariant_summary_json, verified_at)
-       VALUES (:'id', :'backup_reference', :'environment', 'VERIFIED', :'schema_version', :'summary', NOW())`,
+        (id, backup_reference, environment, status, schema_version, invariant_summary_json, custody_identity, verified_at)
+       VALUES (:'id', :'backup_reference', :'environment', 'VERIFIED', :'schema_version', :'summary', :'custody_identity', NOW())`,
       {
         id: verificationId,
         backup_reference: backupReference,
         environment,
         schema_version: 'prisma-verified',
         summary: invariantSummary,
+        custody_identity: custodyIdentity,
       },
+    )
+    runSql(
+      targetDatabaseUrl,
+      `UPDATE runtime_metadata
+          SET value = 'RESTORE_VERIFIED', updated_at = NOW()
+        WHERE key = 'money_worker_gate'`,
     )
     process.stdout.write(`Restore verification passed for ${backupReference}\n`)
   } catch (error) {
@@ -110,7 +129,7 @@ function verifyBackup(inputArgument) {
       runSql(
         targetDatabaseUrl,
         `INSERT INTO backup_restore_verifications
-          (id, backup_reference, environment, status, schema_version, failure_safe)
+        (id, backup_reference, environment, status, schema_version, failure_safe)
          VALUES (:'id', :'backup_reference', :'environment', 'FAILED', 'restore-check', :'failure')`,
         {
           id: verificationId,
@@ -144,7 +163,23 @@ function restoreInvariantQuery() {
     (SELECT count(*) FROM payment_attempts a
       LEFT JOIN payments p ON p.id = a.payment_id
       WHERE p.id IS NULL) AS missing_attempt_links,
-    (SELECT count(*) FROM runtime_metadata WHERE key = 'runtime_identity') AS runtime_identity_rows;`
+    (SELECT count(*) FROM runtime_metadata WHERE key = 'runtime_identity') AS runtime_identity_rows,
+    (SELECT count(*) FROM runtime_metadata
+      WHERE key = 'runtime_authority' AND value = :'runtime_authority') AS runtime_authority_rows,
+    (SELECT count(*) FROM runtime_metadata
+      WHERE key = 'runtime_identity'
+        AND value::jsonb ->> 'custodyBackendIdentity' = :'custody_identity') AS custody_identity_rows;`
+}
+
+function setRestoredRuntimePendingSql() {
+  return `INSERT INTO runtime_metadata (key, value, created_at, updated_at)
+    VALUES ('money_worker_gate', 'RESTORE_PENDING', NOW(), NOW())
+    ON CONFLICT (key) DO UPDATE
+      SET value = EXCLUDED.value, updated_at = NOW();
+  INSERT INTO runtime_metadata (key, value, created_at, updated_at)
+    VALUES ('runtime_authority', :'runtime_authority', NOW(), NOW())
+    ON CONFLICT (key) DO UPDATE
+      SET value = EXCLUDED.value, updated_at = NOW();`
 }
 
 function runSql(databaseUrl, sql, variables = {}) {

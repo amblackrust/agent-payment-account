@@ -668,6 +668,8 @@ export interface DatabaseClient
     input: RuntimeIdentity,
     validateLegacyCustody?: (custody: AccountCustodyRecord) => Promise<void>,
   ): Promise<void>
+  initializeRuntimeAuthority(authorityId: string): Promise<void>
+  getRuntimeMetadata(key: string): Promise<string | null>
   reserveFeeSponsorship(input: {
     readonly accountId: string
     readonly paymentId: string
@@ -2241,6 +2243,35 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           )
         }
       })
+    },
+    async initializeRuntimeAuthority(authorityId): Promise<void> {
+      const normalized = authorityId.trim()
+      if (normalized.length === 0) {
+        throw new Error('Runtime authority ID must not be empty')
+      }
+      await prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT pg_advisory_xact_lock(764895321) IS NULL AS locked
+        `
+        const existing = await transaction.runtimeMetadata.findUnique({
+          where: { key: 'runtime_authority' },
+        })
+        if (existing === null) {
+          await transaction.runtimeMetadata.create({
+            data: { key: 'runtime_authority', value: normalized },
+          })
+          return
+        }
+        if (existing.value !== normalized) {
+          throw new Error(
+            'Runtime authority mismatch; restored copies require an explicit authority handoff',
+          )
+        }
+      })
+    },
+    async getRuntimeMetadata(key): Promise<string | null> {
+      const metadata = await prisma.runtimeMetadata.findUnique({ where: { key } })
+      return metadata?.value ?? null
     },
     async disconnect(): Promise<void> {
       await prisma.$disconnect()

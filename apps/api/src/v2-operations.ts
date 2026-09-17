@@ -1,8 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import {
-  InvalidStateError,
-  ValidationError,
-} from '@agent-payment/core'
+import { InvalidStateError, NotFoundError, ValidationError } from '@agent-payment/core'
 import type {
   V2OperationalExceptionRecord,
   V2OperationsRepository,
@@ -43,21 +40,26 @@ export class V2OperationsService {
     }
   }
 
-  public async listExceptions(input: {
-    readonly accountId?: string
-    readonly status?: string
-    readonly limit?: number
-  } = {}) {
-    return (await this.repository.listExceptions({
-      ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
-      ...(input.status === undefined ? {} : { status: input.status }),
-      limit: validateLimit(input.limit),
-    })).map(serializeException)
+  public async listExceptions(
+    input: {
+      readonly accountId?: string
+      readonly status?: string
+      readonly limit?: number
+    } = {},
+  ) {
+    return (
+      await this.repository.listExceptions({
+        ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
+        ...(input.status === undefined ? {} : { status: input.status }),
+        limit: validateLimit(input.limit),
+      })
+    ).map(serializeException)
   }
 
   public async getException(id: string) {
     const exception = await this.repository.findException(id)
-    if (exception === null) throw new InvalidStateError('Operational exception was not found')
+    if (exception === null)
+      throw new NotFoundError('Operational exception was not found')
     return serializeException(exception)
   }
 
@@ -84,7 +86,9 @@ export class V2OperationsService {
     readonly rowVersion: number
     readonly evidenceId?: string
   }) {
-    return serializeException(await this.repository.resolveProvedNoEffectException(input))
+    return serializeException(
+      await this.repository.resolveProvedNoEffectException(input),
+    )
   }
 
   public async closeUnresolvedException(input: {
@@ -96,7 +100,9 @@ export class V2OperationsService {
   }
 
   public async listWebhooks(accountId: string) {
-    return (await this.repository.listWebhookSubscriptions(accountId)).map(serializeSubscription)
+    return (await this.repository.listWebhookSubscriptions(accountId)).map(
+      serializeSubscription,
+    )
   }
 
   public async createWebhook(input: {
@@ -106,10 +112,12 @@ export class V2OperationsService {
     readonly signingKeyRef: string
     readonly signingKeyVersion: number
   }) {
-    return serializeSubscription(await this.repository.createWebhookSubscription({
-      id: createId('whsub'),
-      ...input,
-    }))
+    return serializeSubscription(
+      await this.repository.createWebhookSubscription({
+        id: createId('whsub'),
+        ...input,
+      }),
+    )
   }
 
   public async archiveWebhook(accountId: string, id: string): Promise<void> {
@@ -188,12 +196,15 @@ function parseJson(value: string | null): unknown {
 }
 
 function encodeCursor(occurredAt: Date, id: string): string {
-  return Buffer.from(JSON.stringify({ occurred_at: occurredAt.toISOString(), id }), 'utf8').toString('base64url')
+  return Buffer.from(
+    JSON.stringify({ occurred_at: occurredAt.toISOString(), id }),
+    'utf8',
+  ).toString('base64url')
 }
 
-function decodeCursor(value: string | undefined):
-  | { readonly occurredAt: Date; readonly id: string }
-  | undefined {
+function decodeCursor(
+  value: string | undefined,
+): { readonly occurredAt: Date; readonly id: string } | undefined {
   if (value === undefined) return undefined
   try {
     const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as {

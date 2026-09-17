@@ -92,6 +92,8 @@ class MaintenanceWorker implements RuntimeWorker {
     private readonly recipient: string | undefined,
     private readonly identity: string | undefined,
     private readonly verifyDatabaseUrl: string | undefined,
+    private readonly runtimeAuthorityId: string | undefined,
+    private readonly custodyIdentity: string | undefined,
   ) {
     if (recipient === undefined) {
       throw new ConfigurationError(
@@ -140,6 +142,12 @@ class MaintenanceWorker implements RuntimeWorker {
       ...(this.verifyDatabaseUrl === undefined
         ? {}
         : { BACKUP_VERIFY_DATABASE_URL: this.verifyDatabaseUrl }),
+      ...(this.runtimeAuthorityId === undefined
+        ? {}
+        : { BACKUP_VERIFY_RUNTIME_AUTHORITY_ID: this.runtimeAuthorityId }),
+      ...(this.custodyIdentity === undefined
+        ? {}
+        : { BACKUP_VERIFY_CUSTODY_IDENTITY: this.custodyIdentity }),
     }
     await execFileAsync(process.execPath, [script, 'backup', output], {
       env: environment,
@@ -184,6 +192,9 @@ async function startWorker(): Promise<void> {
     },
     (custody) => validateLegacyWalletCustody(walletCipher, custody),
   )
+  if (config.runtimeAuthorityId !== undefined) {
+    await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
+  }
 
   const v2OutgoingRuntime =
     config.runtimeRole === 'outgoing'
@@ -230,6 +241,12 @@ async function startWorker(): Promise<void> {
           ...(config.backupVerifyDatabaseUrl === undefined
             ? {}
             : { backupVerifyDatabaseUrl: config.backupVerifyDatabaseUrl }),
+          ...(config.runtimeAuthorityId === undefined
+            ? {}
+            : { runtimeAuthorityId: config.runtimeAuthorityId }),
+          ...(config.custodyBackendIdentity === undefined
+            ? {}
+            : { custodyIdentity: config.custodyBackendIdentity }),
         }
       : {}),
   })
@@ -316,6 +333,8 @@ function createWorker(input: {
   readonly backupAgeRecipient?: string
   readonly backupAgeIdentity?: string
   readonly backupVerifyDatabaseUrl?: string
+  readonly runtimeAuthorityId?: string
+  readonly custodyIdentity?: string
 }): RuntimeWorker {
   if (input.role === 'incoming') {
     if (input.incomingReader === undefined) {
@@ -350,6 +369,8 @@ function createWorker(input: {
     input.backupAgeRecipient,
     input.backupAgeIdentity,
     input.backupVerifyDatabaseUrl,
+    input.runtimeAuthorityId,
+    input.custodyIdentity,
   )
 }
 

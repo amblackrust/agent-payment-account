@@ -48,6 +48,7 @@ const testConfig: AppConfig = {
   port: 0,
   nodeEnv: 'test',
   runtimeRole: 'all',
+  restoreGateRequired: false,
   adminApiKey: 'test-admin-key',
   solanaRpcUrl: 'http://surfpool.local',
   solanaCluster: 'localnet',

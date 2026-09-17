@@ -352,6 +352,9 @@ export interface V2DatabaseRepository {
     readonly settlementState: string
     readonly outcomeState: string
     readonly externalId?: string
+    readonly expectedExternalId?: string
+    readonly payloadHash?: string
+    readonly metadataJson?: string
     readonly confirmedAt?: Date
     readonly failedAt?: Date
     readonly failureCode?: string
@@ -1379,7 +1382,13 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             outcome: input.evidenceOutcome,
             observedAt: new Date(),
             ...(input.externalId === undefined ? {} : { externalId: input.externalId }),
-            metadataJson: '{}',
+            ...(input.expectedExternalId === undefined
+              ? {}
+              : { expectedExternalId: input.expectedExternalId }),
+            ...(input.payloadHash === undefined
+              ? {}
+              : { payloadHash: input.payloadHash }),
+            metadataJson: input.metadataJson ?? '{}',
           },
         })
         const updated = await transaction.payment.findUniqueOrThrow({

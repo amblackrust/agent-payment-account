@@ -103,5 +103,25 @@ export function createV2OutgoingWorker(input: {
       },
     },
   })
-  return { worker, checkReadiness: executor.checkReadiness }
+  const checkReadiness = async (): Promise<void> => {
+    await executor.checkReadiness()
+    if (!input.config.restoreGateRequired) return
+    const environment = input.config.restoreGateEnvironment
+    const verification = await input.database.v2Operations.findLatestBackupVerification()
+    const gateStatus = await input.database.getRuntimeMetadata('money_worker_gate')
+    if (
+      environment === undefined ||
+      verification === null ||
+      verification.status !== 'VERIFIED' ||
+      verification.verifiedAt === null ||
+      verification.environment !== environment ||
+      verification.custodyIdentity !== custodyIdentity ||
+      gateStatus !== 'RESTORE_VERIFIED'
+    ) {
+      throw new DependencyUnavailableError(
+        'Outgoing workers are blocked until an isolated restore is verified for this runtime authority',
+      )
+    }
+  }
+  return { worker, checkReadiness }
 }

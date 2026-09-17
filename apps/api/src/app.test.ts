@@ -8,6 +8,7 @@ const testConfig: AppConfig = {
   port: 3000,
   nodeEnv: 'test',
   runtimeRole: 'all',
+  restoreGateRequired: false,
   adminApiKey: 'test-admin-key',
   solanaRpcUrl: 'http://127.0.0.1:8899',
   solanaCluster: 'localnet',

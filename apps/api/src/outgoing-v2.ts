@@ -375,6 +375,11 @@ export class V2OutgoingWorker {
         settlementState: 'CONFIRMED',
         outcomeState: 'CONFIRMED',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
+        ...evidenceFields(
+          attempt,
+          prepared,
+          result.externalId ?? attempt.expectedExternalId ?? undefined,
+        ),
         confirmedAt: this.now(),
         reservation: 'CONSUME',
         evidenceOutcome: 'CONFIRMED',
@@ -398,6 +403,14 @@ export class V2OutgoingWorker {
         status: 'SUBMITTED',
         executionState: 'RECONCILING',
         settlementState: 'SUBMITTED',
+      })
+      await this.recordObservation({
+        paymentId: view.payment.id,
+        attemptId: attempt.id,
+        outcome: 'SUBMITTED',
+        ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
+        ...evidenceFields(attempt, prepared, result.externalId),
+        source: 'V2_OUTGOING_WORKER',
       })
       await this.options.repository.retryWorkItem({
         id: claim.id,
@@ -425,6 +438,14 @@ export class V2OutgoingWorker {
         settlementState: 'UNKNOWN',
         outcomeState: 'UNDETERMINED',
       })
+      await this.recordObservation({
+        paymentId: view.payment.id,
+        attemptId: attempt.id,
+        outcome: 'UNKNOWN',
+        ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
+        ...evidenceFields(attempt, prepared, result.externalId),
+        source: 'V2_OUTGOING_WORKER',
+      })
       await this.options.repository.retryWorkItem({
         id: claim.id,
         owner: this.options.owner,
@@ -449,12 +470,12 @@ export class V2OutgoingWorker {
       ...(result.failureMessageSafe === undefined
         ? {}
         : { failureMessageSafe: result.failureMessageSafe }),
+      ...evidenceFields(attempt, prepared),
       reservation: 'RELEASE',
       evidenceOutcome: 'PROVED_NO_EFFECT',
       source: 'V2_OUTGOING_WORKER',
     })
     await this.options.repository.completeWorkItem(claim.id, this.options.owner)
-    void prepared
   }
 
   private async processReconciliation(
@@ -486,6 +507,11 @@ export class V2OutgoingWorker {
         settlementState: 'CONFIRMED',
         outcomeState: 'CONFIRMED',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
+        ...evidenceFields(
+          attempt,
+          undefined,
+          result.externalId ?? attempt.expectedExternalId ?? undefined,
+        ),
         confirmedAt: this.now(),
         reservation: 'CONSUME',
         evidenceOutcome: 'CONFIRMED',
@@ -506,6 +532,7 @@ export class V2OutgoingWorker {
         paymentStatus: 'PROVED_NO_EFFECT',
         settlementState: 'NOT_SUBMITTED',
         outcomeState: 'PROVED_NO_EFFECT',
+        ...evidenceFields(attempt),
         reservation: 'RELEASE',
         evidenceOutcome: 'PROVED_NO_EFFECT',
         source: 'V2_RECONCILIATION_WORKER',
@@ -513,6 +540,14 @@ export class V2OutgoingWorker {
       await this.options.repository.completeWorkItem(claim.id, this.options.owner)
       return
     }
+    await this.recordObservation({
+      paymentId: view.payment.id,
+      attemptId: attempt.id,
+      outcome: 'UNKNOWN',
+      ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
+      ...evidenceFields(attempt, undefined, result.externalId),
+      source: 'V2_RECONCILIATION_WORKER',
+    })
     await this.options.repository.retryWorkItem({
       id: claim.id,
       owner: this.options.owner,
@@ -549,6 +584,7 @@ export class V2OutgoingWorker {
           outcomeState: 'PROVED_NO_EFFECT',
           failureCode: decision.reasonCode,
           failureMessageSafe: 'Outgoing execution failed before submission',
+          ...evidenceFields(attempt),
           reservation: 'RELEASE',
           evidenceOutcome: 'PROVED_NO_EFFECT',
           source: 'V2_OUTGOING_WORKER',
@@ -602,6 +638,13 @@ export class V2OutgoingWorker {
       settlementState: 'UNKNOWN',
       outcomeState: 'UNDETERMINED',
     })
+    await this.recordObservation({
+      paymentId: view.payment.id,
+      attemptId: attempt.id,
+      outcome: 'UNKNOWN',
+      ...evidenceFields(attempt),
+      source: 'V2_OUTGOING_WORKER',
+    })
     await this.options.repository.retryWorkItem({
       id: claim.id,
       owner: this.options.owner,
@@ -610,10 +653,69 @@ export class V2OutgoingWorker {
       errorSafe: 'Submission outcome requires reconciliation',
     })
   }
+
+  private async recordObservation(input: {
+    readonly paymentId: string
+    readonly attemptId: string
+    readonly outcome: string
+    readonly externalId?: string
+    readonly expectedExternalId?: string
+    readonly payloadHash?: string
+    readonly metadataJson?: string
+    readonly source: string
+  }): Promise<void> {
+    await this.options.repository.recordEvidence?.({
+      id: `evidence_${randomUUID()}`,
+      paymentId: input.paymentId,
+      attemptId: input.attemptId,
+      authority: 'RAIL',
+      source: input.source,
+      outcome: input.outcome,
+      observedAt: this.now(),
+      ...(input.externalId === undefined ? {} : { externalId: input.externalId }),
+      ...(input.expectedExternalId === undefined
+        ? {}
+        : { expectedExternalId: input.expectedExternalId }),
+      ...(input.payloadHash === undefined ? {} : { payloadHash: input.payloadHash }),
+      ...(input.metadataJson === undefined ? {} : { metadataJson: input.metadataJson }),
+    })
+  }
 }
 
 function hashBytes(value: Uint8Array): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function evidenceFields(
+  attempt: V2PaymentAttemptSnapshot,
+  prepared?: V2PreparedEffect,
+  expectedExternalId?: string,
+): {
+  readonly expectedExternalId?: string
+  readonly payloadHash?: string
+  readonly metadataJson: string
+} {
+  const metadata = {
+    ...(attempt.preparedEffectHash === null
+      ? {}
+      : { prepared_effect_hash: attempt.preparedEffectHash }),
+    ...(prepared === undefined ? {} : { prepared_payload_hash: prepared.payloadHash }),
+    ...(attempt.signedPayloadHash === null
+      ? {}
+      : { signed_payload_hash: attempt.signedPayloadHash }),
+    ...(attempt.validityExpiresAt === null
+      ? {}
+      : { validity_expires_at: attempt.validityExpiresAt.toISOString() }),
+    ...(attempt.validitySlot === null
+      ? {}
+      : { validity_slot: attempt.validitySlot.toString() }),
+  }
+  const payloadHash = attempt.signedPayloadHash ?? prepared?.payloadHash
+  return {
+    ...(expectedExternalId === undefined ? {} : { expectedExternalId }),
+    ...(payloadHash === undefined ? {} : { payloadHash }),
+    metadataJson: JSON.stringify(metadata),
+  }
 }
 
 function serializeEncryptedPayload(value: {

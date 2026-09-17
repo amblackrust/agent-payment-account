@@ -121,6 +121,7 @@ describe('V2 outgoing worker', () => {
     let signCount = 0
     let completed = false
     let finalized = false
+    let finalizedInput: Record<string, unknown> | undefined
     const baseView = view()
     const signingRequest: V2SigningRequestRecord = {
       id: 'signing_attempt_1',
@@ -161,8 +162,9 @@ describe('V2 outgoing worker', () => {
       findPaymentView: async () => baseView,
       updateAttemptOutcome: async () => baseView.attempts[0],
       updatePaymentExecution: async () => baseView.payment,
-      finalizeV2Payment: async () => {
+      finalizeV2Payment: async (input: Record<string, unknown>) => {
         finalized = true
+        finalizedInput = input
         return baseView
       },
       completeWorkItem: async () => {
@@ -227,6 +229,9 @@ describe('V2 outgoing worker', () => {
 
     expect(signCount).toBe(1)
     expect(finalized).toBe(true)
+    expect(finalizedInput?.expectedExternalId).toBe('external-1')
+    expect(finalizedInput?.payloadHash).toBe('a'.repeat(64))
+    expect(finalizedInput?.metadataJson).toContain('prepared_payload_hash')
     expect(completed).toBe(true)
   })
 })

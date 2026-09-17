@@ -50,12 +50,21 @@ invariant:
 ```bash
 BACKUP_AGE_IDENTITY=/secure/restore/age-key.txt \
 BACKUP_VERIFY_DATABASE_URL='postgresql://.../mux_restore' \
+BACKUP_VERIFY_CUSTODY_IDENTITY='provider/key-reference' \
+BACKUP_VERIFY_RUNTIME_AUTHORITY_ID='runtime-restore-20260917' \
 BACKUP_VERIFY_ENVIRONMENT=isolated-restore \
   pnpm backup:verify -- .local/backups/mux-20260917T000000Z.dump.age
 ```
 
 Do not point verification at production. A restored environment must remain
-non-authoritative until its runtime identity and custody configuration are
-validated. Start incoming reconciliation first, inspect the durable
+non-authoritative until its runtime identity, custody configuration, and new
+runtime authority are validated. Verification leaves the durable
+`money_worker_gate` blocked on failure and sets it to `RESTORE_VERIFIED` only
+after all checks pass. Configure the promoted outgoing runtime with the same
+`RUNTIME_AUTHORITY_ID`, `RESTORE_GATE_REQUIRED=true`,
+`RESTORE_GATE_ENVIRONMENT=isolated-restore`, and matching custody identity.
+Start incoming reconciliation first, inspect the durable
 `backup_restore_verifications` record, and only then enable outgoing workers.
+The original authority must be fenced before promotion; a restored copy never
+reuses its source authority ID.
 Exact RPO/RTO and retention values remain workload/risk decisions (OD-008).

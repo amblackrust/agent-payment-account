@@ -160,7 +160,9 @@ export interface V2OperationsRepository {
     readonly signingKeyRef: string
     readonly signingKeyVersion: number
   }): Promise<V2WebhookSubscriptionRecord>
-  listWebhookSubscriptions(accountId: string): Promise<readonly V2WebhookSubscriptionRecord[]>
+  listWebhookSubscriptions(
+    accountId: string,
+  ): Promise<readonly V2WebhookSubscriptionRecord[]>
   archiveWebhookSubscription(accountId: string, id: string): Promise<void>
   createWebhookEvent(input: {
     readonly id: string
@@ -201,6 +203,7 @@ export interface V2OperationsRepository {
     readonly failureSafe?: string
     readonly verifiedAt?: Date
   }): Promise<V2BackupRestoreVerificationRecord>
+  findLatestBackupVerification(): Promise<V2BackupRestoreVerificationRecord | null>
 }
 
 export function createV2OperationsRepository(
@@ -208,14 +211,17 @@ export function createV2OperationsRepository(
 ): V2OperationsRepository {
   return {
     async getDomainHealth() {
-      const [reviewRequiredPayments, exhaustedIncomingIssues, pendingWebhookDeliveries] =
-        await Promise.all([
-          prisma.payment.count({ where: { status: 'REVIEW_REQUIRED' } }),
-          prisma.incomingReconciliationIssue.count({ where: { status: 'EXHAUSTED' } }),
-          prisma.webhookDelivery.count({
-            where: { status: { in: ['AVAILABLE', 'RETRY_WAIT', 'CLAIMED'] } },
-          }),
-        ])
+      const [
+        reviewRequiredPayments,
+        exhaustedIncomingIssues,
+        pendingWebhookDeliveries,
+      ] = await Promise.all([
+        prisma.payment.count({ where: { status: 'REVIEW_REQUIRED' } }),
+        prisma.incomingReconciliationIssue.count({ where: { status: 'EXHAUSTED' } }),
+        prisma.webhookDelivery.count({
+          where: { status: { in: ['AVAILABLE', 'RETRY_WAIT', 'CLAIMED'] } },
+        }),
+      ])
       return {
         reviewRequiredPayments,
         exhaustedIncomingIssues,
@@ -227,7 +233,9 @@ export function createV2OperationsRepository(
       const events = await prisma.operationTimelineEvent.findMany({
         where: {
           accountId: input.accountId,
-          ...(input.resourceType === undefined ? {} : { resourceType: input.resourceType }),
+          ...(input.resourceType === undefined
+            ? {}
+            : { resourceType: input.resourceType }),
           ...(input.resourceId === undefined ? {} : { resourceId: input.resourceId }),
           ...(input.cursor === undefined
             ? {}
@@ -277,7 +285,9 @@ export function createV2OperationsRepository(
       })
       if (updated.count !== 1) throw new ConflictError('Exception changed concurrently')
       return toExceptionRecord(
-        await prisma.operationalException.findUniqueOrThrow({ where: { id: input.id } }),
+        await prisma.operationalException.findUniqueOrThrow({
+          where: { id: input.id },
+        }),
       )
     },
 
@@ -308,7 +318,14 @@ export function createV2OperationsRepository(
               rowVersion: { increment: 1 },
             },
           })
-          await appendOperatorTimeline(transaction, payment.accountId, payment.id, 'PAYMENT_CLOSED_UNRESOLVED', input.operatorId, now)
+          await appendOperatorTimeline(
+            transaction,
+            payment.accountId,
+            payment.id,
+            'PAYMENT_CLOSED_UNRESOLVED',
+            input.operatorId,
+            now,
+          )
         }
         const updated = await transaction.operationalException.update({
           where: { id: exception.id },
@@ -339,7 +356,9 @@ export function createV2OperationsRepository(
     },
 
     async reconcilePlatformCost(input) {
-      const cost = await prisma.platformCostRecord.findUnique({ where: { id: input.id } })
+      const cost = await prisma.platformCostRecord.findUnique({
+        where: { id: input.id },
+      })
       if (cost === null) throw new NotFoundError('Platform cost record was not found')
       const updated = await prisma.platformCostRecord.update({
         where: { id: cost.id },
@@ -357,9 +376,15 @@ export function createV2OperationsRepository(
         throw new InvalidStateError('Webhook subscription requires an event type')
       }
       validateWebhookEndpoint(input.endpoint)
-      const eventTypes = [...new Set(input.eventTypes.map((eventType) => eventType.trim()))]
-      if (eventTypes.some((eventType) => eventType.length === 0 || eventType.length > 128)) {
-        throw new ValidationError('Webhook event types must contain 1 to 128 characters')
+      const eventTypes = [
+        ...new Set(input.eventTypes.map((eventType) => eventType.trim())),
+      ]
+      if (
+        eventTypes.some((eventType) => eventType.length === 0 || eventType.length > 128)
+      ) {
+        throw new ValidationError(
+          'Webhook event types must contain 1 to 128 characters',
+        )
       }
       if (!Number.isInteger(input.signingKeyVersion) || input.signingKeyVersion < 1) {
         throw new ValidationError('Webhook signing key version must be positive')
@@ -390,7 +415,8 @@ export function createV2OperationsRepository(
         where: { id, accountId, status: 'ACTIVE' },
         data: { status: 'ARCHIVED', archivedAt: new Date() },
       })
-      if (result.count !== 1) throw new NotFoundError('Webhook subscription was not found')
+      if (result.count !== 1)
+        throw new NotFoundError('Webhook subscription was not found')
     },
 
     async createWebhookEvent(input) {
@@ -435,7 +461,9 @@ export function createV2OperationsRepository(
     async claimWebhookDeliveries(input) {
       const now = input.now ?? new Date()
       if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
-        throw new ValidationError('Webhook delivery batch size must be an integer from 1 to 100')
+        throw new ValidationError(
+          'Webhook delivery batch size must be an integer from 1 to 100',
+        )
       }
       if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
         throw new InvalidStateError('Webhook delivery lease must be positive')
@@ -505,9 +533,15 @@ export function createV2OperationsRepository(
     async markWebhookDelivered(id, owner, responseStatus) {
       const result = await prisma.webhookDelivery.updateMany({
         where: { id, status: 'CLAIMED', leaseOwner: owner },
-        data: { status: 'DELIVERED', responseStatus, leaseOwner: null, leaseExpiresAt: null },
+        data: {
+          status: 'DELIVERED',
+          responseStatus,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        },
       })
-      if (result.count !== 1) throw new ConflictError('Webhook delivery lease is no longer owned')
+      if (result.count !== 1)
+        throw new ConflictError('Webhook delivery lease is no longer owned')
     },
 
     async retryWebhookDelivery(input) {
@@ -518,7 +552,8 @@ export function createV2OperationsRepository(
           WHERE id = ${input.id}
           FOR UPDATE
         `
-        if (locked.length === 0) throw new NotFoundError('Webhook delivery was not found')
+        if (locked.length === 0)
+          throw new NotFoundError('Webhook delivery was not found')
         const delivery = await transaction.webhookDelivery.findUnique({
           where: { id: input.id },
         })
@@ -577,7 +612,9 @@ export function createV2OperationsRepository(
           backupReference: input.backupReference,
           environment: input.environment,
           schemaVersion: input.schemaVersion,
-          ...(input.custodyIdentity === undefined ? {} : { custodyIdentity: input.custodyIdentity }),
+          ...(input.custodyIdentity === undefined
+            ? {}
+            : { custodyIdentity: input.custodyIdentity }),
         },
       })
       return toBackupRecord(verification)
@@ -589,11 +626,20 @@ export function createV2OperationsRepository(
         data: {
           status: input.status,
           invariantSummaryJson: input.invariantSummaryJson,
-          ...(input.failureSafe === undefined ? {} : { failureSafe: input.failureSafe }),
+          ...(input.failureSafe === undefined
+            ? {}
+            : { failureSafe: input.failureSafe }),
           ...(input.verifiedAt === undefined ? {} : { verifiedAt: input.verifiedAt }),
         },
       })
       return toBackupRecord(verification)
+    },
+
+    async findLatestBackupVerification() {
+      const verification = await prisma.backupRestoreVerification.findFirst({
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      })
+      return verification === null ? null : toBackupRecord(verification)
     },
   }
 }
@@ -613,7 +659,8 @@ async function resolveExceptionWithEvidence(
   return prisma.$transaction(async (transaction) => {
     const exception = await lockException(transaction, input.id, input.rowVersion)
     const payment = await findExceptionPayment(transaction, exception)
-    if (payment === null) throw new InvalidStateError('Exception is not linked to a payment')
+    if (payment === null)
+      throw new InvalidStateError('Exception is not linked to a payment')
     const evidence = await transaction.evidenceRecord.findFirst({
       where: {
         paymentId: payment.id,
@@ -637,7 +684,8 @@ async function resolveExceptionWithEvidence(
       orderBy: { attemptNumber: 'asc' },
     })
     const currentAttempt = attempts.at(-1)
-    if (currentAttempt === undefined) throw new InvalidStateError('Payment has no attempt')
+    if (currentAttempt === undefined)
+      throw new InvalidStateError('Payment has no attempt')
     if (outcome === 'CONFIRMED') {
       if (
         attempts.some(
@@ -648,13 +696,19 @@ async function resolveExceptionWithEvidence(
             ),
         )
       ) {
-        throw new ConflictError('Every earlier attempt requires authoritative resolution')
+        throw new ConflictError(
+          'Every earlier attempt requires authoritative resolution',
+        )
       }
       if (currentAttempt.outcome === 'UNKNOWN') {
         assertAttemptProgression('UNKNOWN', 'CONFIRMED')
         await transaction.paymentAttempt.update({
           where: { id: currentAttempt.id },
-          data: { outcome: 'CONFIRMED', status: 'CONFIRMED', rowVersion: { increment: 1 } },
+          data: {
+            outcome: 'CONFIRMED',
+            status: 'CONFIRMED',
+            rowVersion: { increment: 1 },
+          },
         })
       } else if (currentAttempt.outcome !== 'CONFIRMED') {
         throw new ConflictError('Payment attempt is not awaiting confirmed resolution')
@@ -684,9 +738,15 @@ async function resolveExceptionWithEvidence(
         assertAttemptProgression('UNKNOWN', 'PROVED_NO_EFFECT')
         await transaction.paymentAttempt.update({
           where: { id: currentAttempt.id },
-          data: { outcome: 'PROVED_NO_EFFECT', status: 'FAILED', rowVersion: { increment: 1 } },
+          data: {
+            outcome: 'PROVED_NO_EFFECT',
+            status: 'FAILED',
+            rowVersion: { increment: 1 },
+          },
         })
-      } else if (!['PROVED_NO_EFFECT', 'PRE_EFFECT_ABORTED'].includes(currentAttempt.outcome)) {
+      } else if (
+        !['PROVED_NO_EFFECT', 'PRE_EFFECT_ABORTED'].includes(currentAttempt.outcome)
+      ) {
         throw new ConflictError('Payment attempt is not awaiting no-effect resolution')
       }
       const allNoEffect = attempts.every((attempt) =>
@@ -758,10 +818,12 @@ async function lockException(
     WHERE id = ${id}
     FOR UPDATE
   `
-  if (locked.length === 0) throw new NotFoundError('Operational exception was not found')
+  if (locked.length === 0)
+    throw new NotFoundError('Operational exception was not found')
   const exception = await transaction.operationalException.findUnique({ where: { id } })
   if (exception === null) throw new NotFoundError('Operational exception was not found')
-  if (exception.rowVersion !== rowVersion) throw new ConflictError('Exception changed concurrently')
+  if (exception.rowVersion !== rowVersion)
+    throw new ConflictError('Exception changed concurrently')
   if (!['OPEN', 'ACKNOWLEDGED'].includes(exception.status)) {
     throw new ConflictError('Operational exception is already terminal')
   }
@@ -936,8 +998,14 @@ function validateWebhookEndpoint(endpoint: string): void {
   } catch {
     throw new ValidationError('Webhook endpoint must be a valid URL')
   }
-  if (parsed.protocol !== 'https:' || parsed.username.length > 0 || parsed.password.length > 0) {
-    throw new ValidationError('Webhook endpoint must use HTTPS without embedded credentials')
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.username.length > 0 ||
+    parsed.password.length > 0
+  ) {
+    throw new ValidationError(
+      'Webhook endpoint must use HTTPS without embedded credentials',
+    )
   }
 }
 
