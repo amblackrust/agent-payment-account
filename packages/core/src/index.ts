@@ -119,6 +119,7 @@ export type {
 
 export {
   AGENT_CREDENTIAL_SCOPES,
+  DEFAULT_AGENT_CREDENTIAL_SCOPES,
   AgentAccountLifecycleStatus,
   AgentCredentialStatus,
   assertAccountCanStartMoneyOperation,

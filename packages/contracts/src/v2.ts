@@ -55,11 +55,15 @@ export const v2ErrorEnvelopeSchema = z
     message: z.string().min(1),
     request_id: z.string().min(1).optional(),
     details: z.record(z.string(), z.string()).optional(),
+    payment_id: z.string().min(1).optional(),
+    payment_status: v2PaymentStatusSchema.optional(),
+    reason_codes: z.array(z.string()).optional(),
   })
   .strict()
 
 export const v2PaymentCreateRequestSchema = z
   .object({
+    kind: z.enum(['PAY', 'SEND', 'REFUND']).default('PAY'),
     recipient_id: z.string().min(1),
     amount: exactAmountSchema,
     denomination_id: z.string().min(1),
@@ -76,11 +80,19 @@ export const v2PaymentResponseSchema = z
     recipient_id: z.string().nullable(),
     amount: exactAmountSchema,
     denomination_id: z.string().min(1),
+    denomination_symbol: z.string().min(1),
     status: v2PaymentStatusSchema,
     policy_decision: policyDecisionSchema,
+    policy_reason_codes: z.array(z.string()),
     approval_state: approvalStateSchema,
     attempt_count: z.number().int().nonnegative(),
     reservation_status: z.enum(['NONE', 'HELD', 'RELEASED', 'CONSUMED']),
+    route_id: z.string().nullable(),
+    route_selection_reason: z.string().nullable(),
+    settlement_asset_id: z.string().nullable(),
+    execution_state: z.string().min(1),
+    settlement_state: z.string().min(1),
+    outcome_state: z.string().min(1),
     created_at: z.string().min(1),
     updated_at: z.string().min(1),
     confirmed_at: z.string().nullable(),
@@ -102,9 +114,29 @@ export const v2BalanceResponseSchema = z
   })
   .strict()
 
+export const v2PaymentListResponseSchema = z
+  .object({
+    payments: z.array(v2PaymentResponseSchema),
+    next_cursor: z.string().nullable(),
+  })
+  .strict()
+
+export const v2AccountResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    status: z.enum(['PROVISIONING', 'ACTIVE', 'DISABLED', 'PROVISIONING_FAILED']),
+    runtime_version: z.string().nullable(),
+    provisioning_failure_code: z.string().nullable(),
+    disabled_at: z.string().nullable(),
+    disabled_reason: z.string().nullable(),
+  })
+  .strict()
+
 export type V2PaymentStatus = z.infer<typeof v2PaymentStatusSchema>
 export type V2ErrorCode = z.infer<typeof v2ErrorCodeSchema>
 export type V2ErrorEnvelope = z.infer<typeof v2ErrorEnvelopeSchema>
 export type V2PaymentCreateRequest = z.infer<typeof v2PaymentCreateRequestSchema>
 export type V2PaymentResponse = z.infer<typeof v2PaymentResponseSchema>
 export type V2BalanceResponse = z.infer<typeof v2BalanceResponseSchema>
+export type V2PaymentListResponse = z.infer<typeof v2PaymentListResponseSchema>
+export type V2AccountResponse = z.infer<typeof v2AccountResponseSchema>

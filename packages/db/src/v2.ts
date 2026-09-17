@@ -27,10 +27,43 @@ export interface V2SettlementAssetRecord {
   readonly version: number
 }
 
+export interface V2SpendPolicyRecord {
+  readonly id: string
+  readonly accountId: string
+  readonly version: number
+  readonly status: string
+  readonly denominationId: string
+  readonly maxPerPaymentAtomic: bigint | null
+  readonly rollingBudgetAtomic: bigint | null
+  readonly rollingWindowSeconds: number | null
+  readonly transactionCountCap: number | null
+  readonly approvalThresholdAtomic: bigint | null
+  readonly rollingBudgetEscalatable: boolean
+  readonly transactionCountEscalatable: boolean
+}
+
+export interface V2SpendContext {
+  readonly confirmedSpendAtomic: bigint
+  readonly heldReservationAtomic: bigint
+  readonly unresolvedSpendAtomic: bigint
+  readonly transactionCount: number
+}
+
+export interface V2ApprovedDestinationRecord {
+  readonly id: string
+  readonly accountId: string
+  readonly fingerprint: string
+  readonly rail: string
+  readonly network: string
+  readonly assetReference: string
+  readonly destination: string
+}
+
 export interface V2PaymentSnapshot {
   readonly id: string
   readonly payerAccountId: string
   readonly recipientId: string | null
+  readonly recipientManagedAccountId: string | null
   readonly kind: string
   readonly amountAtomic: bigint
   readonly amountScale: number | null
@@ -39,6 +72,7 @@ export interface V2PaymentSnapshot {
   readonly status: string
   readonly routeId: string | null
   readonly routeSelectionReason: string | null
+  readonly settlementAssetId: string | null
   readonly policyDecisionId: string | null
   readonly approvalId: string | null
   readonly executionState: string
@@ -46,6 +80,10 @@ export interface V2PaymentSnapshot {
   readonly outcomeState: string
   readonly rowVersion: number
   readonly originalPaymentId: string | null
+  readonly confirmedAt: Date | null
+  readonly failedAt: Date | null
+  readonly failureCode: string | null
+  readonly failureMessageSafe: string | null
   readonly createdAt: Date
   readonly updatedAt: Date
 }
@@ -63,6 +101,16 @@ export interface V2PaymentAttemptSnapshot {
   readonly validityExpiresAt: Date | null
   readonly validitySlot: bigint | null
   readonly rowVersion: number
+}
+
+export interface V2PaymentView {
+  readonly payment: V2PaymentSnapshot
+  readonly policyDecision: PaymentPolicyDecision
+  readonly reasonCodes: readonly string[]
+  readonly approvalState:
+    'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED'
+  readonly reservationStatus: 'NONE' | 'HELD' | 'RELEASED' | 'CONSUMED'
+  readonly attempts: readonly V2PaymentAttemptSnapshot[]
 }
 
 export interface V2PolicyDecisionInput {
@@ -83,13 +131,16 @@ export interface V2PaymentCreateInput {
   readonly attemptId: string
   readonly workItemId: string
   readonly idempotencyId: string
+  readonly timelineEventId: string
   readonly accountId: string
   readonly operation: 'PAY' | 'SEND' | 'REFUND'
   readonly idempotencyKey: string
   readonly requestHash: string
+  readonly requestId?: string
   readonly fingerprint: string
   readonly payerPublicKey: string
   readonly recipientId: string | null
+  readonly recipientManagedAccountId?: string | null
   readonly amountAtomic: bigint
   readonly amountScale: number
   readonly denominationId: string
@@ -131,6 +182,22 @@ export interface V2DatabaseRepository {
     readonly version?: number
   }): Promise<V2DenominationRecord>
   findDenomination(id: string): Promise<V2DenominationRecord | null>
+  findSettlementAsset(id: string): Promise<V2SettlementAssetRecord | null>
+  findActiveSpendPolicy(
+    accountId: string,
+    denominationId: string,
+  ): Promise<V2SpendPolicyRecord | null>
+  getSpendContext(
+    accountId: string,
+    denominationId: string,
+    now: Date,
+  ): Promise<V2SpendContext>
+  findApprovedDestination(
+    accountId: string,
+    fingerprint: string,
+  ): Promise<V2ApprovedDestinationRecord | null>
+  findAccountPublicKey(accountId: string): Promise<string | null>
+  getRefundedAtomic(originalPaymentId: string): Promise<bigint>
   createSettlementAsset(input: {
     readonly id: string
     readonly rail: string
@@ -191,6 +258,14 @@ export interface V2DatabaseRepository {
   }): Promise<void>
   createV2Payment(input: V2PaymentCreateInput): Promise<V2PaymentCreateResult>
   findPayment(accountId: string, paymentId: string): Promise<V2PaymentSnapshot | null>
+  findPaymentView(accountId: string, paymentId: string): Promise<V2PaymentView | null>
+  listPaymentViews(input: {
+    readonly accountId: string
+    readonly limit: number
+    readonly cursor?: { readonly createdAt: Date; readonly id: string }
+    readonly status?: string
+    readonly recipientId?: string
+  }): Promise<readonly V2PaymentView[]>
   listPayments(input: {
     readonly accountId: string
     readonly limit: number
@@ -280,6 +355,83 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 
     async findDenomination(id) {
       return prisma.denomination.findUnique({ where: { id } })
+    },
+
+    async findSettlementAsset(id) {
+      return prisma.settlementAsset.findUnique({ where: { id } })
+    },
+
+    async findActiveSpendPolicy(accountId, denominationId) {
+      return prisma.spendPolicy.findFirst({
+        where: { accountId, denominationId, status: 'ACTIVE' },
+        orderBy: { version: 'desc' },
+      })
+    },
+
+    async getSpendContext(accountId, denominationId, now) {
+      const windowStart = new Date(now.getTime() - 86_400_000)
+      const [confirmed, held, unresolved, transactionCount] = await Promise.all([
+        prisma.payment.aggregate({
+          where: { payerAccountId: accountId, denominationId, status: 'CONFIRMED' },
+          _sum: { amountAtomic: true },
+        }),
+        prisma.outgoingReservation.aggregate({
+          where: {
+            ownerAccountId: accountId,
+            status: 'ACTIVE',
+            lifecycleState: 'HELD',
+          },
+          _sum: { amountAtomic: true },
+        }),
+        prisma.payment.aggregate({
+          where: {
+            payerAccountId: accountId,
+            denominationId,
+            status: { in: ['REVIEW_REQUIRED', 'CLOSED_UNRESOLVED'] },
+          },
+          _sum: { amountAtomic: true },
+        }),
+        prisma.payment.count({
+          where: {
+            payerAccountId: accountId,
+            denominationId,
+            createdAt: { gte: windowStart },
+            status: { notIn: ['REJECTED_BY_POLICY', 'REJECTED', 'FAILED', 'EXPIRED'] },
+          },
+        }),
+      ])
+      return {
+        confirmedSpendAtomic: confirmed._sum.amountAtomic ?? 0n,
+        heldReservationAtomic: held._sum.amountAtomic ?? 0n,
+        unresolvedSpendAtomic: unresolved._sum.amountAtomic ?? 0n,
+        transactionCount,
+      }
+    },
+
+    async findApprovedDestination(accountId, fingerprint) {
+      return prisma.approvedDestination.findFirst({
+        where: { accountId, fingerprint, status: 'ACTIVE' },
+      })
+    },
+
+    async findAccountPublicKey(accountId) {
+      const account = await prisma.agentAccount.findFirst({
+        where: { id: accountId, status: 'ACTIVE' },
+        select: { solanaPublicKey: true },
+      })
+      return account?.solanaPublicKey ?? null
+    },
+
+    async getRefundedAtomic(originalPaymentId) {
+      const refunds = await prisma.payment.aggregate({
+        where: {
+          originalPaymentId,
+          kind: 'REFUND',
+          status: { notIn: ['FAILED', 'REJECTED', 'REJECTED_BY_POLICY', 'EXPIRED'] },
+        },
+        _sum: { amountAtomic: true },
+      })
+      return refunds._sum.amountAtomic ?? 0n
     },
 
     async createSettlementAsset(input) {
@@ -503,6 +655,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             payerAccountId: input.accountId,
             payerPublicKey: input.payerPublicKey,
             recipientId: input.recipientId,
+            ...(input.recipientManagedAccountId === undefined
+              ? {}
+              : { recipientManagedAccountId: input.recipientManagedAccountId }),
             kind: input.operation,
             amountAtomic: input.amountAtomic,
             amountScale: input.amountScale,
@@ -603,6 +758,21 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             responseSnapshot: JSON.stringify({ payment_id: payment.id, status }),
           },
         })
+        await transaction.operationTimelineEvent.create({
+          data: {
+            id: input.timelineEventId,
+            accountId: input.accountId,
+            resourceType: 'PAYMENT',
+            resourceId: payment.id,
+            eventType: 'PAYMENT_CREATED',
+            actorType: 'AGENT_CREDENTIAL',
+            actorId: input.accountId,
+            ...(input.requestId === undefined ? {} : { requestId: input.requestId }),
+            source: 'V2_PAYMENT_ORCHESTRATOR',
+            occurredAt: payment.createdAt,
+            newStateJson: JSON.stringify({ status, policy_decision: decision }),
+          },
+        })
         return { payment: toV2PaymentSnapshot(payment), created: true }
       })
     },
@@ -612,6 +782,38 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         where: { id: paymentId, payerAccountId: accountId },
       })
       return payment === null ? null : toV2PaymentSnapshot(payment)
+    },
+
+    async findPaymentView(accountId, paymentId) {
+      const payment = await prisma.payment.findFirst({
+        where: { id: paymentId, payerAccountId: accountId },
+      })
+      return payment === null ? null : loadPaymentView(prisma, payment, accountId)
+    },
+
+    async listPaymentViews(input) {
+      const payments = await prisma.payment.findMany({
+        where: {
+          payerAccountId: input.accountId,
+          ...(input.status === undefined ? {} : { status: input.status as never }),
+          ...(input.recipientId === undefined
+            ? {}
+            : { recipientId: input.recipientId }),
+          ...(input.cursor === undefined
+            ? {}
+            : {
+                OR: [
+                  { createdAt: { lt: input.cursor.createdAt } },
+                  { createdAt: input.cursor.createdAt, id: { lt: input.cursor.id } },
+                ],
+              }),
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: input.limit,
+      })
+      return Promise.all(
+        payments.map((payment) => loadPaymentView(prisma, payment, input.accountId)),
+      )
     },
 
     async listPayments(input) {
@@ -816,6 +1018,7 @@ function toV2PaymentSnapshot(payment: {
   id: string
   payerAccountId: string
   recipientId: string | null
+  recipientManagedAccountId: string | null
   kind: string
   amountAtomic: bigint
   amountScale: number | null
@@ -824,6 +1027,7 @@ function toV2PaymentSnapshot(payment: {
   status: string
   routeId: string | null
   routeSelectionReason: string | null
+  settlementAssetId: string | null
   policyDecisionId: string | null
   approvalId: string | null
   executionState: string
@@ -831,6 +1035,10 @@ function toV2PaymentSnapshot(payment: {
   outcomeState: string
   rowVersion: number
   originalPaymentId: string | null
+  confirmedAt: Date | null
+  failedAt: Date | null
+  failureCode: string | null
+  failureMessageSafe: string | null
   createdAt: Date
   updatedAt: Date
 }): V2PaymentSnapshot {
@@ -854,4 +1062,88 @@ function toV2AttemptSnapshot(attempt: {
   return {
     ...attempt,
   }
+}
+
+async function loadPaymentView(
+  prisma: PrismaClient,
+  payment: Parameters<typeof toV2PaymentSnapshot>[0],
+  accountId: string,
+): Promise<V2PaymentView> {
+  const [policyDecision, approval, reservation, attempts] = await Promise.all([
+    prisma.policyDecision.findUnique({ where: { paymentId: payment.id } }),
+    prisma.approval.findUnique({ where: { paymentId: payment.id } }),
+    prisma.outgoingReservation.findUnique({ where: { paymentId: payment.id } }),
+    prisma.paymentAttempt.findMany({
+      where: { paymentId: payment.id },
+      orderBy: { attemptNumber: 'asc' },
+    }),
+  ])
+  if (policyDecision === null || policyDecision.accountId !== accountId) {
+    throw new InvalidStateError('Payment is missing its durable policy decision')
+  }
+  const decision = parsePolicyDecision(policyDecision.decision)
+  const approvalState = projectApprovalState(approval)
+  return {
+    payment: toV2PaymentSnapshot(payment),
+    policyDecision: decision,
+    reasonCodes: parseStringArray(
+      policyDecision.reasonCodesJson,
+      'policy reason codes',
+    ),
+    approvalState,
+    reservationStatus: projectReservationStatus(reservation),
+    attempts: attempts.map(toV2AttemptSnapshot),
+  }
+}
+
+function parsePolicyDecision(value: string): PaymentPolicyDecision {
+  if (value === 'ALLOW' || value === 'REQUIRE_APPROVAL' || value === 'DENY') {
+    return value
+  }
+  throw new InvalidStateError('Payment has an unknown policy decision')
+}
+
+function projectApprovalState(
+  approval: { readonly status: string; readonly expiresAt: Date } | null,
+): V2PaymentView['approvalState'] {
+  if (approval === null) return 'NOT_REQUIRED'
+  if (approval.status === 'PENDING' && approval.expiresAt <= new Date())
+    return 'EXPIRED'
+  if (
+    approval.status === 'PENDING' ||
+    approval.status === 'APPROVED' ||
+    approval.status === 'REJECTED' ||
+    approval.status === 'EXPIRED'
+  ) {
+    return approval.status
+  }
+  throw new InvalidStateError('Payment has an unknown approval state')
+}
+
+function projectReservationStatus(
+  reservation: { readonly status: string; readonly lifecycleState: string } | null,
+): V2PaymentView['reservationStatus'] {
+  if (reservation === null) return 'NONE'
+  if (reservation.status === 'RELEASED' || reservation.lifecycleState === 'RELEASED') {
+    return 'RELEASED'
+  }
+  if (reservation.lifecycleState === 'HELD') return 'HELD'
+  if (reservation.lifecycleState === 'CONSUMED') return 'CONSUMED'
+  throw new InvalidStateError('Payment has an unknown reservation state')
+}
+
+function parseStringArray(value: string, fieldName: string): readonly string[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value) as unknown
+  } catch (error) {
+    throw new InvalidStateError(`${fieldName} are not valid JSON`)
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some((item): item is unknown => typeof item !== 'string')
+  ) {
+    throw new InvalidStateError(`${fieldName} are not a string array`)
+  }
+  return parsed
 }

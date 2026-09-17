@@ -11,13 +11,18 @@ import type { SolanaRail } from '@agent-payment/solana-rail'
 import type { AppConfig } from './config.js'
 import { serializeAccountCreation, serializeReceiveDestination } from './accounts.js'
 import type { AccountService } from './accounts.js'
-import { assertAdminApiKey, authenticateAgent } from './auth.js'
+import {
+  assertAdminApiKey,
+  authenticateAgent,
+  authenticateAgentWithScope,
+} from './auth.js'
 import { serializePayment } from './payments.js'
 import type { PaymentService } from './payments.js'
 import { serializeRecipient } from './recipients.js'
 import type { RecipientService } from './recipients.js'
 import type { ReceiveService } from './receives.js'
 import type { TransactionService } from './transactions.js'
+import { type V2CreatePaymentInput, type V2PaymentService } from './payments-v2.js'
 
 export interface ReadinessDependency {
   checkReadiness(): Promise<void>
@@ -34,6 +39,7 @@ export interface BuildAppOptions {
   readonly reservationRepository?: ReservationRepository
   readonly receiveService?: ReceiveService
   readonly transactionService?: TransactionService
+  readonly v2PaymentService?: V2PaymentService
 }
 
 interface ErrorWithCode {
@@ -61,6 +67,20 @@ function getErrorStatusCode(error: ErrorWithCode): number {
   switch (error.code) {
     case 'AUTHENTICATION_ERROR':
       return 401
+    case 'AUTHORIZATION_ERROR':
+      return 403
+    case 'POLICY_DENIED':
+      return 403
+    case 'NOT_FOUND':
+      return 404
+    case 'RATE_LIMITED':
+      return 429
+    case 'DEPENDENCY_UNAVAILABLE':
+    case 'CUSTODY_UNAVAILABLE':
+      return 503
+    case 'INVALID_STATE':
+    case 'IDEMPOTENCY_CONFLICT':
+      return 409
     case 'INSUFFICIENT_FUNDS':
     case 'CONFLICT':
       return 409
@@ -77,8 +97,24 @@ function getErrorStatusCode(error: ErrorWithCode): number {
   }
 }
 
-function getErrorResponse(error: ErrorWithCode & Error, statusCode: number) {
+function getErrorResponse(
+  error: ErrorWithCode & Error,
+  statusCode: number,
+  requestId?: string,
+  v2 = false,
+) {
   const isInternal = statusCode >= 500
+  if (v2) {
+    return {
+      code:
+        error.validation === undefined
+          ? (error.code ?? 'INTERNAL_ERROR')
+          : 'VALIDATION_ERROR',
+      message: isInternal ? 'Internal Server Error' : error.message,
+      ...(requestId === undefined ? {} : { request_id: requestId }),
+      ...(error.details === undefined ? {} : { details: error.details }),
+    }
+  }
   const response = {
     statusCode,
     error: error.code ?? 'INTERNAL_ERROR',
@@ -716,6 +752,221 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         )
       }
     }
+
+    if (options.v2PaymentService !== undefined) {
+      const { v2PaymentService } = options
+      const v2PaymentSchema = {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            kind: { type: 'string', enum: ['PAY', 'SEND', 'REFUND'], default: 'PAY' },
+            recipient_id: { type: 'string', minLength: 1, maxLength: 64 },
+            amount: { type: 'string', minLength: 1, maxLength: 256 },
+            denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
+            description: { type: 'string', minLength: 1, maxLength: 500 },
+            external_reference: { type: 'string', minLength: 1, maxLength: 255 },
+            route_preference: { type: 'string', minLength: 1, maxLength: 64 },
+          },
+          required: ['recipient_id', 'amount', 'denomination_id'],
+        },
+        headers: {
+          type: 'object',
+          properties: {
+            'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+          },
+          required: ['idempotency-key'],
+        },
+      } as const
+
+      app.post<{
+        Body: {
+          kind?: 'PAY' | 'SEND' | 'REFUND'
+          recipient_id: string
+          amount: string
+          denomination_id: string
+          description?: string
+          external_reference?: string
+          route_preference?: string
+        }
+      }>(
+        '/v2/payments',
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:create'),
+          schema: v2PaymentSchema,
+        },
+        async (request, reply) => {
+          const body: V2CreatePaymentInput = {
+            kind: request.body.kind ?? 'PAY',
+            recipientId: request.body.recipient_id,
+            amount: request.body.amount,
+            denominationId: request.body.denomination_id,
+            ...(request.body.description === undefined
+              ? {}
+              : { description: request.body.description }),
+            ...(request.body.external_reference === undefined
+              ? {}
+              : { externalReference: request.body.external_reference }),
+            ...(request.body.route_preference === undefined
+              ? {}
+              : { routePreference: request.body.route_preference }),
+          }
+          const result = await v2PaymentService.createPayment(
+            requireAgentAccount(request),
+            body,
+            getIdempotencyKey(request),
+            request.id,
+          )
+          const response = await v2PaymentService.serialize(result.view)
+          if (result.view.policyDecision === 'DENY') {
+            return reply.code(403).send({
+              code: 'POLICY_DENIED',
+              message: 'Payment was denied by policy',
+              request_id: request.id,
+              payment_id: result.view.payment.id,
+              payment_status: result.view.payment.status,
+              reason_codes: [...result.view.reasonCodes],
+            })
+          }
+          return reply.code(result.created ? 201 : 200).send(response)
+        },
+      )
+
+      app.get<{ Params: { paymentId: string } }>(
+        '/v2/payments/:paymentId',
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:read'),
+
+          schema: {
+            params: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                paymentId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['paymentId'],
+            },
+          },
+        },
+        async (request) =>
+          v2PaymentService.serialize(
+            await v2PaymentService.getPayment(
+              requireAgentAccount(request).account.id,
+              request.params.paymentId,
+            ),
+          ),
+      )
+
+      app.get<{
+        Querystring: {
+          limit?: number
+          cursor?: string
+          status?: string
+          recipient_id?: string
+        }
+      }>(
+        '/v2/payments',
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:read'),
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                cursor: { type: 'string', minLength: 1 },
+                status: { type: 'string', minLength: 1, maxLength: 32 },
+                recipient_id: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+            },
+          },
+        },
+        async (request) => {
+          const page = await v2PaymentService.listPayments(
+            requireAgentAccount(request).account.id,
+            {
+              ...(request.query.limit === undefined
+                ? {}
+                : { limit: request.query.limit }),
+              ...(request.query.cursor === undefined
+                ? {}
+                : { cursor: request.query.cursor }),
+              ...(request.query.status === undefined
+                ? {}
+                : { status: request.query.status }),
+              ...(request.query.recipient_id === undefined
+                ? {}
+                : { recipientId: request.query.recipient_id }),
+            },
+          )
+          return {
+            payments: await Promise.all(
+              page.payments.map((payment) => v2PaymentService.serialize(payment)),
+            ),
+            next_cursor: page.nextCursor,
+          }
+        },
+      )
+
+      app.post<{
+        Params: { paymentId: string }
+        Body: {
+          amount: string
+          denomination_id: string
+          description?: string
+          external_reference?: string
+          route_preference?: string
+        }
+      }>(
+        '/v2/payments/:paymentId/refunds',
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:create'),
+          schema: {
+            headers: v2PaymentSchema.headers,
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['amount', 'denomination_id'],
+              properties: {
+                amount: { type: 'string', minLength: 1, maxLength: 256 },
+                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
+                description: { type: 'string', minLength: 1, maxLength: 500 },
+                external_reference: { type: 'string', minLength: 1, maxLength: 255 },
+                route_preference: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+            },
+          },
+        },
+        async (request, reply) => {
+          const result = await v2PaymentService.createRefund(
+            requireAgentAccount(request),
+            request.params.paymentId,
+            {
+              amount: request.body.amount,
+              denominationId: request.body.denomination_id,
+              ...(request.body.description === undefined
+                ? {}
+                : { description: request.body.description }),
+              ...(request.body.external_reference === undefined
+                ? {}
+                : { externalReference: request.body.external_reference }),
+              ...(request.body.route_preference === undefined
+                ? {}
+                : { routePreference: request.body.route_preference }),
+            },
+            getIdempotencyKey(request),
+            request.id,
+          )
+          return reply
+            .code(result.created ? 201 : 200)
+            .send(await v2PaymentService.serialize(result.view))
+        },
+      )
+    }
   }
 
   app.get(
@@ -758,7 +1009,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       },
       'API request failed',
     )
-    return reply.code(statusCode).send(getErrorResponse(error, statusCode))
+    const isV2 = request.url.startsWith('/v2/')
+    return reply
+      .code(statusCode)
+      .send(getErrorResponse(error, statusCode, request.id, isV2))
   })
 
   return app

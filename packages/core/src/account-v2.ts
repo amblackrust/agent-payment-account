@@ -32,6 +32,15 @@ export const AGENT_CREDENTIAL_SCOPES = {
 export type AgentCredentialScope =
   (typeof AGENT_CREDENTIAL_SCOPES)[keyof typeof AGENT_CREDENTIAL_SCOPES]
 
+export const DEFAULT_AGENT_CREDENTIAL_SCOPES: readonly AgentCredentialScope[] = [
+  AGENT_CREDENTIAL_SCOPES.PAYMENTS_CREATE,
+  AGENT_CREDENTIAL_SCOPES.PAYMENTS_READ,
+  AGENT_CREDENTIAL_SCOPES.RECIPIENTS_MANAGE,
+  AGENT_CREDENTIAL_SCOPES.RECEIVE_MANAGE,
+  AGENT_CREDENTIAL_SCOPES.BALANCE_READ,
+  AGENT_CREDENTIAL_SCOPES.HISTORY_READ,
+]
+
 export function canTransitionAgentAccount(
   current: AgentAccountLifecycleStatus,
   next: AgentAccountLifecycleStatus,

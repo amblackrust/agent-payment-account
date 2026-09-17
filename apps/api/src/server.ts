@@ -23,6 +23,7 @@ import { ReceiveService } from './receives.js'
 import { IncomingReconciliationService } from './incoming.js'
 import { OutgoingPaymentReconciliationService } from './outgoing.js'
 import { TransactionService } from './transactions.js'
+import { V2PaymentService } from './payments-v2.js'
 
 const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
 const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
@@ -81,6 +82,21 @@ async function startServer(): Promise<void> {
     },
   )
   const transactionService = new TransactionService(database)
+  const v2PaymentService = new V2PaymentService({
+    repository: database.v2,
+    recipientRepository: database,
+    settledBalanceProvider: {
+      getSettledAtomic: async ({ account, denomination }) => {
+        if (denomination.symbol !== 'USD' || denomination.maxScale !== 2) {
+          throw new ExternalRailError(
+            'The configured Solana balance provider cannot represent this denomination exactly',
+          )
+        }
+        const balance = await rail.getSettlementBalance(account.account.solanaPublicKey)
+        return balance.settled.atomicUnits
+      },
+    },
+  })
   const incomingReader = createSolanaIncomingReader({
     rpc: createSolanaRpc(config.solanaRpcUrl as ClusterUrl),
     readRail: rail,
@@ -107,6 +123,7 @@ async function startServer(): Promise<void> {
     reservationRepository: database,
     receiveService,
     transactionService,
+    v2PaymentService,
   })
   paymentService.setEventSink({
     info: (data, message) => app.log.info(data, message),

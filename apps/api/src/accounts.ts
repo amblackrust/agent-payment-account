@@ -1,5 +1,6 @@
 import {
   ValidationError,
+  DEFAULT_AGENT_CREDENTIAL_SCOPES,
   createAccountId,
   createCredentialId,
   createReceiveId,
@@ -81,6 +82,7 @@ export class AccountService {
       accountId,
       keyHash: credential.keyHash,
       keyPrefix: credential.keyPrefix,
+      scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
     })
     return { ...stored, apiKey: credential.rawKey }
   }

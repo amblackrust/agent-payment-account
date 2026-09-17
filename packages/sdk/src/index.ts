@@ -5,12 +5,19 @@ import {
   receiveResponseSchema,
   transactionListResponseSchema,
   transactionResponseSchema,
+  v2ErrorEnvelopeSchema,
+  v2PaymentCreateRequestSchema,
+  v2PaymentListResponseSchema,
+  v2PaymentResponseSchema,
   type ApiErrorResponse,
   type BalanceResponse,
   type PaymentResponse,
   type ReceiveResponse,
   type TransactionListResponse,
   type TransactionResponse,
+  type V2PaymentCreateRequest,
+  type V2PaymentListResponse,
+  type V2PaymentResponse,
 } from '@agent-payment/contracts'
 
 export type Currency = 'USD'
@@ -18,7 +25,19 @@ export type Currency = 'USD'
 export type PaymentKind = 'PAY' | 'SEND' | 'REFUND'
 export type TransactionKind = PaymentKind | 'RECEIVE'
 export type PaymentStatus =
-  'CREATED' | 'ROUTING' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
+  | 'CREATED'
+  | 'ROUTING'
+  | 'AWAITING_APPROVAL'
+  | 'REJECTED_BY_POLICY'
+  | 'REJECTED'
+  | 'SUBMITTED'
+  | 'RECONCILING'
+  | 'CONFIRMED'
+  | 'PROVED_NO_EFFECT'
+  | 'REVIEW_REQUIRED'
+  | 'CLOSED_UNRESOLVED'
+  | 'FAILED'
+  | 'EXPIRED'
 
 export type TransactionDirection = 'INCOMING' | 'OUTGOING'
 
@@ -75,6 +94,59 @@ export interface PaymentInput {
   readonly currency?: Currency
   readonly description?: string
   readonly externalReference?: string
+}
+
+export type V2PaymentStatus = V2PaymentResponse['status']
+
+export interface V2Payment {
+  readonly id: string
+  readonly kind: PaymentKind
+  readonly recipientId: string | null
+  readonly amount: string
+  readonly denominationId: string
+  readonly denominationSymbol: string
+  readonly status: V2PaymentStatus
+  readonly policyDecision: 'ALLOW' | 'REQUIRE_APPROVAL' | 'DENY'
+  readonly policyReasonCodes: readonly string[]
+  readonly approvalState:
+    'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED'
+  readonly attemptCount: number
+  readonly reservationStatus: 'NONE' | 'HELD' | 'RELEASED' | 'CONSUMED'
+  readonly routeId: string | null
+  readonly routeSelectionReason: string | null
+  readonly settlementAssetId: string | null
+  readonly executionState: string
+  readonly settlementState: string
+  readonly outcomeState: string
+  readonly createdAt: string
+  readonly updatedAt: string
+  readonly confirmedAt: string | null
+  readonly failureCode: string | null
+  readonly failureMessage: string | null
+  readonly originalPaymentId: string | null
+}
+
+export interface V2PaymentInput {
+  readonly kind?: PaymentKind
+  readonly recipientId: string
+  readonly amount: string
+  readonly denominationId: string
+  readonly description?: string
+  readonly externalReference?: string
+  readonly routePreference?: string
+}
+
+export interface V2PaymentPage {
+  readonly payments: readonly V2Payment[]
+  readonly nextCursor: string | null
+}
+
+export interface V2RefundInput {
+  readonly amount: string
+  readonly denominationId: string
+  readonly description?: string
+  readonly externalReference?: string
+  readonly routePreference?: string
 }
 
 export interface RefundInput {
@@ -138,6 +210,14 @@ export type SdkErrorCode =
   | 'REFUND_NOT_SUPPORTED'
   | 'PAYMENT_PENDING'
   | 'EXTERNAL_SERVICE_ERROR'
+  | 'AUTHORIZATION_ERROR'
+  | 'NOT_FOUND'
+  | 'IDEMPOTENCY_CONFLICT'
+  | 'POLICY_DENIED'
+  | 'APPROVAL_REQUIRED'
+  | 'REVIEW_REQUIRED'
+  | 'INVALID_STATE'
+  | 'RATE_LIMITED'
 
 export class SdkError extends Error {
   public readonly code: SdkErrorCode
@@ -208,16 +288,19 @@ export class RefundNotSupportedError extends SdkError {
 export class PaymentPendingError extends SdkError {
   public readonly idempotencyKey: string
   public readonly paymentId?: string
+  public readonly requestId?: string
 
   public constructor(
     idempotencyKey: string,
     message = 'Payment outcome is pending; poll the payment or retry with the same idempotency key',
     paymentId?: string,
+    requestId?: string,
   ) {
     super('PAYMENT_PENDING', message)
     this.name = 'PaymentPendingError'
     this.idempotencyKey = idempotencyKey
     if (paymentId !== undefined) this.paymentId = paymentId
+    if (requestId !== undefined) this.requestId = requestId
   }
 }
 
@@ -229,6 +312,65 @@ export class ExternalServiceError extends SdkError {
   ) {
     super('EXTERNAL_SERVICE_ERROR', message, statusCode, options)
     this.name = 'ExternalServiceError'
+  }
+}
+
+export class AuthorizationError extends SdkError {
+  public constructor(message = 'The actor is not authorized for this operation') {
+    super('AUTHORIZATION_ERROR', message, 403)
+    this.name = 'AuthorizationError'
+  }
+}
+
+export class NotFoundError extends SdkError {
+  public constructor(message = 'Resource was not found') {
+    super('NOT_FOUND', message, 404)
+    this.name = 'NotFoundError'
+  }
+}
+
+export class IdempotencyConflictError extends SdkError {
+  public constructor(message = 'Idempotency key was already used for another request') {
+    super('IDEMPOTENCY_CONFLICT', message, 409)
+    this.name = 'IdempotencyConflictError'
+  }
+}
+
+export class PolicyDeniedError extends SdkError {
+  public readonly paymentId: string | undefined
+
+  public constructor(message = 'Payment was denied by policy', paymentId?: string) {
+    super('POLICY_DENIED', message, 403)
+    this.name = 'PolicyDeniedError'
+    this.paymentId = paymentId
+  }
+}
+
+export class ApprovalRequiredError extends SdkError {
+  public constructor(message = 'Payment requires approval') {
+    super('APPROVAL_REQUIRED', message, 409)
+    this.name = 'ApprovalRequiredError'
+  }
+}
+
+export class ReviewRequiredError extends SdkError {
+  public constructor(message = 'Payment requires operational review') {
+    super('REVIEW_REQUIRED', message, 409)
+    this.name = 'ReviewRequiredError'
+  }
+}
+
+export class InvalidStateError extends SdkError {
+  public constructor(message = 'The resource is in an invalid state') {
+    super('INVALID_STATE', message, 409)
+    this.name = 'InvalidStateError'
+  }
+}
+
+export class RateLimitedError extends SdkError {
+  public constructor(message = 'Request rate limit exceeded') {
+    super('RATE_LIMITED', message, 429)
+    this.name = 'RateLimitedError'
   }
 }
 
@@ -354,6 +496,52 @@ function parseTransactionListPage(value: unknown): TransactionPage {
   }
 }
 
+function parseV2Payment(value: unknown): V2Payment {
+  const response = parseContract<V2PaymentResponse>(
+    value,
+    v2PaymentResponseSchema,
+    'API returned an invalid V2 payment response',
+  )
+  return {
+    id: response.id,
+    kind: response.kind,
+    recipientId: response.recipient_id,
+    amount: response.amount,
+    denominationId: response.denomination_id,
+    denominationSymbol: response.denomination_symbol,
+    status: response.status,
+    policyDecision: response.policy_decision,
+    policyReasonCodes: response.policy_reason_codes,
+    approvalState: response.approval_state,
+    attemptCount: response.attempt_count,
+    reservationStatus: response.reservation_status,
+    routeId: response.route_id,
+    routeSelectionReason: response.route_selection_reason,
+    settlementAssetId: response.settlement_asset_id,
+    executionState: response.execution_state,
+    settlementState: response.settlement_state,
+    outcomeState: response.outcome_state,
+    createdAt: response.created_at,
+    updatedAt: response.updated_at,
+    confirmedAt: response.confirmed_at,
+    failureCode: response.failure_code,
+    failureMessage: response.failure_message,
+    originalPaymentId: response.original_payment_id,
+  }
+}
+
+function parseV2PaymentPage(value: unknown): V2PaymentPage {
+  const response = parseContract<V2PaymentListResponse>(
+    value,
+    v2PaymentListResponseSchema,
+    'API returned an invalid V2 payment list response',
+  )
+  return {
+    payments: response.payments.map(parseV2Payment),
+    nextCursor: response.next_cursor,
+  }
+}
+
 function generatedIdempotencyKey(): string {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
     return `sdk_${globalThis.crypto.randomUUID()}`
@@ -398,6 +586,24 @@ function toApiPaymentInput(input: PaymentInput) {
       ? {}
       : { external_reference: input.externalReference }),
   }
+}
+
+function toApiV2PaymentInput(input: V2PaymentInput): V2PaymentCreateRequest {
+  const result = v2PaymentCreateRequestSchema.safeParse({
+    kind: input.kind ?? 'PAY',
+    recipient_id: input.recipientId,
+    amount: input.amount,
+    denomination_id: input.denominationId,
+    ...(input.description === undefined ? {} : { description: input.description }),
+    ...(input.externalReference === undefined
+      ? {}
+      : { external_reference: input.externalReference }),
+    ...(input.routePreference === undefined
+      ? {}
+      : { route_preference: input.routePreference }),
+  })
+  if (!result.success) throw new ValidationError('V2 payment input is invalid')
+  return result.data
 }
 
 function toApiRefundInput(input: RefundInput) {
@@ -456,6 +662,82 @@ export class AgentPaymentAccount {
 
   public async getBalance(): Promise<Balance> {
     return parseBalance(await this.request('/v1/balance', 'GET'))
+  }
+
+  public async createPaymentV2(
+    input: V2PaymentInput,
+    options?: string | IdempotencyOptions,
+  ): Promise<V2Payment> {
+    const idempotencyKey = unwrapIdempotencyOptions(options)
+    return this.postMoney(
+      '/v2/payments',
+      toApiV2PaymentInput(input),
+      idempotencyKey,
+      parseV2Payment,
+    )
+  }
+
+  public async getPaymentV2(paymentId: string): Promise<V2Payment> {
+    return parseV2Payment(
+      await this.request(`/v2/payments/${encodeURIComponent(paymentId)}`, 'GET'),
+    )
+  }
+
+  public async listPaymentsV2Page(
+    input: {
+      readonly limit?: number
+      readonly cursor?: string
+      readonly status?: V2PaymentStatus
+      readonly recipientId?: string
+    } = {},
+  ): Promise<V2PaymentPage> {
+    const query = new URLSearchParams()
+    if (input.limit !== undefined) query.set('limit', String(input.limit))
+    if (input.cursor !== undefined) query.set('cursor', input.cursor)
+    if (input.status !== undefined) query.set('status', input.status)
+    if (input.recipientId !== undefined) query.set('recipient_id', input.recipientId)
+    const suffix = query.toString()
+    return parseV2PaymentPage(
+      await this.request(`/v2/payments${suffix === '' ? '' : `?${suffix}`}`, 'GET'),
+    )
+  }
+
+  public async listPaymentsV2(): Promise<readonly V2Payment[]> {
+    const payments: V2Payment[] = []
+    let cursor: string | undefined
+    do {
+      const page = await this.listPaymentsV2Page({
+        ...(cursor === undefined ? {} : { cursor }),
+      })
+      payments.push(...page.payments)
+      cursor = page.nextCursor ?? undefined
+    } while (cursor !== undefined)
+    return payments
+  }
+
+  public async refundV2(
+    paymentId: string,
+    input: V2RefundInput,
+    options?: string | IdempotencyOptions,
+  ): Promise<V2Payment> {
+    const idempotencyKey = unwrapIdempotencyOptions(options)
+    const body = {
+      amount: input.amount,
+      denomination_id: input.denominationId,
+      ...(input.description === undefined ? {} : { description: input.description }),
+      ...(input.externalReference === undefined
+        ? {}
+        : { external_reference: input.externalReference }),
+      ...(input.routePreference === undefined
+        ? {}
+        : { route_preference: input.routePreference }),
+    }
+    return this.postMoney(
+      `/v2/payments/${encodeURIComponent(paymentId)}/refunds`,
+      body,
+      idempotencyKey,
+      parseV2Payment,
+    )
   }
 
   public async pay(
@@ -671,6 +953,70 @@ function mapHttpError(
   payload: unknown,
   idempotencyKey?: string,
 ): SdkError {
+  const v2Parsed = v2ErrorEnvelopeSchema.safeParse(payload)
+  if (v2Parsed.success) {
+    const body = v2Parsed.data
+    const paymentId = body.payment_id
+    switch (body.code) {
+      case 'AUTHENTICATION_ERROR':
+        return new AuthenticationError(body.message)
+      case 'AUTHORIZATION_ERROR':
+        return new AuthorizationError(body.message)
+      case 'NOT_FOUND':
+        return new NotFoundError(body.message)
+      case 'IDEMPOTENCY_CONFLICT':
+        return new IdempotencyConflictError(body.message)
+      case 'POLICY_DENIED':
+        return new PolicyDeniedError(body.message, paymentId)
+      case 'APPROVAL_REQUIRED':
+        return new ApprovalRequiredError(body.message)
+      case 'REVIEW_REQUIRED':
+        return new ReviewRequiredError(body.message)
+      case 'INVALID_STATE':
+        return new InvalidStateError(body.message)
+      case 'RATE_LIMITED':
+        return new RateLimitedError(body.message)
+      case 'VALIDATION_ERROR':
+        return new ValidationError(body.message, statusCode)
+      case 'INSUFFICIENT_FUNDS':
+        return new InsufficientFundsError(body.message)
+      case 'CONFLICT':
+        return new ConflictError(body.message)
+      case 'DEPENDENCY_UNAVAILABLE':
+      case 'CUSTODY_UNAVAILABLE':
+        if (idempotencyKey !== undefined && statusCode >= 500) {
+          return new PaymentPendingError(
+            idempotencyKey,
+            body.message,
+            paymentId,
+            body.request_id,
+          )
+        }
+        return new HttpResponseExternalServiceError(body.message, statusCode)
+      case 'EXTERNAL_RAIL_FAILURE':
+        if (idempotencyKey !== undefined && statusCode >= 500) {
+          return new PaymentPendingError(
+            idempotencyKey,
+            body.message,
+            paymentId,
+            body.request_id,
+          )
+        }
+        return new HttpResponseExternalServiceError(body.message, statusCode)
+      case 'INTERNAL_ERROR':
+        if (idempotencyKey !== undefined) {
+          return new PaymentPendingError(
+            idempotencyKey,
+            body.message,
+            paymentId,
+            body.request_id,
+          )
+        }
+        return new HttpResponseExternalServiceError(body.message, statusCode)
+      default:
+        return new HttpResponseExternalServiceError(body.message, statusCode)
+    }
+  }
   const parsed = apiErrorResponseSchema.safeParse(payload)
   const body: ApiErrorResponse = parsed.success ? parsed.data : {}
   const message = body.message

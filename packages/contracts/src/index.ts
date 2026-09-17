@@ -17,10 +17,17 @@ const currency = z.literal('USD')
 const paymentStatus = z.enum([
   'CREATED',
   'ROUTING',
+  'AWAITING_APPROVAL',
+  'REJECTED_BY_POLICY',
+  'REJECTED',
   'SUBMITTED',
   'RECONCILING',
   'CONFIRMED',
+  'PROVED_NO_EFFECT',
+  'REVIEW_REQUIRED',
+  'CLOSED_UNRESOLVED',
   'FAILED',
+  'EXPIRED',
 ])
 const paymentKind = z.enum(['PAY', 'SEND', 'REFUND'])
 const transactionKind = z.enum(['PAY', 'SEND', 'REFUND', 'RECEIVE'])
@@ -172,15 +179,19 @@ export {
   v2BalanceResponseSchema,
   v2ErrorCodeSchema,
   v2ErrorEnvelopeSchema,
+  v2AccountResponseSchema,
   v2PaymentCreateRequestSchema,
+  v2PaymentListResponseSchema,
   v2PaymentResponseSchema,
   v2PaymentStatusSchema,
 } from './v2.js'
 export type {
   V2BalanceResponse,
+  V2AccountResponse,
   V2ErrorCode,
   V2ErrorEnvelope,
   V2PaymentCreateRequest,
+  V2PaymentListResponse,
   V2PaymentResponse,
   V2PaymentStatus,
 } from './v2.js'

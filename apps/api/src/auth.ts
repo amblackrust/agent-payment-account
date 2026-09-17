@@ -1,6 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { FastifyRequest } from 'fastify'
-import { AuthenticationError } from '@agent-payment/core'
+import {
+  AgentCredentialStatus,
+  AuthenticationError,
+  AuthorizationError,
+  type AgentCredentialScope,
+} from '@agent-payment/core'
 import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 
 export const ADMIN_API_KEY_HEADER = 'x-admin-api-key'
@@ -59,12 +64,40 @@ export async function authenticateAgent(
   if (account === null || account.credential.revokedAt !== null) {
     throw new AuthenticationError()
   }
+  if (
+    account.credential.status !== undefined &&
+    account.credential.status !== AgentCredentialStatus.ACTIVE
+  ) {
+    throw new AuthenticationError()
+  }
+  if (
+    account.credential.expiresAt !== undefined &&
+    account.credential.expiresAt !== null &&
+    account.credential.expiresAt <= new Date()
+  ) {
+    throw new AuthenticationError()
+  }
   if (account.account.status !== 'ACTIVE') {
     throw new AuthenticationError('Account is disabled')
   }
 
   await repository.markCredentialUsed(account.credential.id)
   request.agentAccount = account
+  return account
+}
+
+export async function authenticateAgentWithScope(
+  request: FastifyRequest,
+  repository: AccountRepository,
+  requiredScope: AgentCredentialScope,
+): Promise<AuthenticatedAccount> {
+  const account = await authenticateAgent(request, repository)
+  if (account.credential.scopes === undefined) {
+    throw new AuthorizationError('Credential scopes are unavailable')
+  }
+  if (!account.credential.scopes.includes(requiredScope)) {
+    throw new AuthorizationError('Credential does not have the required scope')
+  }
   return account
 }
 

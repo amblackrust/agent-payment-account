@@ -4,6 +4,7 @@ import {
   assertPaymentAttemptStatusTransition,
   assertPaymentStatusTransition,
   ConflictError,
+  DEFAULT_AGENT_CREDENTIAL_SCOPES,
   ExternalRailError,
   InsufficientFundsError,
   RecipientResolutionError,
@@ -12,6 +13,7 @@ import { PrismaClient, type Prisma } from './generated/client/client.js'
 import { createV2DatabaseRepository, type V2DatabaseRepository } from './v2.js'
 export { createV2DatabaseRepository } from './v2.js'
 export type {
+  V2ApprovedDestinationRecord,
   V2DatabaseRepository,
   V2DenominationRecord,
   V2PaymentAttemptSnapshot,
@@ -20,6 +22,9 @@ export type {
   V2PolicyDecisionInput,
   V2PaymentSnapshot,
   V2SettlementAssetRecord,
+  V2PaymentView,
+  V2SpendContext,
+  V2SpendPolicyRecord,
   V2WorkItemClaim,
 } from './v2.js'
 
@@ -50,6 +55,9 @@ export interface AuthenticatedAccount {
     readonly accountId: string
     readonly keyHash: string
     readonly keyPrefix: string
+    readonly status?: 'ACTIVE' | 'EXPIRED' | 'REVOKED' | 'ROTATING'
+    readonly scopes?: readonly string[]
+    readonly expiresAt?: Date | null
     readonly revokedAt: Date | null
     readonly lastUsedAt: Date | null
   }
@@ -65,6 +73,8 @@ export interface CreateAgentAccountInput {
   readonly credentialId: string
   readonly keyHash: string
   readonly keyPrefix: string
+  readonly scopes?: readonly string[]
+  readonly expiresAt?: Date
 }
 
 export interface AccountCustodyRecord {
@@ -89,6 +99,8 @@ export interface AccountRepository {
     readonly accountId: string
     readonly keyHash: string
     readonly keyPrefix: string
+    readonly scopes?: readonly string[]
+    readonly expiresAt?: Date
   }) => Promise<StoredApiCredential>
   readonly listAccountSummaries?: () => Promise<readonly AccountSummary[]>
   readonly findAccountSummary?: (accountId: string) => Promise<AccountSummary | null>
@@ -100,6 +112,9 @@ export interface StoredApiCredential {
   readonly keyPrefix: string
   readonly createdAt: Date
   readonly revokedAt: Date | null
+  readonly status?: 'ACTIVE' | 'EXPIRED' | 'REVOKED' | 'ROTATING'
+  readonly scopes?: readonly string[]
+  readonly expiresAt?: Date | null
 }
 
 export interface AccountSummary {
@@ -140,6 +155,8 @@ export interface RecipientRecord {
   readonly destinations: readonly RecipientDestinationRecord[]
   readonly createdAt: Date
   readonly updatedAt: Date
+  readonly archivedAt?: Date | null
+  readonly rowVersion?: number
 }
 
 export interface CreateRecipientInput {
@@ -727,6 +744,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             accountId: account.id,
             keyHash: input.keyHash,
             keyPrefix: input.keyPrefix,
+            scopes: JSON.stringify(DEFAULT_AGENT_CREDENTIAL_SCOPES),
           },
         })
         return account
@@ -740,6 +758,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           accountId: true,
           keyHash: true,
           keyPrefix: true,
+          status: true,
+          scopes: true,
+          expiresAt: true,
           revokedAt: true,
           lastUsedAt: true,
           account: {
@@ -762,6 +783,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           accountId: credential.accountId,
           keyHash: credential.keyHash,
           keyPrefix: credential.keyPrefix,
+          status: credential.status,
+          scopes: parseCredentialScopes(credential.scopes),
+          expiresAt: credential.expiresAt,
           revokedAt: credential.revokedAt,
           lastUsedAt: credential.lastUsedAt,
         },
@@ -797,7 +821,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     async revokeCredential(accountId, credentialId): Promise<boolean> {
       const result = await prisma.apiCredential.updateMany({
         where: { id: credentialId, accountId, revokedAt: null },
-        data: { revokedAt: new Date() },
+        data: {
+          status: 'REVOKED',
+          revokedAt: new Date(),
+          rowVersion: { increment: 1 },
+        },
       })
       return result.count === 1
     },
@@ -808,6 +836,10 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           accountId: input.accountId,
           keyHash: input.keyHash,
           keyPrefix: input.keyPrefix,
+          ...(input.scopes === undefined
+            ? {}
+            : { scopes: JSON.stringify(input.scopes) }),
+          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
         },
       })
       return {
@@ -816,6 +848,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         keyPrefix: credential.keyPrefix,
         createdAt: credential.createdAt,
         revokedAt: credential.revokedAt,
+        status: credential.status,
+        scopes: parseCredentialScopes(credential.scopes),
+        expiresAt: credential.expiresAt,
       }
     },
     async listAccountSummaries() {
@@ -2072,6 +2107,8 @@ function toRecipientRecord(recipient: {
   type: string
   createdAt: Date
   updatedAt: Date
+  archivedAt?: Date | null
+  rowVersion?: number
   ownerAccount: { status: AgentAccountStatus }
   destinations: readonly {
     id: string
@@ -2095,7 +2132,22 @@ function toRecipientRecord(recipient: {
     })),
     createdAt: recipient.createdAt,
     updatedAt: recipient.updatedAt,
+    archivedAt: recipient.archivedAt ?? null,
+    rowVersion: recipient.rowVersion ?? 1,
   }
+}
+
+function parseCredentialScopes(value: string): readonly string[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value) as unknown
+  } catch {
+    throw new Error('Credential scopes are not valid JSON')
+  }
+  if (!Array.isArray(parsed) || parsed.some((scope) => typeof scope !== 'string')) {
+    throw new Error('Credential scopes are not a string array')
+  }
+  return parsed
 }
 
 function toPaymentRecord(payment: {
