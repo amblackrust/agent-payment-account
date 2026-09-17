@@ -1,17 +1,67 @@
-import { createHmac } from 'node:crypto'
+import { createHmac, timingSafeEqual } from 'node:crypto'
 import { computeRetryAt } from '@agent-payment/core'
-import type {
-  V2OperationsRepository,
-  V2WebhookDeliveryClaim,
-} from '@agent-payment/db'
+import type { V2OperationsRepository, V2WebhookDeliveryClaim } from '@agent-payment/db'
 
 const DEFAULT_BATCH_SIZE = 50
 const DEFAULT_LEASE_SECONDS = 30
 const DEFAULT_MAX_ATTEMPTS = 12
 const DEFAULT_TIMEOUT_MS = 5_000
+export const DEFAULT_WEBHOOK_REPLAY_WINDOW_SECONDS = 300
+
+export const WEBHOOK_SIGNATURE_HEADER = 'x-mux-signature'
+export const WEBHOOK_SIGNATURE_VERSION_HEADER = 'x-mux-signature-version'
+export const WEBHOOK_TIMESTAMP_HEADER = 'x-mux-timestamp'
 
 export interface WebhookSigningKeyProvider {
   getKey(reference: string, version: number): Promise<Uint8Array>
+}
+
+export interface WebhookSignatureVerificationInput {
+  readonly rawBody: string
+  readonly timestamp: string
+  readonly signature: string
+  readonly key: Uint8Array
+  readonly now?: Date
+  readonly replayWindowSeconds?: number
+}
+
+/**
+ * Verifies the exact body delivered by the worker and rejects stale headers.
+ * The timestamp is part of the MAC input so a captured delivery cannot be
+ * replayed outside the bounded acceptance window.
+ */
+export function verifyWebhookSignature(
+  input: WebhookSignatureVerificationInput,
+): boolean {
+  if (!/^\d+$/u.test(input.timestamp)) return false
+  const timestampSeconds = Number(input.timestamp)
+  const replayWindowSeconds =
+    input.replayWindowSeconds ?? DEFAULT_WEBHOOK_REPLAY_WINDOW_SECONDS
+  if (
+    !Number.isSafeInteger(timestampSeconds) ||
+    timestampSeconds <= 0 ||
+    !Number.isInteger(replayWindowSeconds) ||
+    replayWindowSeconds <= 0 ||
+    input.key.byteLength === 0
+  ) {
+    return false
+  }
+  const ageSeconds = Math.abs(
+    (input.now ?? new Date()).getTime() / 1_000 - timestampSeconds,
+  )
+  if (ageSeconds > replayWindowSeconds) return false
+
+  const expected = createWebhookSignature(input.rawBody, timestampSeconds, input.key)
+  const provided = input.signature.startsWith('sha256=')
+    ? input.signature.slice('sha256='.length)
+    : input.signature
+  if (!/^[0-9a-f]{64}$/iu.test(provided)) return false
+  const expectedBytes = Buffer.from(expected, 'hex')
+  const providedBytes = Buffer.from(provided, 'hex')
+  return (
+    providedBytes.byteLength === expectedBytes.byteLength &&
+    timingSafeEqual(providedBytes, expectedBytes)
+  )
 }
 
 export interface WebhookDeliveryWorkerOptions {
@@ -75,7 +125,8 @@ export class WebhookDeliveryWorker {
         claim.signingKeyVersion,
       )
       if (key.byteLength === 0) throw new Error('Webhook signing key is empty')
-      const signature = createHmac('sha256', key).update(claim.rawBody, 'utf8').digest('hex')
+      const timestampSeconds = Math.floor(this.now().getTime() / 1_000)
+      const signature = createWebhookSignature(claim.rawBody, timestampSeconds, key)
       const controller = new AbortController()
       const timeout = setTimeout(
         () => controller.abort(),
@@ -88,8 +139,9 @@ export class WebhookDeliveryWorker {
           headers: {
             'content-type': 'application/json',
             'x-mux-event-id': claim.eventId,
-            'x-mux-signature': `sha256=${signature}`,
-            'x-mux-signature-version': String(claim.signingKeyVersion),
+            [WEBHOOK_SIGNATURE_HEADER]: `sha256=${signature}`,
+            [WEBHOOK_SIGNATURE_VERSION_HEADER]: String(claim.signingKeyVersion),
+            [WEBHOOK_TIMESTAMP_HEADER]: String(timestampSeconds),
           },
           body: claim.rawBody,
           signal: controller.signal,
@@ -131,4 +183,14 @@ export class WebhookDeliveryWorker {
       maxAttempts: this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
     })
   }
+}
+
+function createWebhookSignature(
+  rawBody: string,
+  timestampSeconds: number,
+  key: Uint8Array,
+): string {
+  return createHmac('sha256', key)
+    .update(`${timestampSeconds}.${rawBody}`, 'utf8')
+    .digest('hex')
 }

@@ -71,6 +71,23 @@ policies, approvals, approved destinations, and the operator exception inbox:
   review without allowing an operator to release an unresolved reservation by
   timeout alone.
 
+### V2 webhook verification
+
+Webhook deliveries use the exact durable JSON body and include these headers:
+
+- `x-mux-event-id` — stable event identity; duplicate deliveries are possible.
+- `x-mux-signature-version` — signing-key version to select at the secret
+  boundary.
+- `x-mux-timestamp` — Unix timestamp in seconds.
+- `x-mux-signature` — `sha256=<hex HMAC>`.
+
+Compute `HMAC-SHA256(secret, "<timestamp>.<raw_body>")` without parsing or
+re-serializing the body. Accept a delivery only when the timestamp is within
+the five-minute replay window and compare the decoded MAC in constant time.
+Subscriptions store a secret reference and version; the signing secret is
+never returned by the API. Delivery is at-least-once with bounded retries, so
+consumers should deduplicate by event ID.
+
 V2 errors use the canonical envelope:
 
 ```json
