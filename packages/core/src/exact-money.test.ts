@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  convertFromSettlementAtomicUnits,
   convertToSettlementAtomicUnits,
   addExactMoney,
   createDenomination,
@@ -55,6 +56,23 @@ describe('exact money', () => {
     expect(() =>
       convertToSettlementAtomicUnits(parseExactMoney('1', usd), mapping, solanaUsdc),
     ).toThrow(/rounding/i)
+  })
+
+  it('converts settlement balances back without rounding', () => {
+    const mapping = createEconomicMapping({
+      id: 'mapping_usd_usdc',
+      denominationId: usd.id,
+      settlementAssetId: solanaUsdc.id,
+      numerator: 2n,
+      denominator: 1n,
+    })
+    expect(
+      convertFromSettlementAtomicUnits(2_000_000n, mapping, usd, solanaUsdc)
+        .atomicUnits,
+    ).toBe(1_000_000n)
+    expect(() =>
+      convertFromSettlementAtomicUnits(1n, mapping, usd, solanaUsdc),
+    ).toThrow(/represented exactly/i)
   })
 
   it('distinguishes settlement assets with the same symbol in different contexts', () => {

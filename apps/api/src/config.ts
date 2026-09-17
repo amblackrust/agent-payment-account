@@ -1,5 +1,48 @@
 import { z } from 'zod'
 
+const positiveInt = (defaultValue: number, maximum: number) =>
+  z.coerce.number().int().min(1).max(maximum).default(defaultValue)
+
+export interface RuntimeLimits {
+  readonly workerBatchSize: number
+  readonly workerLeaseSeconds: number
+  readonly incomingAccountConcurrency: number
+  readonly requestRateLimitWindowSeconds: number
+  readonly paymentRateLimitPerWindow: number
+  readonly receiveRateLimitPerWindow: number
+  readonly capacityWindowSeconds: number
+  readonly databaseCapacityPerWindow: number
+  readonly rpcCapacityPerWindow: number
+  readonly custodyCapacityPerWindow: number
+  readonly railCapacityPerWindow: number
+  readonly webhookCapacityPerWindow: number
+  readonly webhookBatchSize: number
+  readonly webhookLeaseSeconds: number
+  readonly webhookMaxAttempts: number
+  readonly webhookTimeoutMs: number
+  readonly maxPageSize: number
+}
+
+export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = {
+  workerBatchSize: 10,
+  workerLeaseSeconds: 30,
+  incomingAccountConcurrency: 8,
+  requestRateLimitWindowSeconds: 60,
+  paymentRateLimitPerWindow: 60,
+  receiveRateLimitPerWindow: 120,
+  capacityWindowSeconds: 1,
+  databaseCapacityPerWindow: 100,
+  rpcCapacityPerWindow: 50,
+  custodyCapacityPerWindow: 20,
+  railCapacityPerWindow: 50,
+  webhookCapacityPerWindow: 50,
+  webhookBatchSize: 50,
+  webhookLeaseSeconds: 30,
+  webhookMaxAttempts: 12,
+  webhookTimeoutMs: 5_000,
+  maxPageSize: 100,
+}
+
 const configSchema = z.object({
   DATABASE_URL: z.string().trim().min(1, 'DATABASE_URL is required'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3_000),
@@ -24,7 +67,7 @@ const configSchema = z.object({
       'RECOVERY_ENVELOPE_KEY must be 32 bytes encoded as 64 hexadecimal characters',
     ),
   RUNTIME_ROLE: z
-    .enum(['api', 'outgoing', 'incoming', 'webhook', 'maintenance', 'all'])
+    .enum(['api', 'outgoing', 'reconcile', 'incoming', 'webhook', 'maintenance', 'all'])
     .optional(),
   RUNTIME_AUTHORITY_ID: z.string().trim().min(1).optional(),
   RESTORE_GATE_REQUIRED: z.preprocess((value: unknown) => {
@@ -41,6 +84,53 @@ const configSchema = z.object({
   BACKUP_OUTPUT_DIRECTORY: z.string().trim().min(1).optional(),
   CUSTODY_BACKEND_IDENTITY: z.string().trim().min(1).optional(),
   CUSTODY_BACKEND_MODE: z.enum(['EXTERNAL', 'LOCAL_TEST']).optional(),
+  WORKER_BATCH_SIZE: positiveInt(DEFAULT_RUNTIME_LIMITS.workerBatchSize, 1_000),
+  WORKER_LEASE_SECONDS: positiveInt(DEFAULT_RUNTIME_LIMITS.workerLeaseSeconds, 3_600),
+  INCOMING_ACCOUNT_CONCURRENCY: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.incomingAccountConcurrency,
+    1_000,
+  ),
+  REQUEST_RATE_LIMIT_WINDOW_SECONDS: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.requestRateLimitWindowSeconds,
+    86_400,
+  ),
+  PAYMENT_RATE_LIMIT_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.paymentRateLimitPerWindow,
+    1_000_000,
+  ),
+  RECEIVE_RATE_LIMIT_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.receiveRateLimitPerWindow,
+    1_000_000,
+  ),
+  CAPACITY_WINDOW_SECONDS: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.capacityWindowSeconds,
+    86_400,
+  ),
+  DATABASE_CAPACITY_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.databaseCapacityPerWindow,
+    1_000_000,
+  ),
+  RPC_CAPACITY_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.rpcCapacityPerWindow,
+    1_000_000,
+  ),
+  CUSTODY_CAPACITY_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.custodyCapacityPerWindow,
+    1_000_000,
+  ),
+  RAIL_CAPACITY_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.railCapacityPerWindow,
+    1_000_000,
+  ),
+  WEBHOOK_CAPACITY_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.webhookCapacityPerWindow,
+    1_000_000,
+  ),
+  WEBHOOK_BATCH_SIZE: positiveInt(DEFAULT_RUNTIME_LIMITS.webhookBatchSize, 1_000),
+  WEBHOOK_LEASE_SECONDS: positiveInt(DEFAULT_RUNTIME_LIMITS.webhookLeaseSeconds, 3_600),
+  WEBHOOK_MAX_ATTEMPTS: positiveInt(DEFAULT_RUNTIME_LIMITS.webhookMaxAttempts, 100),
+  WEBHOOK_TIMEOUT_MS: positiveInt(DEFAULT_RUNTIME_LIMITS.webhookTimeoutMs, 120_000),
+  MAX_PAGE_SIZE: positiveInt(DEFAULT_RUNTIME_LIMITS.maxPageSize, 1_000),
   ALLOW_MAINNET: z.preprocess((value: unknown) => {
     if (value === undefined) {
       return false
@@ -56,7 +146,7 @@ const configSchema = z.object({
 })
 
 export type RuntimeRole =
-  'api' | 'outgoing' | 'incoming' | 'webhook' | 'maintenance' | 'all'
+  'api' | 'outgoing' | 'reconcile' | 'incoming' | 'webhook' | 'maintenance' | 'all'
 
 export type AppConfig = {
   readonly databaseUrl: string
@@ -81,6 +171,7 @@ export type AppConfig = {
   readonly custodyBackendIdentity?: string
   readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
   readonly allowMainnet: boolean
+  readonly limits?: RuntimeLimits
 }
 
 export class ConfigurationError extends Error {
@@ -118,10 +209,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       'Production must select an explicit runtime role; RUNTIME_ROLE=all is development-only',
     )
   }
-  if (result.data.NODE_ENV === 'production' && result.data.RUNTIME_AUTHORITY_ID === undefined) {
-    throw new ConfigurationError(
-      'Production requires an explicit RUNTIME_AUTHORITY_ID',
-    )
+  if (
+    result.data.NODE_ENV === 'production' &&
+    result.data.RUNTIME_AUTHORITY_ID === undefined
+  ) {
+    throw new ConfigurationError('Production requires an explicit RUNTIME_AUTHORITY_ID')
   }
   if (
     (runtimeRole === 'outgoing' || runtimeRole === 'all') &&
@@ -132,7 +224,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     )
   }
   if (
-    runtimeRole === 'outgoing' &&
+    (runtimeRole === 'outgoing' || runtimeRole === 'reconcile') &&
     (result.data.CUSTODY_BACKEND_IDENTITY === undefined ||
       result.data.CUSTODY_BACKEND_MODE === undefined)
   ) {
@@ -237,6 +329,25 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       ? {}
       : { custodyBackendMode: result.data.CUSTODY_BACKEND_MODE }),
     allowMainnet: result.data.ALLOW_MAINNET,
+    limits: {
+      workerBatchSize: result.data.WORKER_BATCH_SIZE,
+      workerLeaseSeconds: result.data.WORKER_LEASE_SECONDS,
+      incomingAccountConcurrency: result.data.INCOMING_ACCOUNT_CONCURRENCY,
+      requestRateLimitWindowSeconds: result.data.REQUEST_RATE_LIMIT_WINDOW_SECONDS,
+      paymentRateLimitPerWindow: result.data.PAYMENT_RATE_LIMIT_PER_WINDOW,
+      receiveRateLimitPerWindow: result.data.RECEIVE_RATE_LIMIT_PER_WINDOW,
+      capacityWindowSeconds: result.data.CAPACITY_WINDOW_SECONDS,
+      databaseCapacityPerWindow: result.data.DATABASE_CAPACITY_PER_WINDOW,
+      rpcCapacityPerWindow: result.data.RPC_CAPACITY_PER_WINDOW,
+      custodyCapacityPerWindow: result.data.CUSTODY_CAPACITY_PER_WINDOW,
+      railCapacityPerWindow: result.data.RAIL_CAPACITY_PER_WINDOW,
+      webhookCapacityPerWindow: result.data.WEBHOOK_CAPACITY_PER_WINDOW,
+      webhookBatchSize: result.data.WEBHOOK_BATCH_SIZE,
+      webhookLeaseSeconds: result.data.WEBHOOK_LEASE_SECONDS,
+      webhookMaxAttempts: result.data.WEBHOOK_MAX_ATTEMPTS,
+      webhookTimeoutMs: result.data.WEBHOOK_TIMEOUT_MS,
+      maxPageSize: result.data.MAX_PAGE_SIZE,
+    },
   }
 }
 
@@ -258,6 +369,11 @@ export interface RedactedConfig {
   readonly hasBackupAgeIdentity: boolean
   readonly custodyBackendIdentity?: string
   readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
+  readonly limits: RuntimeLimits
+}
+
+export function getRuntimeLimits(config: Pick<AppConfig, 'limits'>): RuntimeLimits {
+  return config.limits ?? DEFAULT_RUNTIME_LIMITS
 }
 
 export function redactConfig(config: AppConfig): RedactedConfig {
@@ -287,5 +403,6 @@ export function redactConfig(config: AppConfig): RedactedConfig {
     ...(config.custodyBackendMode === undefined
       ? {}
       : { custodyBackendMode: config.custodyBackendMode }),
+    limits: getRuntimeLimits(config),
   }
 }

@@ -78,7 +78,7 @@ pnpm local:status
 Expected readiness response:
 
 ```json
-{"status":"ok"}
+{ "status": "ok" }
 ```
 
 `local:setup` creates a local-only environment: PostgreSQL, a detached Solana validator, a platform fee payer funded with fake SOL, a 6-decimal classic SPL test mint, generated API and wallet-encryption secrets, a root `.env`, and the committed database migrations. It does not use mainnet, real money, or an external faucet.
@@ -145,30 +145,30 @@ Root project commands load the checkout's root `.env` explicitly, even when pnpm
 
 Useful commands:
 
-| Command | Purpose |
-| --- | --- |
-| `pnpm local:setup` | Create or restart the preserved local environment and deploy committed migrations |
-| `pnpm local:status` | Report PostgreSQL, Solana, mint, fee-payer, and API status without printing secrets |
-| `pnpm local:down` | Stop only this checkout's local infrastructure while preserving state |
-| `pnpm db:migrate` | Author a new Prisma migration during schema development |
-| `pnpm db:migrate:deploy` | Apply already committed migrations |
+| Command                  | Purpose                                                                             |
+| ------------------------ | ----------------------------------------------------------------------------------- |
+| `pnpm local:setup`       | Create or restart the preserved local environment and deploy committed migrations   |
+| `pnpm local:status`      | Report PostgreSQL, Solana, mint, fee-payer, and API status without printing secrets |
+| `pnpm local:down`        | Stop only this checkout's local infrastructure while preserving state               |
+| `pnpm db:migrate`        | Author a new Prisma migration during schema development                             |
+| `pnpm db:migrate:deploy` | Apply already committed migrations                                                  |
 
 ### Configuration
 
 See [`.env.example`](.env.example) for safe manual defaults and accepted secret formats.
 
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL connection URL |
-| `PORT` | API port; defaults to `3000` |
-| `NODE_ENV` | `development`, `test`, or `production` |
-| `ADMIN_API_KEY` | Administrative account and credential authentication |
-| `SOLANA_RPC_URL` | RPC endpoint for the configured cluster |
-| `SOLANA_CLUSTER` | `localnet`, `devnet`, `testnet`, or `mainnet-beta` |
-| `SOLANA_SETTLEMENT_MINT` | One classic SPL mint used for settlement |
-| `SOLANA_FEE_PAYER_SECRET` | Separate platform fee-payer signer secret |
-| `WALLET_MASTER_KEY` | 32-byte key used to encrypt managed signer secrets |
-| `ALLOW_MAINNET` | Additional explicit mainnet opt-in; defaults to `false` |
+| Variable                  | Purpose                                                 |
+| ------------------------- | ------------------------------------------------------- |
+| `DATABASE_URL`            | PostgreSQL connection URL                               |
+| `PORT`                    | API port; defaults to `3000`                            |
+| `NODE_ENV`                | `development`, `test`, or `production`                  |
+| `ADMIN_API_KEY`           | Administrative account and credential authentication    |
+| `SOLANA_RPC_URL`          | RPC endpoint for the configured cluster                 |
+| `SOLANA_CLUSTER`          | `localnet`, `devnet`, `testnet`, or `mainnet-beta`      |
+| `SOLANA_SETTLEMENT_MINT`  | One classic SPL mint used for settlement                |
+| `SOLANA_FEE_PAYER_SECRET` | Separate platform fee-payer signer secret               |
+| `WALLET_MASTER_KEY`       | 32-byte key used to encrypt managed signer secrets      |
+| `ALLOW_MAINNET`           | Additional explicit mainnet opt-in; defaults to `false` |
 
 For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supply a mint and funded fee payer belonging to that cluster. Do not use `local:setup` to prepare a custom network. Mainnet is never part of Quick Start and requires both `SOLANA_CLUSTER=mainnet-beta` and `ALLOW_MAINNET=true`.
 
@@ -177,6 +177,9 @@ For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supp
 - [Product](docs/product.md) — users, mental model, product flow, v1 scope, and non-goals
 - [Architecture](docs/architecture.md) — components, lifecycle, custody, data, and trust boundaries
 - [API Reference](docs/api.md) — authentication, routes, payloads, statuses, and errors
+- [Operations](docs/operations.md) — runtime roles, health, backup, and restore gate
+- [Deployment](docs/deployment.md) — platform-neutral topology and secret boundaries
+- [V2 Conformance](docs/v2-conformance.md) — release evidence and open decision gates
 - [Roadmap](docs/roadmap.md) — implemented scope and explicitly uncommitted future directions
 
 ## Current Scope and Limitations

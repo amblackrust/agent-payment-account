@@ -9,14 +9,213 @@ const ALLOWED_LABELS = new Set([
 ])
 
 const DEFAULT_HISTOGRAM_BUCKETS = [5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000]
+const MAX_CORRELATION_ID_LENGTH = 128
+
+export const CORRELATION_ID_HEADER = 'x-correlation-id'
+
+export type DomainAlertName =
+  | 'REVIEW_REQUIRED_BACKLOG'
+  | 'REVIEW_REQUIRED_AGE'
+  | 'INCOMING_ISSUES_EXHAUSTED'
+  | 'CUSTODY_FAILURES'
+  | 'NO_PROGRESS'
+  | 'DATABASE_SATURATION'
+  | 'DEPENDENCY_DEGRADED'
+  | 'WEBHOOK_BACKLOG'
+  | 'RESTORE_VERIFICATION_FAILED'
+  | 'RUNTIME_IDENTITY_MISMATCH'
+
+export interface DomainAlert {
+  readonly name: DomainAlertName
+  readonly severity: 'warning' | 'critical'
+  readonly message: string
+}
+
+export interface DomainAlertSnapshot {
+  readonly reviewRequiredPayments: number
+  readonly oldestReviewRequiredAgeSeconds: number | null
+  readonly exhaustedIncomingIssues: number
+  readonly custodyFailures: number
+  readonly noProgressSeconds: number | null
+  readonly databaseSaturationRatio: number | null
+  readonly dependencyDegraded: boolean
+  readonly pendingWebhookDeliveries: number
+  readonly restoreVerificationFailed: boolean
+  readonly runtimeIdentityMismatch: boolean
+}
+
+export interface DomainAlertThresholds {
+  readonly reviewRequiredBacklog: number
+  readonly reviewRequiredAgeSeconds: number
+  readonly noProgressSeconds: number
+  readonly databaseSaturationRatio: number
+  readonly webhookBacklog: number
+}
+
+export const DEFAULT_DOMAIN_ALERT_THRESHOLDS: DomainAlertThresholds = {
+  reviewRequiredBacklog: 1,
+  reviewRequiredAgeSeconds: 300,
+  noProgressSeconds: 300,
+  databaseSaturationRatio: 0.9,
+  webhookBacklog: 1,
+}
 
 export interface DomainHealthSnapshot {
   readonly status: 'ok' | 'degraded'
   readonly checks: Readonly<Record<string, 'ok' | 'degraded'>>
+  readonly alerts?: readonly DomainAlert[]
 }
 
 export interface DomainHealthDependency {
   checkDomainHealth(): Promise<DomainHealthSnapshot>
+}
+
+export function normalizeCorrelationId(
+  value: string | readonly string[] | undefined,
+  fallback: string,
+): string {
+  const candidate = Array.isArray(value) ? value[0] : value
+  if (
+    candidate !== undefined &&
+    candidate.length > 0 &&
+    candidate.length <= MAX_CORRELATION_ID_LENGTH &&
+    /^[a-zA-Z0-9_.:-]+$/u.test(candidate)
+  ) {
+    return candidate
+  }
+  return fallback
+}
+
+export function evaluateDomainAlerts(
+  snapshot: DomainAlertSnapshot,
+  thresholds: DomainAlertThresholds = DEFAULT_DOMAIN_ALERT_THRESHOLDS,
+): readonly DomainAlert[] {
+  validateAlertSnapshot(snapshot, thresholds)
+  const alerts: DomainAlert[] = []
+  if (snapshot.reviewRequiredPayments >= thresholds.reviewRequiredBacklog) {
+    alerts.push({
+      name: 'REVIEW_REQUIRED_BACKLOG',
+      severity: 'critical',
+      message: 'Payments require operator review',
+    })
+  }
+  if (
+    snapshot.oldestReviewRequiredAgeSeconds !== null &&
+    snapshot.oldestReviewRequiredAgeSeconds >= thresholds.reviewRequiredAgeSeconds
+  ) {
+    alerts.push({
+      name: 'REVIEW_REQUIRED_AGE',
+      severity: 'critical',
+      message: 'The oldest payment requiring review exceeds the alert age',
+    })
+  }
+  if (snapshot.exhaustedIncomingIssues > 0) {
+    alerts.push({
+      name: 'INCOMING_ISSUES_EXHAUSTED',
+      severity: 'critical',
+      message: 'Incoming reconciliation issues have exhausted their retry budget',
+    })
+  }
+  if (snapshot.custodyFailures > 0) {
+    alerts.push({
+      name: 'CUSTODY_FAILURES',
+      severity: 'critical',
+      message: 'Custody operations are failing',
+    })
+  }
+  if (
+    snapshot.noProgressSeconds !== null &&
+    snapshot.noProgressSeconds >= thresholds.noProgressSeconds
+  ) {
+    alerts.push({
+      name: 'NO_PROGRESS',
+      severity: 'warning',
+      message: 'A durable workflow has not made progress within the alert window',
+    })
+  }
+  if (
+    snapshot.databaseSaturationRatio !== null &&
+    snapshot.databaseSaturationRatio >= thresholds.databaseSaturationRatio
+  ) {
+    alerts.push({
+      name: 'DATABASE_SATURATION',
+      severity: 'warning',
+      message: 'Database capacity is near its configured limit',
+    })
+  }
+  if (snapshot.dependencyDegraded) {
+    alerts.push({
+      name: 'DEPENDENCY_DEGRADED',
+      severity: 'critical',
+      message: 'A configured settlement dependency is degraded',
+    })
+  }
+  if (snapshot.pendingWebhookDeliveries >= thresholds.webhookBacklog) {
+    alerts.push({
+      name: 'WEBHOOK_BACKLOG',
+      severity: 'warning',
+      message: 'Webhook deliveries are backlogged',
+    })
+  }
+  if (snapshot.restoreVerificationFailed) {
+    alerts.push({
+      name: 'RESTORE_VERIFICATION_FAILED',
+      severity: 'critical',
+      message: 'The latest backup restore verification failed',
+    })
+  }
+  if (snapshot.runtimeIdentityMismatch) {
+    alerts.push({
+      name: 'RUNTIME_IDENTITY_MISMATCH',
+      severity: 'critical',
+      message: 'Runtime financial identity does not match durable configuration',
+    })
+  }
+  return alerts
+}
+
+function validateAlertSnapshot(
+  snapshot: DomainAlertSnapshot,
+  thresholds: DomainAlertThresholds,
+): void {
+  const counters = [
+    snapshot.reviewRequiredPayments,
+    snapshot.exhaustedIncomingIssues,
+    snapshot.custodyFailures,
+    snapshot.pendingWebhookDeliveries,
+  ]
+  if (counters.some((value) => !Number.isInteger(value) || value < 0)) {
+    throw new Error('Domain alert counters must be non-negative integers')
+  }
+  const optionalDurations = [
+    snapshot.oldestReviewRequiredAgeSeconds,
+    snapshot.noProgressSeconds,
+  ]
+  if (
+    optionalDurations.some(
+      (value) => value !== null && (!Number.isFinite(value) || value < 0),
+    )
+  ) {
+    throw new Error('Domain alert durations must be non-negative')
+  }
+  if (
+    snapshot.databaseSaturationRatio !== null &&
+    (!Number.isFinite(snapshot.databaseSaturationRatio) ||
+      snapshot.databaseSaturationRatio < 0 ||
+      snapshot.databaseSaturationRatio > 1)
+  ) {
+    throw new Error('Database saturation ratio must be between zero and one')
+  }
+  if (
+    thresholds.reviewRequiredBacklog < 1 ||
+    thresholds.reviewRequiredAgeSeconds < 1 ||
+    thresholds.noProgressSeconds < 1 ||
+    thresholds.databaseSaturationRatio <= 0 ||
+    thresholds.databaseSaturationRatio > 1 ||
+    thresholds.webhookBacklog < 1
+  ) {
+    throw new Error('Domain alert thresholds are invalid')
+  }
 }
 
 interface HistogramState {

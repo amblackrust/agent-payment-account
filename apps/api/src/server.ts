@@ -5,12 +5,23 @@ import {
   createSolanaIncomingReader,
   createSolanaRail,
 } from '@agent-payment/solana-rail'
+import type { SolanaRail } from '@agent-payment/solana-rail'
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
-import { DependencyUnavailableError, ExternalRailError } from '@agent-payment/core'
+import {
+  convertFromSettlementAtomicUnits,
+  DependencyUnavailableError,
+  ExternalRailError,
+} from '@agent-payment/core'
 
 import { buildApp } from './app.js'
 import { AccountService } from './accounts.js'
-import { ConfigurationError, loadConfig, redactConfig } from './config.js'
+import {
+  ConfigurationError,
+  getRuntimeLimits,
+  loadConfig,
+  redactConfig,
+} from './config.js'
+import { DurableCapacityController } from './capacity.js'
 import {
   fingerprintWalletMasterKey,
   validateLegacyWalletCustody,
@@ -23,10 +34,12 @@ import { V2ReceiveService } from './receives.js'
 import { IncomingReconciliationService } from './incoming.js'
 import { TransactionService } from './transactions.js'
 import { V2PaymentService } from './payments-v2.js'
+import type { V2SettledBalanceProvider } from './payments-v2.js'
 import { V2PaymentServiceAdapter } from './payments-v1-adapter.js'
 import { V2ManagementService } from './v2-management.js'
 import { V2OperationsService } from './v2-operations.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
+import { evaluateDomainAlerts } from './observability.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -37,6 +50,8 @@ async function startServer(): Promise<void> {
   }
   const legacyRuntimeEnabled = config.runtimeRole === 'all'
   const database = createDatabaseClient(config.databaseUrl)
+  const limits = getRuntimeLimits(config)
+  const capacity = new DurableCapacityController(database.v2Admin, limits)
   const rail = createSolanaRail({
     rpcUrl: config.solanaRpcUrl,
     expectedCluster: config.solanaCluster,
@@ -119,34 +134,21 @@ async function startServer(): Promise<void> {
     repository: database.v2,
     recipientRepository: database,
     settledBalanceProvider: {
-      getSettledAtomic: async ({ account, denomination }) => {
-        if (denomination.symbol !== 'USD' || denomination.maxScale !== 2) {
-          throw new ExternalRailError(
-            'The configured Solana balance provider cannot represent this denomination exactly',
-          )
-        }
-        const balance = await rail.getSettlementBalance(account.account.solanaPublicKey)
-        return balance.settled.atomicUnits
-      },
+      getSettledAtomic: (input) => getLogicalSettledAtomic(rail, input),
     },
+    maxPageSize: limits.maxPageSize,
   })
   const v2ManagementService = new V2ManagementService({
     repository: database.v2Admin,
     financialRepository: database.v2,
     settledBalanceProvider: {
-      getSettledAtomic: async ({ account, denomination }) => {
-        if (denomination.symbol !== 'USD' || denomination.maxScale !== 2) {
-          throw new ExternalRailError(
-            'The configured Solana balance provider cannot represent this denomination exactly',
-          )
-        }
-        const balance = await rail.getSettlementBalance(account.account.solanaPublicKey)
-        return balance.settled.atomicUnits
-      },
+      getSettledAtomic: (input) => getLogicalSettledAtomic(rail, input),
     },
     recoveryCipher,
   })
-  const v2OperationsService = new V2OperationsService(database.v2Operations)
+  const v2OperationsService = new V2OperationsService(database.v2Operations, {
+    maxPageSize: limits.maxPageSize,
+  })
   const v2OutgoingRuntime = legacyRuntimeEnabled
     ? createV2OutgoingWorker({ config, database, walletCipher })
     : undefined
@@ -186,6 +188,18 @@ async function startServer(): Promise<void> {
       checkDomainHealth: async () => {
         const health = await database.v2Operations.getDomainHealth?.()
         if (health === undefined) return { status: 'ok', checks: {} }
+        const alerts = evaluateDomainAlerts({
+          reviewRequiredPayments: health.reviewRequiredPayments,
+          oldestReviewRequiredAgeSeconds: null,
+          exhaustedIncomingIssues: health.exhaustedIncomingIssues,
+          custodyFailures: 0,
+          noProgressSeconds: null,
+          databaseSaturationRatio: null,
+          dependencyDegraded: false,
+          pendingWebhookDeliveries: health.pendingWebhookDeliveries,
+          restoreVerificationFailed: false,
+          runtimeIdentityMismatch: false,
+        })
         const checks = {
           review_required:
             health.reviewRequiredPayments === 0
@@ -205,14 +219,23 @@ async function startServer(): Promise<void> {
             ? ('degraded' as const)
             : ('ok' as const),
           checks,
+          alerts,
         }
       },
     },
   })
   const incomingReconciliation = legacyRuntimeEnabled
-    ? new IncomingReconciliationService(database, incomingReader, {
-        error: (data, message) => app.log.error(data, message),
-      })
+    ? new IncomingReconciliationService(
+        database,
+        incomingReader,
+        {
+          error: (data, message) => app.log.error(data, message),
+        },
+        {
+          accountConcurrency: limits.incomingAccountConcurrency,
+          capacity,
+        },
+      )
     : undefined
   const runWorkers = (): void => {
     void incomingReconciliation?.runOnce().catch((error: unknown) => {
@@ -283,3 +306,21 @@ async function startServer(): Promise<void> {
 }
 
 await startServer()
+
+async function getLogicalSettledAtomic(
+  rail: SolanaRail,
+  input: Parameters<V2SettledBalanceProvider['getSettledAtomic']>[0],
+): Promise<bigint> {
+  const balance = await rail.getSettlementBalance(input.account.account.solanaPublicKey)
+  if (balance.tokenDecimals !== input.settlementAsset.decimals) {
+    throw new ExternalRailError(
+      'Settlement token decimals differ from the persisted asset configuration',
+    )
+  }
+  return convertFromSettlementAtomicUnits(
+    balance.tokenAtomicUnits,
+    input.economicMapping,
+    input.denomination,
+    input.settlementAsset,
+  ).atomicUnits
+}

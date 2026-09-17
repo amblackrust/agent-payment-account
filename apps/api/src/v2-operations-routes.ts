@@ -1,10 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { AuthenticationError } from '@agent-payment/core'
-import type {
-  AccountRepository,
-  AuthenticatedAccount,
-} from '@agent-payment/db'
-import type { AppConfig } from './config.js'
+import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
+import { getRuntimeLimits, type AppConfig } from './config.js'
 import { assertAdminApiKey, authenticateAgentWithScope } from './auth.js'
 import type { V2OperationsService } from './v2-operations.js'
 
@@ -41,6 +38,7 @@ export function registerV2OperationsRoutes(
     readonly service: V2OperationsService
   },
 ): void {
+  const maxPageSize = getRuntimeLimits(options.config).maxPageSize
   app.get<{
     Querystring: {
       limit?: number
@@ -166,7 +164,7 @@ export function registerV2OperationsRoutes(
           additionalProperties: false,
           properties: {
             status: { type: 'string', minLength: 1, maxLength: 32 },
-            limit: { type: 'integer', minimum: 1, maximum: 100 },
+            limit: { type: 'integer', minimum: 1, maximum: maxPageSize },
           },
         },
       },

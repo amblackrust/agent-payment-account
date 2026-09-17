@@ -146,6 +146,38 @@ describe('webhook delivery worker', () => {
     })
   })
 
+  it('defers delivery when the shared webhook capacity is exhausted', async () => {
+    const retries: unknown[] = []
+    const currentClaim = claim()
+    const retryAt = new Date('2026-09-18T00:01:00.000Z')
+    globalThis.fetch = vi.fn() as typeof globalThis.fetch
+    const worker = new WebhookDeliveryWorker({
+      repository: repository(currentClaim, {
+        retryWebhookDelivery: async (input) => {
+          retries.push(input)
+        },
+      }),
+      signingKeys: { getKey: async () => new TextEncoder().encode('webhook-secret') },
+      owner: 'webhook-worker-1',
+      maxAttempts: 3,
+      now: () => new Date('2026-09-18T00:00:00.000Z'),
+      capacity: {
+        acquire: async () => ({ allowed: false, count: 51, retryAt }),
+      },
+    })
+
+    await worker.runOnce()
+
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+    expect(retries).toHaveLength(1)
+    expect(retries[0]).toMatchObject({
+      id: currentClaim.id,
+      retryAt,
+      errorSafe: 'Webhook delivery capacity is temporarily exhausted',
+      maxAttempts: 3,
+    })
+  })
+
   it('does not overlap concurrent runs for one worker owner', async () => {
     let release!: () => void
     const blocked = new Promise<void>((resolve) => {

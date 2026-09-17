@@ -1,6 +1,8 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { computeRetryAt } from '@agent-payment/core'
 import type { V2OperationsRepository, V2WebhookDeliveryClaim } from '@agent-payment/db'
+import type { CapacityResult } from './capacity.js'
+import { retryAtAfter } from './capacity.js'
 
 const DEFAULT_BATCH_SIZE = 50
 const DEFAULT_LEASE_SECONDS = 30
@@ -72,6 +74,9 @@ export interface WebhookDeliveryWorkerOptions {
   readonly leaseSeconds?: number
   readonly maxAttempts?: number
   readonly timeoutMs?: number
+  readonly capacity?: {
+    acquire(dependency: 'webhook', now?: Date): Promise<CapacityResult>
+  }
   readonly now?: () => Date
   readonly logger?: {
     info(data: Readonly<Record<string, unknown>>, message: string): void
@@ -119,6 +124,15 @@ export class WebhookDeliveryWorker {
   }
 
   private async deliver(claim: V2WebhookDeliveryClaim): Promise<void> {
+    const heartbeat = this.startLeaseHeartbeat(claim)
+    try {
+      await this.deliverWithLease(claim)
+    } finally {
+      heartbeat.stop()
+    }
+  }
+
+  private async deliverWithLease(claim: V2WebhookDeliveryClaim): Promise<void> {
     try {
       const key = await this.options.signingKeys.getKey(
         claim.signingKeyRef,
@@ -127,6 +141,7 @@ export class WebhookDeliveryWorker {
       if (key.byteLength === 0) throw new Error('Webhook signing key is empty')
       const timestampSeconds = Math.floor(this.now().getTime() / 1_000)
       const signature = createWebhookSignature(claim.rawBody, timestampSeconds, key)
+      if (!(await this.acquireCapacity(claim))) return
       const controller = new AbortController()
       const timeout = setTimeout(
         () => controller.abort(),
@@ -182,6 +197,55 @@ export class WebhookDeliveryWorker {
       errorSafe,
       maxAttempts: this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
     })
+  }
+
+  private async acquireCapacity(claim: V2WebhookDeliveryClaim): Promise<boolean> {
+    if (this.options.capacity === undefined) return true
+    const result = await this.options.capacity.acquire('webhook', this.now())
+    if (result.allowed) return true
+    await this.options.repository.retryWebhookDelivery({
+      id: claim.id,
+      owner: this.options.owner,
+      retryAt: retryAtAfter(
+        result.retryAt,
+        computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
+      ),
+      errorSafe: 'Webhook delivery capacity is temporarily exhausted',
+      maxAttempts: this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+    })
+    return false
+  }
+
+  private startLeaseHeartbeat(claim: V2WebhookDeliveryClaim): { stop(): void } {
+    const repository = this.options.repository as V2OperationsRepository & {
+      readonly renewWebhookDeliveryLease?: V2OperationsRepository['renewWebhookDeliveryLease']
+    }
+    if (typeof repository.renewWebhookDeliveryLease !== 'function') {
+      return { stop: () => undefined }
+    }
+    const intervalMs = Math.max(
+      1_000,
+      Math.floor(((this.options.leaseSeconds ?? DEFAULT_LEASE_SECONDS) * 1_000) / 3),
+    )
+    const timer = setInterval(() => {
+      void repository
+        .renewWebhookDeliveryLease({
+          id: claim.id,
+          owner: this.options.owner,
+          leaseSeconds: this.options.leaseSeconds ?? DEFAULT_LEASE_SECONDS,
+          now: this.now(),
+        })
+        .catch((error: unknown) => {
+          this.options.logger?.error(
+            {
+              deliveryId: claim.id,
+              errorCode: error instanceof Error ? error.name : 'UNKNOWN',
+            },
+            'Webhook delivery lease renewal failed',
+          )
+        })
+    }, intervalMs)
+    return { stop: () => clearInterval(timer) }
   }
 }
 

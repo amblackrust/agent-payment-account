@@ -1,8 +1,10 @@
 import { createHash, randomBytes } from 'node:crypto'
 import {
   createDenomination,
+  createEconomicMapping,
   createPaymentId,
   createPaymentAttemptId,
+  createSettlementAsset,
   AuthorizationError,
   DependencyUnavailableError,
   evaluateSpendPolicy,
@@ -16,7 +18,9 @@ import {
   ValidationError,
   type AgentCredentialScope,
   type Denomination,
+  type EconomicMapping,
   type ExactMoney,
+  type SettlementAsset,
   type SpendPolicy,
 } from '@agent-payment/core'
 import type {
@@ -35,6 +39,8 @@ export interface V2SettledBalanceProvider {
   getSettledAtomic(input: {
     readonly account: AuthenticatedAccount
     readonly denomination: Denomination
+    readonly economicMapping: EconomicMapping
+    readonly settlementAsset: SettlementAsset
   }): Promise<bigint>
 }
 
@@ -44,6 +50,7 @@ export interface V2PaymentServiceOptions {
   readonly settledBalanceProvider: V2SettledBalanceProvider
   readonly configuredDefaultRouteId?: string
   readonly approvalTtlSeconds?: number
+  readonly maxPageSize?: number
   readonly now?: () => Date
 }
 
@@ -79,12 +86,17 @@ export interface V2PaymentPage {
 export class V2PaymentService {
   private readonly now: () => Date
   private readonly approvalTtlSeconds: number
+  private readonly maxPageSize: number
 
   public constructor(private readonly options: V2PaymentServiceOptions) {
     this.now = options.now ?? (() => new Date())
     this.approvalTtlSeconds = options.approvalTtlSeconds ?? DEFAULT_APPROVAL_TTL_SECONDS
+    this.maxPageSize = options.maxPageSize ?? MAX_PAGE_SIZE
     if (!Number.isInteger(this.approvalTtlSeconds) || this.approvalTtlSeconds <= 0) {
       throw new InvalidStateError('Approval TTL must be a positive integer')
+    }
+    if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
+      throw new InvalidStateError('Maximum page size must be a positive integer')
     }
   }
 
@@ -127,6 +139,40 @@ export class V2PaymentService {
     if (settlementAsset === null) {
       throw new DependencyUnavailableError(
         'Settlement asset configuration is unavailable',
+      )
+    }
+    const mappingRecord = await this.options.repository.findEconomicMapping(
+      route.economicMappingId,
+    )
+    if (mappingRecord === null) {
+      throw new DependencyUnavailableError(
+        'Economic mapping configuration is unavailable',
+      )
+    }
+    const settlementAssetModel = createSettlementAsset({
+      id: settlementAsset.id,
+      rail: settlementAsset.rail,
+      network: settlementAsset.network,
+      assetReference: settlementAsset.assetReference,
+      decimals: settlementAsset.decimals,
+      status: asLifecycleStatus(settlementAsset.status),
+      version: settlementAsset.version,
+    })
+    const economicMapping = createEconomicMapping({
+      id: mappingRecord.id,
+      denominationId: mappingRecord.denominationId,
+      settlementAssetId: mappingRecord.settlementAssetId,
+      numerator: mappingRecord.numerator,
+      denominator: mappingRecord.denominator,
+      status: asLifecycleStatus(mappingRecord.status),
+      version: mappingRecord.version,
+    })
+    if (
+      economicMapping.denominationId !== denomination.id ||
+      economicMapping.settlementAssetId !== settlementAssetModel.id
+    ) {
+      throw new InvalidStateError(
+        'Settlement route mapping does not match the selected denomination and asset',
       )
     }
     const destinationFingerprint = fingerprintDestination({
@@ -176,6 +222,8 @@ export class V2PaymentService {
         ? await this.options.settledBalanceProvider.getSettledAtomic({
             account,
             denomination,
+            economicMapping,
+            settlementAsset: settlementAssetModel,
           })
         : 0n
     if (settledAtomic < 0n) {
@@ -307,9 +355,9 @@ export class V2PaymentService {
     } = {},
   ): Promise<V2PaymentPage> {
     const limit = input.limit ?? 50
-    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.maxPageSize) {
       throw new InvalidStateError(
-        `Payment limit must be an integer from 1 to ${MAX_PAGE_SIZE}`,
+        `Payment limit must be an integer from 1 to ${this.maxPageSize}`,
       )
     }
     const cursor = decodeCursor(input.cursor)
@@ -484,6 +532,11 @@ function hashJson(value: unknown): string {
 
 function createId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString('hex')}`
+}
+
+function asLifecycleStatus(status: string): 'ACTIVE' | 'RETIRED' {
+  if (status === 'ACTIVE' || status === 'RETIRED') return status
+  throw new InvalidStateError('Financial configuration has an invalid lifecycle status')
 }
 
 function encodeCursor(createdAt: Date, id: string): string {

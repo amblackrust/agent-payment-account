@@ -23,6 +23,33 @@ describe('configuration', () => {
     expect(config.runtimeRole).toBe('all')
     expect(config.restoreGateRequired).toBe(false)
     expect(config.allowMainnet).toBe(false)
+    expect(config.limits?.workerBatchSize).toBe(10)
+    expect(config.limits?.receiveRateLimitPerWindow).toBe(120)
+  })
+
+  it('loads bounded worker, capacity, and pagination limits', () => {
+    const config = loadConfig({
+      ...validEnvironment,
+      RUNTIME_ROLE: 'reconcile',
+      SOLANA_FEE_PAYER_SECRET: undefined,
+      PAYMENT_RATE_LIMIT_PER_WINDOW: '7',
+      RECEIVE_RATE_LIMIT_PER_WINDOW: '9',
+      CAPACITY_WINDOW_SECONDS: '2',
+      RPC_CAPACITY_PER_WINDOW: '11',
+      MAX_PAGE_SIZE: '25',
+      CUSTODY_BACKEND_IDENTITY: 'local-test-custody',
+      CUSTODY_BACKEND_MODE: 'LOCAL_TEST',
+    })
+
+    expect(config.runtimeRole).toBe('reconcile')
+    expect(config.solanaFeePayerSecret).toBeUndefined()
+    expect(config.limits).toMatchObject({
+      paymentRateLimitPerWindow: 7,
+      receiveRateLimitPerWindow: 9,
+      capacityWindowSeconds: 2,
+      rpcCapacityPerWindow: 11,
+      maxPageSize: 25,
+    })
   })
 
   it('fails with a clear configuration error when a required value is missing', () => {

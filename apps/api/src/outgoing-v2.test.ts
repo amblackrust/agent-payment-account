@@ -234,4 +234,52 @@ describe('V2 outgoing worker', () => {
     expect(finalizedInput?.metadataJson).toContain('prepared_payload_hash')
     expect(completed).toBe(true)
   })
+
+  it('keeps reconciliation work on the dedicated reconciliation role', async () => {
+    const claimedKinds: string[] = []
+    let retryInput: { nextKind?: string } | undefined
+    let claimCount = 0
+    const repository = {
+      claimWorkItem: async ({ kind }: { kind: string }) => {
+        claimedKinds.push(kind)
+        if (claimCount++ > 0) return null
+        return {
+          id: 'reconcile_work_1',
+          kind,
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: 'attempt_1',
+          attemptCount: 1,
+          payloadJson: JSON.stringify({ payment_id: 'pay_1', attempt_id: 'attempt_1' }),
+          accountId: 'acct_1',
+        }
+      },
+      findPaymentView: async () => view(),
+      retryWorkItem: async (input: { nextKind?: string }) => {
+        retryInput = input
+      },
+    }
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'ACTIVE' },
+      executor: {
+        prepare: async () => {
+          throw new Error('reconcile role must not prepare')
+        },
+        sign: async () => {
+          throw new Error('reconcile role must not sign')
+        },
+        submit: async () => ({ status: 'UNKNOWN' as const }),
+      },
+      mode: 'reconcile',
+      owner: 'reconcile-1',
+    })
+
+    await worker.runOnce()
+
+    expect(claimedKinds).toEqual([
+      'RECONCILE_PAYMENT_ATTEMPT',
+      'RECONCILE_PAYMENT_ATTEMPT',
+    ])
+    expect(retryInput?.nextKind).toBe('OUTGOING_PAYMENT_ATTEMPT')
+  })
 })

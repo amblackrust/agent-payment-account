@@ -10,7 +10,17 @@ import type {
 const MAX_PAGE_SIZE = 100
 
 export class V2OperationsService {
-  public constructor(private readonly repository: V2OperationsRepository) {}
+  private readonly maxPageSize: number
+
+  public constructor(
+    private readonly repository: V2OperationsRepository,
+    options: { readonly maxPageSize?: number } = {},
+  ) {
+    this.maxPageSize = options.maxPageSize ?? MAX_PAGE_SIZE
+    if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
+      throw new InvalidStateError('Maximum page size must be a positive integer')
+    }
+  }
 
   public async listTimeline(
     accountId: string,
@@ -21,7 +31,7 @@ export class V2OperationsService {
       readonly resourceId?: string
     } = {},
   ) {
-    const limit = validateLimit(input.limit)
+    const limit = this.validateLimit(input.limit)
     const cursor = decodeCursor(input.cursor)
     const records = await this.repository.listTimeline({
       accountId,
@@ -51,7 +61,7 @@ export class V2OperationsService {
       await this.repository.listExceptions({
         ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
         ...(input.status === undefined ? {} : { status: input.status }),
-        limit: validateLimit(input.limit),
+        limit: this.validateLimit(input.limit),
       })
     ).map(serializeException)
   }
@@ -123,14 +133,16 @@ export class V2OperationsService {
   public async archiveWebhook(accountId: string, id: string): Promise<void> {
     await this.repository.archiveWebhookSubscription(accountId, id)
   }
-}
 
-function validateLimit(limit: number | undefined): number {
-  const value = limit ?? 50
-  if (!Number.isInteger(value) || value < 1 || value > MAX_PAGE_SIZE) {
-    throw new ValidationError(`Limit must be an integer from 1 to ${MAX_PAGE_SIZE}`)
+  private validateLimit(limit: number | undefined): number {
+    const value = limit ?? 50
+    if (!Number.isInteger(value) || value < 1 || value > this.maxPageSize) {
+      throw new ValidationError(
+        `Limit must be an integer from 1 to ${this.maxPageSize}`,
+      )
+    }
+    return value
   }
-  return value
 }
 
 function serializeTimeline(event: V2TimelineRecord) {

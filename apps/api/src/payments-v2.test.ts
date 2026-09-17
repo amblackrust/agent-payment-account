@@ -61,6 +61,15 @@ function createHarness(destinationApproved: boolean) {
       status: 'ACTIVE',
       version: 1,
     }),
+    findEconomicMapping: async () => ({
+      id: 'mapping_usd_usdc',
+      denominationId: 'denom_usd',
+      settlementAssetId: 'asset_usdc',
+      numerator: 1n,
+      denominator: 1n,
+      status: 'ACTIVE',
+      version: 1,
+    }),
     findApprovedDestination: async () =>
       destinationApproved
         ? {

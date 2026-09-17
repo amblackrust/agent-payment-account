@@ -2,15 +2,20 @@ import { randomBytes } from 'node:crypto'
 import {
   createDenomination,
   createCredentialId,
+  createEconomicMapping,
+  createSettlementAsset,
   DependencyUnavailableError,
   exactMoneyFromAtomicUnits,
   formatExactMoney,
   InvalidStateError,
   NotFoundError,
   parseExactMoney,
+  selectSettlementRoute,
   ValidationError,
   type AgentCredentialScope,
   type AgentAccountLifecycleStatus,
+  type EconomicMapping,
+  type SettlementAsset,
 } from '@agent-payment/core'
 import type {
   AuthenticatedAccount,
@@ -221,9 +226,14 @@ export class V2ManagementService {
       }
       const denomination = await this.loadDenomination(view.payment.denominationId)
       const account = await this.requireAccount(input.accountId)
+      const settlementContext = await this.loadSettlementContext(
+        denomination,
+        view.payment.routeId,
+      )
       settledAtomic = await this.options.settledBalanceProvider.getSettledAtomic({
         account: toAuthenticatedAccount(account),
         denomination,
+        ...settlementContext,
       })
     }
     return serializeApproval(
@@ -306,6 +316,7 @@ export class V2ManagementService {
       throw new InvalidStateError('Account is not active')
     }
     const denomination = await this.loadDenomination(denominationId)
+    const settlementContext = await this.loadSettlementContext(denomination)
     const context = await this.options.financialRepository.getSpendContext(
       accountId,
       denominationId,
@@ -314,6 +325,7 @@ export class V2ManagementService {
     const settledAtomic = await this.options.settledBalanceProvider.getSettledAtomic({
       account: toAuthenticatedAccount(account),
       denomination,
+      ...settlementContext,
     })
     if (settledAtomic < 0n)
       throw new InvalidStateError('Settlement balance cannot be negative')
@@ -436,6 +448,68 @@ export class V2ManagementService {
     if (approval === undefined) throw new NotFoundError('Approval was not found')
     return approval
   }
+
+  private async loadSettlementContext(
+    denomination: ReturnType<typeof createDenomination>,
+    routeId?: string | null,
+  ): Promise<{
+    readonly economicMapping: EconomicMapping
+    readonly settlementAsset: SettlementAsset
+  }> {
+    const route =
+      routeId === undefined || routeId === null
+        ? selectSettlementRoute(
+            {},
+            await this.options.financialRepository.listActiveSettlementRoutes(),
+          ).route
+        : await this.options.financialRepository.findSettlementRoute(routeId)
+    if (route === null || route === undefined) {
+      throw new DependencyUnavailableError(
+        'Settlement route configuration is unavailable',
+      )
+    }
+    const [assetRecord, mappingRecord] = await Promise.all([
+      this.options.financialRepository.findSettlementAsset(route.settlementAssetId),
+      this.options.financialRepository.findEconomicMapping(route.economicMappingId),
+    ])
+    if (assetRecord === null || mappingRecord === null) {
+      throw new DependencyUnavailableError(
+        'Settlement route financial configuration is unavailable',
+      )
+    }
+    const settlementAsset = createSettlementAsset({
+      id: assetRecord.id,
+      rail: assetRecord.rail,
+      network: assetRecord.network,
+      assetReference: assetRecord.assetReference,
+      decimals: assetRecord.decimals,
+      status: asLifecycleStatus(assetRecord.status),
+      version: assetRecord.version,
+    })
+    const economicMapping = createEconomicMapping({
+      id: mappingRecord.id,
+      denominationId: mappingRecord.denominationId,
+      settlementAssetId: mappingRecord.settlementAssetId,
+      numerator: mappingRecord.numerator,
+      denominator: mappingRecord.denominator,
+      status: asLifecycleStatus(mappingRecord.status),
+      version: mappingRecord.version,
+    })
+    if (
+      economicMapping.denominationId !== denomination.id ||
+      economicMapping.settlementAssetId !== settlementAsset.id
+    ) {
+      throw new InvalidStateError(
+        'Settlement route mapping does not match the requested denomination',
+      )
+    }
+    return { economicMapping, settlementAsset }
+  }
+}
+
+function asLifecycleStatus(status: string): 'ACTIVE' | 'RETIRED' {
+  if (status === 'ACTIVE' || status === 'RETIRED') return status
+  throw new InvalidStateError('Financial configuration has an invalid lifecycle status')
 }
 
 function serializeApproval(approval: V2ApprovalAdminRecord) {

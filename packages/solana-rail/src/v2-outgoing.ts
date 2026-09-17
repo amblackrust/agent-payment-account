@@ -99,7 +99,7 @@ export interface SolanaV2SignedEffect {
 export interface SolanaV2OutgoingExecutorOptions {
   readonly rpc: SolanaRpc
   readonly settlementMint: string
-  readonly feePayerSecret: string | Uint8Array
+  readonly feePayerSecret?: string | Uint8Array
   readonly rpcTimeoutMs?: number
   readonly minimumFeePayerBalanceLamports?: bigint
   getPayerPublicKey(accountId: string): Promise<string | null>
@@ -215,6 +215,11 @@ export function createSolanaV2OutgoingExecutor(
   let feePayerSignerPromise: Promise<KeyPairSigner> | undefined
 
   async function getFeePayerSigner(): Promise<KeyPairSigner> {
+    if (options.feePayerSecret === undefined) {
+      throw new SolanaRailConfigurationError(
+        'A fee-payer secret is required for outgoing execution',
+      )
+    }
     feePayerSignerPromise ??= createSigner(options.feePayerSecret, 'fee payer secret')
     return feePayerSignerPromise
   }
@@ -718,6 +723,7 @@ export function createSolanaV2OutgoingExecutor(
 
   async function checkReadiness(): Promise<void> {
     await getTokenDecimals()
+    if (options.feePayerSecret === undefined) return
     const feePayerSigner = await getFeePayerSigner()
     const balance = await withRpcTimeout((abortSignal) =>
       options.rpc

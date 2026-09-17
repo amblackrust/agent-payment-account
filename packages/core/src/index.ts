@@ -47,6 +47,7 @@ export {
   addExactMoney,
   assertSameSettlementAsset,
   compareExactMoney,
+  convertFromSettlementAtomicUnits,
   convertToSettlementAtomicUnits,
   createDenomination,
   createEconomicMapping,
@@ -185,9 +186,5 @@ export type {
   RailStatusResult,
 } from './rail.js'
 
-export {
-  classifyRailFailure,
-  classifyWorkFailure,
-  computeRetryAt,
-} from './retry.js'
+export { classifyRailFailure, classifyWorkFailure, computeRetryAt } from './retry.js'
 export type { RetryDecision, WorkRetryClass } from './retry.js'

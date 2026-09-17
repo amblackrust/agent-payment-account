@@ -5,12 +5,10 @@ import {
   signSolanaV2PreparedEffect,
 } from '@agent-payment/solana-rail'
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
-import { ConfigurationError, type AppConfig } from './config.js'
+import { ConfigurationError, getRuntimeLimits, type AppConfig } from './config.js'
+import { DurableCapacityController } from './capacity.js'
 import { ConstrainedCustodyBoundary } from './custody.js'
-import type {
-  ConstrainedCustodyBackend,
-  WalletSecretCipher,
-} from './custody.js'
+import type { ConstrainedCustodyBackend, WalletSecretCipher } from './custody.js'
 import { V2OutgoingWorker } from './outgoing-v2.js'
 
 const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
@@ -25,47 +23,61 @@ export function createV2OutgoingWorker(input: {
   readonly checkReadiness: () => Promise<void>
 } {
   const feePayerSecret = input.config.solanaFeePayerSecret
-  if (feePayerSecret === undefined) {
+  const reconcileOnly = input.config.runtimeRole === 'reconcile'
+  if (feePayerSecret === undefined && !reconcileOnly) {
     throw new ConfigurationError(
       'SOLANA_FEE_PAYER_SECRET is required for the V2 outgoing worker',
     )
   }
   const custodyMode = input.config.custodyBackendMode ?? 'LOCAL_TEST'
-  if (custodyMode !== 'LOCAL_TEST') {
+  if (custodyMode !== 'LOCAL_TEST' && !reconcileOnly) {
     throw new DependencyUnavailableError(
       'The selected external custody backend has no provider adapter configured for Solana V2',
     )
   }
-  const custodyIdentity = input.config.custodyBackendIdentity ?? 'local-test-custody'
-  const backend: ConstrainedCustodyBackend = {
-    identity: custodyIdentity,
-    mode: custodyMode,
-    signPaymentEffect: async (request) => {
-      const custody = await input.database.findAccountCustody(request.accountId)
-      if (custody === null) {
-        throw new DependencyUnavailableError('Payer account custody is unavailable')
-      }
-      const payerSecret = input.walletCipher.decrypt({
-        ciphertext: custody.encryptedSolanaSecret,
-        nonce: custody.encryptionNonce,
-        authTag: custody.encryptionAuthTag,
-      })
-      try {
-        return await signSolanaV2PreparedEffect({
-          request,
-          payerSecret,
-          feePayerSecret,
-        })
-      } finally {
-        payerSecret.fill(0)
-      }
-    },
-  }
-  const custodyBoundary = new ConstrainedCustodyBoundary(backend, input.config.nodeEnv)
+  const custodyIdentity =
+    input.config.custodyBackendIdentity ??
+    (reconcileOnly ? 'reconcile-read-only' : 'local-test-custody')
+  const custodyBoundary = reconcileOnly
+    ? undefined
+    : new ConstrainedCustodyBoundary(
+        {
+          identity: custodyIdentity,
+          mode: custodyMode,
+          signPaymentEffect: async (request) => {
+            const custody = await input.database.findAccountCustody(request.accountId)
+            if (custody === null) {
+              throw new DependencyUnavailableError(
+                'Payer account custody is unavailable',
+              )
+            }
+            const payerSecret = input.walletCipher.decrypt({
+              ciphertext: custody.encryptedSolanaSecret,
+              nonce: custody.encryptionNonce,
+              authTag: custody.encryptionAuthTag,
+            })
+            try {
+              if (feePayerSecret === undefined) {
+                throw new DependencyUnavailableError(
+                  'Fee-payer custody is unavailable for outgoing execution',
+                )
+              }
+              return await signSolanaV2PreparedEffect({
+                request,
+                payerSecret,
+                feePayerSecret,
+              })
+            } finally {
+              payerSecret.fill(0)
+            }
+          },
+        } satisfies ConstrainedCustodyBackend,
+        input.config.nodeEnv,
+      )
   const executor = createSolanaV2OutgoingExecutor({
     rpc: createSolanaRpc(input.config.solanaRpcUrl as ClusterUrl),
     settlementMint: input.config.solanaSettlementMint,
-    feePayerSecret,
+    ...(feePayerSecret === undefined ? {} : { feePayerSecret }),
     getPayerPublicKey: (accountId) => input.database.findAccountPublicKey(accountId),
     getDenomination: (denominationId) =>
       input.database.v2.findDenomination(denominationId),
@@ -81,15 +93,28 @@ export function createV2OutgoingWorker(input: {
         maxLamportsPerDay: SPONSORSHIP_MAX_LAMPORTS_PER_DAY,
         maxTransactionsPerHour: SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR,
       }),
-    signPaymentEffect: (request) => custodyBoundary.signPaymentEffect(request),
+    signPaymentEffect: async (request) => {
+      if (custodyBoundary === undefined) {
+        throw new DependencyUnavailableError(
+          'Reconciliation runtime cannot sign payment effects',
+        )
+      }
+      return custodyBoundary.signPaymentEffect(request)
+    },
   })
   const findAccountSummary = input.database.findAccountSummary
+  const limits = getRuntimeLimits(input.config)
+  const capacity = new DurableCapacityController(input.database.v2Admin, limits)
   const worker = new V2OutgoingWorker({
     repository: input.database.v2,
     custody: input.database.v2Admin,
     signedPayloadCipher: input.walletCipher,
     executor,
     serviceIdentity: custodyIdentity,
+    capacity,
+    mode: input.config.runtimeRole === 'reconcile' ? 'reconcile' : 'outgoing',
+    batchSize: limits.workerBatchSize,
+    leaseSeconds: limits.workerLeaseSeconds,
     owner: `outgoing-v2-${process.pid}`,
     accountStatusProvider: {
       getStatus: async (accountId) => {
@@ -110,7 +135,8 @@ export function createV2OutgoingWorker(input: {
     await executor.checkReadiness()
     if (!input.config.restoreGateRequired) return
     const environment = input.config.restoreGateEnvironment
-    const verification = await input.database.v2Operations.findLatestBackupVerification()
+    const verification =
+      await input.database.v2Operations.findLatestBackupVerification()
     const gateStatus = await input.database.getRuntimeMetadata('money_worker_gate')
     if (
       environment === undefined ||
@@ -122,7 +148,7 @@ export function createV2OutgoingWorker(input: {
       gateStatus !== 'RESTORE_VERIFIED'
     ) {
       throw new DependencyUnavailableError(
-        'Outgoing workers are blocked until an isolated restore is verified for this runtime authority',
+        'Outgoing workers are blocked until restore verification and external reconciliation are complete',
       )
     }
   }

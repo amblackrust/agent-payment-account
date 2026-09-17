@@ -5,3 +5,7 @@ node_modules
 **/generated
 pnpm-lock.yaml
 project-context.md
+.serena
+test-ledger
+MUX_V2_Implementation_Task_Plan.md
+MUX_V2_Implementation_Task_Plan.md:Zone.Identifier

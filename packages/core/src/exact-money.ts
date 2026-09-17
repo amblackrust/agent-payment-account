@@ -253,6 +253,37 @@ export function convertToSettlementAtomicUnits(
   return atomicUnits
 }
 
+/**
+ * Converts a settlement balance back into logical denomination units. The
+ * divisibility check prevents a balance from being overstated by truncation.
+ */
+export function convertFromSettlementAtomicUnits(
+  settlementAtomicUnits: bigint,
+  mapping: EconomicMapping,
+  denomination: Denomination,
+  asset: SettlementAsset,
+): ExactMoney {
+  assertActive(mapping.status, 'Economic mapping')
+  assertActive(asset.status, 'Settlement asset')
+  assertActive(denomination.status, 'Denomination')
+  if (settlementAtomicUnits < 0n) {
+    throw new ValidationError('Settlement atomic units cannot be negative')
+  }
+  if (denomination.id !== mapping.denominationId) {
+    throw new ValidationError('Economic mapping does not match the denomination')
+  }
+  if (asset.id !== mapping.settlementAssetId) {
+    throw new ValidationError('Economic mapping does not match the settlement asset')
+  }
+  const numerator = settlementAtomicUnits * mapping.denominator
+  if (numerator % mapping.numerator !== 0n) {
+    throw new ValidationError(
+      'Settlement balance cannot be represented exactly in the denomination',
+    )
+  }
+  return exactMoneyFromAtomicUnits(numerator / mapping.numerator, denomination)
+}
+
 export function assertSameSettlementAsset(
   left: SettlementAsset,
   right: SettlementAsset,

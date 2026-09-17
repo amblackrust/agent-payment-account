@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import type { IncomingPaymentRepository, ReceiveRepository } from '@agent-payment/db'
 import type { IncomingTransfer, SolanaIncomingReader } from '@agent-payment/solana-rail'
+import type { CapacityResult } from './capacity.js'
 
 interface IndexedAccount {
   readonly accountId: string
@@ -11,6 +12,13 @@ type IncomingStore = IncomingPaymentRepository & ReceiveRepository
 const ISSUE_RETRY_BATCH_SIZE = 50
 const MAX_ISSUE_RETRIES = 8
 
+export interface IncomingReconciliationOptions {
+  readonly accountConcurrency?: number
+  readonly capacity?: {
+    acquire(dependency: 'rpc', now?: Date): Promise<CapacityResult>
+  }
+}
+
 export class IncomingReconciliationService {
   private stopped = false
   private currentRun: Promise<void> | undefined
@@ -19,6 +27,7 @@ export class IncomingReconciliationService {
     private readonly repository: IncomingStore,
     private readonly reader: SolanaIncomingReader,
     private readonly logger: { error(data: object, message: string): void },
+    private readonly options: IncomingReconciliationOptions = {},
   ) {}
 
   public runOnce(): Promise<void> {
@@ -44,9 +53,29 @@ export class IncomingReconciliationService {
   private async reconcileAllAccounts(): Promise<void> {
     const accounts: readonly IndexedAccount[] =
       await this.repository.listActiveAccountSettlements()
-    await Promise.all(accounts.map((account) => this.reconcileAccount(account)))
+    await this.reconcileAccountsWithConcurrency(accounts)
     await this.reconcilePendingIssues()
     await this.repository.reconcileUnmatchedManagedIncoming?.(ISSUE_RETRY_BATCH_SIZE)
+  }
+
+  private async reconcileAccountsWithConcurrency(
+    accounts: readonly IndexedAccount[],
+  ): Promise<void> {
+    const requestedConcurrency = this.options.accountConcurrency ?? accounts.length
+    const concurrency = Math.max(
+      1,
+      Math.min(requestedConcurrency, Math.max(accounts.length, 1)),
+    )
+    let nextIndex = 0
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (nextIndex < accounts.length) {
+          const account = accounts[nextIndex]
+          nextIndex += 1
+          if (account !== undefined) await this.reconcileAccount(account)
+        }
+      }),
+    )
   }
 
   private async reconcileAccount(account: IndexedAccount): Promise<void> {
@@ -56,6 +85,7 @@ export class IncomingReconciliationService {
       account.solanaPublicKey,
     )
     try {
+      if (!(await this.hasRpcCapacity(account.accountId))) return
       const scan =
         this.reader.scanWithCursor === undefined
           ? {
@@ -103,6 +133,17 @@ export class IncomingReconciliationService {
     }
   }
 
+  private async hasRpcCapacity(accountId: string): Promise<boolean> {
+    if (this.options.capacity === undefined) return true
+    const result = await this.options.capacity.acquire('rpc', new Date())
+    if (result.allowed) return true
+    this.logger.error(
+      { accountId, errorCode: 'CAPACITY_BACKPRESSURE' },
+      'Incoming RPC capacity is temporarily exhausted',
+    )
+    return false
+  }
+
   private async reconcilePendingIssues(): Promise<void> {
     const claimIssues = this.repository.claimIncomingReconciliationIssues
     const resolveIssue = this.repository.resolveIncomingReconciliationIssue
@@ -126,6 +167,7 @@ export class IncomingReconciliationService {
           )
           continue
         }
+        if (!(await this.hasRpcCapacity(issue.accountId))) continue
         const inspection = await inspectSignature(
           issue.accountPublicKey,
           issue.signature,

@@ -382,6 +382,7 @@ export interface V2DatabaseRepository {
     readonly retryAt: Date
     readonly errorCode: string
     readonly errorSafe: string
+    readonly nextKind?: string
   }): Promise<void>
   failWorkItem(input: {
     readonly id: string
@@ -1531,6 +1532,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             availableAt: input.retryAt,
             lastErrorCode: input.errorCode,
             lastErrorSafe: input.errorSafe,
+            ...(input.nextKind === undefined ? {} : { kind: input.nextKind }),
             leaseOwner: null,
             leaseExpiresAt: null,
           },
@@ -1696,8 +1698,18 @@ async function loadPaymentView(
       orderBy: { attemptNumber: 'asc' },
     }),
   ])
-  if (policyDecision === null || policyDecision.accountId !== accountId) {
-    throw new InvalidStateError('Payment is missing its durable policy decision')
+  if (policyDecision === null) {
+    return {
+      payment: toV2PaymentSnapshot(payment),
+      policyDecision: legacyPolicyDecision(payment.status),
+      reasonCodes: [],
+      approvalState: projectApprovalState(approval),
+      reservationStatus: projectReservationStatus(reservation),
+      attempts: attempts.map(toV2AttemptSnapshot),
+    }
+  }
+  if (policyDecision.accountId !== accountId) {
+    throw new InvalidStateError('Payment policy decision belongs to another account')
   }
   const decision = parsePolicyDecision(policyDecision.decision)
   const approvalState = projectApprovalState(approval)
@@ -1741,6 +1753,12 @@ function parsePolicyDecision(value: string): PaymentPolicyDecision {
     return value
   }
   throw new InvalidStateError('Payment has an unknown policy decision')
+}
+
+function legacyPolicyDecision(status: string): PaymentPolicyDecision {
+  if (status === 'REJECTED_BY_POLICY') return 'DENY'
+  if (status === 'AWAITING_APPROVAL') return 'REQUIRE_APPROVAL'
+  return 'ALLOW'
 }
 
 function projectApprovalState(

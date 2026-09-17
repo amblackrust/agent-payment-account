@@ -14,7 +14,14 @@ import {
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
 
 import { buildApp } from './app.js'
-import { ConfigurationError, loadConfig, redactConfig } from './config.js'
+import {
+  ConfigurationError,
+  getRuntimeLimits,
+  loadConfig,
+  redactConfig,
+  type RuntimeLimits,
+} from './config.js'
+import { DurableCapacityController } from './capacity.js'
 import { IncomingReconciliationService } from './incoming.js'
 import { WebhookDeliveryWorker, type WebhookSigningKeyProvider } from './webhooks.js'
 import {
@@ -168,6 +175,8 @@ async function startWorker(): Promise<void> {
   }
 
   const database = createDatabaseClient(config.databaseUrl)
+  const limits = getRuntimeLimits(config)
+  const capacity = new DurableCapacityController(database.v2Admin, limits)
   const rail = createSolanaRail({
     rpcUrl: config.solanaRpcUrl,
     expectedCluster: config.solanaCluster,
@@ -196,7 +205,7 @@ async function startWorker(): Promise<void> {
   }
 
   const v2OutgoingRuntime =
-    config.runtimeRole === 'outgoing'
+    config.runtimeRole === 'outgoing' || config.runtimeRole === 'reconcile'
       ? createV2OutgoingWorker({ config, database, walletCipher })
       : undefined
 
@@ -212,6 +221,25 @@ async function startWorker(): Promise<void> {
         })
       : undefined
 
+  let lastWorkerError: string | undefined
+  const app = buildApp({
+    config,
+    readinessDependency: {
+      checkReadiness: async () => {
+        await database.checkReadiness()
+        await rail.checkReadiness?.()
+        await v2OutgoingRuntime?.checkReadiness()
+      },
+    },
+    domainHealthDependency: {
+      checkDomainHealth: async () => ({
+        status: lastWorkerError === undefined ? 'ok' : 'degraded',
+        checks: {
+          worker: lastWorkerError === undefined ? 'ok' : 'degraded',
+        },
+      }),
+    },
+  })
   const worker: RuntimeWorker = createWorker({
     role: config.runtimeRole,
     database,
@@ -248,25 +276,11 @@ async function startWorker(): Promise<void> {
             : { custodyIdentity: config.custodyBackendIdentity }),
         }
       : {}),
-  })
-
-  let lastWorkerError: string | undefined
-  const app = buildApp({
-    config,
-    readinessDependency: {
-      checkReadiness: async () => {
-        await database.checkReadiness()
-        await rail.checkReadiness?.()
-        await v2OutgoingRuntime?.checkReadiness()
-      },
-    },
-    domainHealthDependency: {
-      checkDomainHealth: async () => ({
-        status: lastWorkerError === undefined ? 'ok' : 'degraded',
-        checks: {
-          worker: lastWorkerError === undefined ? 'ok' : 'degraded',
-        },
-      }),
+    limits,
+    capacity,
+    logger: {
+      info: (data, message) => app.log.info(data, message),
+      error: (data, message) => app.log.error(data, message),
     },
   })
   const runWorker = (): void => {
@@ -323,7 +337,7 @@ async function startWorker(): Promise<void> {
 }
 
 function createWorker(input: {
-  readonly role: 'outgoing' | 'incoming' | 'webhook' | 'maintenance'
+  readonly role: 'outgoing' | 'reconcile' | 'incoming' | 'webhook' | 'maintenance'
   readonly database: ReturnType<typeof createDatabaseClient>
   readonly incomingReader?: ReturnType<typeof createSolanaIncomingReader>
   readonly v2OutgoingWorker?: V2OutgoingWorker
@@ -334,16 +348,28 @@ function createWorker(input: {
   readonly backupVerifyDatabaseUrl?: string
   readonly runtimeAuthorityId?: string
   readonly custodyIdentity?: string
+  readonly limits: RuntimeLimits
+  readonly capacity: DurableCapacityController
+  readonly logger: {
+    info(data: Readonly<Record<string, unknown>>, message: string): void
+    error(data: Readonly<Record<string, unknown>>, message: string): void
+  }
 }): RuntimeWorker {
   if (input.role === 'incoming') {
     if (input.incomingReader === undefined) {
       throw new ConfigurationError('Incoming worker reader is unavailable')
     }
-    return new IncomingReconciliationService(input.database, input.incomingReader, {
-      error: () => undefined,
-    })
+    return new IncomingReconciliationService(
+      input.database,
+      input.incomingReader,
+      input.logger,
+      {
+        accountConcurrency: input.limits.incomingAccountConcurrency,
+        capacity: input.capacity,
+      },
+    )
   }
-  if (input.role === 'outgoing') {
+  if (input.role === 'outgoing' || input.role === 'reconcile') {
     if (input.v2OutgoingWorker === undefined) {
       throw new ConfigurationError('V2 outgoing worker is unavailable')
     }
@@ -357,7 +383,12 @@ function createWorker(input: {
       repository: input.database.v2Operations,
       signingKeys: input.webhookSigningKeys,
       owner: `webhook-${process.pid}`,
-      logger: { info: () => undefined, error: () => undefined },
+      batchSize: input.limits.webhookBatchSize,
+      leaseSeconds: input.limits.webhookLeaseSeconds,
+      maxAttempts: input.limits.webhookMaxAttempts,
+      timeoutMs: input.limits.webhookTimeoutMs,
+      capacity: input.capacity,
+      logger: input.logger,
     })
   }
   if (input.backupOutputDirectory === undefined) {

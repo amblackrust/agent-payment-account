@@ -13,14 +13,11 @@ import type {
 } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 
-import type { AppConfig } from './config.js'
+import { getRuntimeLimits, type AppConfig } from './config.js'
 import { serializeAccountCreation, serializeReceiveDestination } from './accounts.js'
 import type { AccountService } from './accounts.js'
-import {
-  assertAdminApiKey,
-  authenticateAgent,
-  authenticateAgentWithScope,
-} from './auth.js'
+import { assertAdminApiKey, authenticateAgentWithScope } from './auth.js'
+import type { authenticateAgent } from './auth.js'
 import { serializePayment } from './payments.js'
 import type { PaymentServiceLike } from './payments.js'
 import { serializeRecipient } from './recipients.js'
@@ -33,7 +30,9 @@ import type { V2ManagementService } from './v2-management.js'
 import { registerV2OperationsRoutes } from './v2-operations-routes.js'
 import type { V2OperationsService } from './v2-operations.js'
 import {
+  CORRELATION_ID_HEADER,
   MetricsRegistry,
+  normalizeCorrelationId,
   type DomainHealthDependency,
   type DomainHealthSnapshot,
 } from './observability.js'
@@ -147,6 +146,7 @@ function getErrorResponse(
 
 export function buildApp(options: BuildAppOptions): FastifyInstance {
   const metrics = options.metrics ?? new MetricsRegistry()
+  const runtimeLimits = getRuntimeLimits(options.config)
   const requestStartTimes = new WeakMap<FastifyRequest, number>()
   const app = Fastify({
     logger: {
@@ -164,6 +164,11 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
   app.addHook('onRequest', async (request) => {
     requestStartTimes.set(request, performance.now())
+    const correlationId = normalizeCorrelationId(
+      request.headers[CORRELATION_ID_HEADER],
+      request.id,
+    )
+    request.log = request.log.child({ correlationId })
   })
 
   app.addHook('onResponse', async (request, reply) => {
@@ -193,6 +198,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
   app.addHook('onSend', async (request, reply) => {
     reply.header('x-request-id', request.id)
+    reply.header(
+      CORRELATION_ID_HEADER,
+      normalizeCorrelationId(request.headers[CORRELATION_ID_HEADER], request.id),
+    )
   })
 
   app.get(
@@ -222,6 +231,19 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             properties: {
               status: { type: 'string', enum: ['ok', 'degraded'] },
               checks: { type: 'object', additionalProperties: { type: 'string' } },
+              alerts: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    name: { type: 'string' },
+                    severity: { type: 'string', enum: ['warning', 'critical'] },
+                    message: { type: 'string' },
+                  },
+                  required: ['name', 'severity', 'message'],
+                },
+              },
             },
             required: ['status', 'checks'],
           },
@@ -231,6 +253,19 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             properties: {
               status: { type: 'string', const: 'degraded' },
               checks: { type: 'object', additionalProperties: { type: 'string' } },
+              alerts: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    name: { type: 'string' },
+                    severity: { type: 'string', enum: ['warning', 'critical'] },
+                    message: { type: 'string' },
+                  },
+                  required: ['name', 'severity', 'message'],
+                },
+              },
             },
             required: ['status', 'checks'],
           },
@@ -402,7 +437,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
     app.get(
       '/v1/balance',
-      { preHandler: async (request) => authenticateAgent(request, accountRepository) },
+      {
+        preHandler: async (request) =>
+          authenticateAgentWithScope(request, accountRepository, 'balance:read'),
+      },
       async (request) => {
         const account = request.agentAccount
         if (account === null) {
@@ -441,7 +479,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     }>(
       '/v1/receives',
       {
-        preHandler: async (request) => authenticateAgent(request, accountRepository),
+        preHandler: async (request) =>
+          authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
         schema: {
           body: {
             type: 'object',
@@ -493,7 +532,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.get<{ Params: { receiveId: string } }>(
         '/v1/receives/:receiveId',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
           schema: {
             params: {
               type: 'object',
@@ -526,7 +566,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       }>(
         '/v1/recipients',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
           schema: {
             body: {
               type: 'object',
@@ -569,13 +610,19 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.get<{ Querystring: { limit?: number; cursor?: string } }>(
         '/v1/recipients',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
           schema: {
             querystring: {
               type: 'object',
               additionalProperties: false,
               properties: {
-                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                limit: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: runtimeLimits.maxPageSize,
+                  default: 50,
+                },
                 cursor: { type: 'string', minLength: 1 },
               },
             },
@@ -597,7 +644,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.get<{ Params: { recipientId: string } }>(
         '/v1/recipients/:recipientId',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
         },
         async (request) => {
           const account = requireAgentAccount(request)
@@ -621,7 +669,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       }>(
         '/v1/recipients/:recipientId',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
           schema: {
             params: {
               type: 'object',
@@ -708,7 +757,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.post<{ Body: PaymentBody }>(
         '/v1/pay',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:create'),
           schema: paymentSchema,
         },
         async (request, reply) => {
@@ -736,7 +786,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       }>(
         '/v1/refunds',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:create'),
           schema: {
             body: {
               type: 'object',
@@ -777,7 +828,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.post<{ Body: PaymentBody }>(
         '/v1/send',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:create'),
           schema: paymentSchema,
         },
         async (request, reply) => {
@@ -803,7 +855,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.get<{ Params: { paymentId: string } }>(
         '/v1/payments/:paymentId',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:read'),
         },
         async (request) => {
           const account = requireAgentAccount(request)
@@ -819,13 +872,19 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.get<{ Querystring: { limit?: number; cursor?: string } }>(
         '/v1/payments',
         {
-          preHandler: async (request) => authenticateAgent(request, accountRepository),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'payments:read'),
           schema: {
             querystring: {
               type: 'object',
               additionalProperties: false,
               properties: {
-                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                limit: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: runtimeLimits.maxPageSize,
+                  default: 50,
+                },
                 cursor: { type: 'string', minLength: 1 },
               },
             },
@@ -849,13 +908,18 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           '/v1/transactions',
           {
             preHandler: async (request) =>
-              authenticateAgent(request, accountRepository),
+              authenticateAgentWithScope(request, accountRepository, 'history:read'),
             schema: {
               querystring: {
                 type: 'object',
                 additionalProperties: false,
                 properties: {
-                  limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                  limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: runtimeLimits.maxPageSize,
+                    default: 50,
+                  },
                   cursor: { type: 'string', minLength: 1 },
                 },
               },
@@ -871,7 +935,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           '/v1/transactions/:transactionId',
           {
             preHandler: async (request) =>
-              authenticateAgent(request, accountRepository),
+              authenticateAgentWithScope(request, accountRepository, 'history:read'),
           },
           async (request) =>
             options.transactionService!.getTransaction(
@@ -931,7 +995,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               options.v2AdminRepository,
               request,
               'payment:create',
-              60,
+              runtimeLimits.paymentRateLimitPerWindow,
+              runtimeLimits.requestRateLimitWindowSeconds,
             )
           },
           schema: v2PaymentSchema,
@@ -1018,7 +1083,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               type: 'object',
               additionalProperties: false,
               properties: {
-                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                limit: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: runtimeLimits.maxPageSize,
+                  default: 50,
+                },
                 cursor: { type: 'string', minLength: 1 },
                 status: { type: 'string', minLength: 1, maxLength: 32 },
                 outcome_state: { type: 'string', minLength: 1, maxLength: 32 },
@@ -1083,7 +1153,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               options.v2AdminRepository,
               request,
               'payment:create',
-              60,
+              runtimeLimits.paymentRateLimitPerWindow,
+              runtimeLimits.requestRateLimitWindowSeconds,
             )
           },
           schema: {
@@ -1199,7 +1270,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                 type: 'object',
                 additionalProperties: false,
                 properties: {
-                  limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                  limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: runtimeLimits.maxPageSize,
+                    default: 50,
+                  },
                   cursor: { type: 'string', minLength: 1 },
                 },
               },
@@ -1839,7 +1915,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               type: 'object',
               additionalProperties: false,
               properties: {
-                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                limit: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: runtimeLimits.maxPageSize,
+                  default: 50,
+                },
                 cursor: { type: 'string', minLength: 1 },
               },
             },
@@ -1866,7 +1947,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               type: 'object',
               additionalProperties: false,
               properties: {
-                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                limit: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: runtimeLimits.maxPageSize,
+                  default: 50,
+                },
                 cursor: { type: 'string', minLength: 1 },
               },
             },
@@ -1910,7 +1996,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               options.v2AdminRepository,
               request,
               'receive:create',
-              120,
+              runtimeLimits.receiveRateLimitPerWindow,
+              runtimeLimits.requestRateLimitWindowSeconds,
             )
           },
           schema: {
@@ -1979,7 +2066,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               options.v2AdminRepository,
               request,
               'receive:create',
-              120,
+              runtimeLimits.receiveRateLimitPerWindow,
+              runtimeLimits.requestRateLimitWindowSeconds,
             )
           },
           schema: {
@@ -2039,7 +2127,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               type: 'object',
               additionalProperties: false,
               properties: {
-                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                limit: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: runtimeLimits.maxPageSize,
+                  default: 50,
+                },
                 cursor: { type: 'string', minLength: 1 },
               },
             },
@@ -2120,7 +2213,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               type: 'object',
               additionalProperties: false,
               properties: {
-                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                limit: {
+                  type: 'integer',
+                  minimum: 1,
+                  maximum: runtimeLimits.maxPageSize,
+                  default: 50,
+                },
                 cursor: { type: 'string', minLength: 1 },
               },
             },
@@ -2302,6 +2400,7 @@ async function enforceRateLimit(
   request: Parameters<typeof authenticateAgent>[0],
   bucket: string,
   limit: number,
+  windowSeconds: number,
 ): Promise<void> {
   if (repository === undefined) return
   const account = requireAgentAccount(request)
@@ -2309,7 +2408,7 @@ async function enforceRateLimit(
     subjectType: 'AGENT_ACCOUNT',
     subjectId: account.account.id,
     bucket,
-    windowSeconds: 60,
+    windowSeconds,
     limit,
   })
   if (!result.allowed) throw new RateLimitedError()

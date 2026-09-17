@@ -3,9 +3,12 @@
 ## Runtime roles
 
 Production starts with one explicit `RUNTIME_ROLE`: `api`, `outgoing`,
-`incoming`, `webhook`, or `maintenance`. The API role does not load the
+`reconcile`, `incoming`, `webhook`, or `maintenance`. The API role does not load the
 platform fee-payer secret or mount the legacy payment signer. Development may
 use `RUNTIME_ROLE=all` for the local compatibility runtime.
+
+The platform-neutral topology, secret boundaries, promotion sequence, and
+shutdown contract are in [deployment.md](./deployment.md).
 
 Run the API and a dedicated worker from the API package after building:
 
@@ -14,6 +17,7 @@ pnpm --filter @agent-payment/api build
 RUNTIME_ROLE=api pnpm --filter @agent-payment/api start
 RUNTIME_ROLE=incoming pnpm --filter @agent-payment/api start:worker
 RUNTIME_ROLE=outgoing pnpm --filter @agent-payment/api start:worker
+RUNTIME_ROLE=reconcile pnpm --filter @agent-payment/api start:worker
 RUNTIME_ROLE=webhook pnpm --filter @agent-payment/api start:worker
 ```
 
@@ -59,8 +63,21 @@ BACKUP_VERIFY_ENVIRONMENT=isolated-restore \
 Do not point verification at production. A restored environment must remain
 non-authoritative until its runtime identity, custody configuration, and new
 runtime authority are validated. Verification leaves the durable
-`money_worker_gate` blocked on failure and sets it to `RESTORE_VERIFIED` only
-after all checks pass. Configure the promoted outgoing runtime with the same
+`money_worker_gate` blocked on failure and sets it to
+`RESTORE_RECONCILIATION_REQUIRED` after local checks pass. Reconcile external
+facts after the backup point, preserve evidence for any unprovable gap, then
+complete the gate explicitly:
+
+```bash
+BACKUP_VERIFY_DATABASE_URL='postgresql://.../mux_restore' \
+BACKUP_VERIFY_CUSTODY_IDENTITY='provider/key-reference' \
+BACKUP_VERIFY_RUNTIME_AUTHORITY_ID='runtime-restore-20260917' \
+BACKUP_VERIFY_ENVIRONMENT=isolated-restore \
+  pnpm backup:complete-reconciliation -- restore-ticket-123
+```
+
+The command records the evidence reference and changes the gate to
+`RESTORE_VERIFIED`. Configure the promoted outgoing runtime with the same
 `RUNTIME_AUTHORITY_ID`, `RESTORE_GATE_REQUIRED=true`,
 `RESTORE_GATE_ENVIRONMENT=isolated-restore`, and matching custody identity.
 Start incoming reconciliation first, inspect the durable

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { ConflictError } from '@agent-payment/core'
+import { ConflictError, DEFAULT_AGENT_CREDENTIAL_SCOPES } from '@agent-payment/core'
 import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 import { moneyFromAtomicUnits } from '@agent-payment/core'
@@ -39,6 +39,7 @@ const activeAccount: AuthenticatedAccount = {
     accountId: 'acct_test',
     keyHash: 'hash',
     keyPrefix: 'apa_test',
+    scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
     revokedAt: null,
     lastUsedAt: null,
   },

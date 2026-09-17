@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { MetricsRegistry } from './observability.js'
+import {
+  evaluateDomainAlerts,
+  MetricsRegistry,
+  normalizeCorrelationId,
+} from './observability.js'
 
 describe('MetricsRegistry', () => {
   it('renders counters, gauges, and bounded histograms', () => {
@@ -29,5 +33,39 @@ describe('MetricsRegistry', () => {
     expect(() =>
       metrics.incrementCounter('mux_test_total', { operation: 'payment/1' }),
     ).toThrow('Metric label value is invalid')
+  })
+
+  it('normalizes untrusted correlation headers to a request fallback', () => {
+    expect(normalizeCorrelationId('trace-123', 'request-1')).toBe('trace-123')
+    expect(normalizeCorrelationId('trace value', 'request-1')).toBe('request-1')
+    expect(normalizeCorrelationId('x'.repeat(129), 'request-1')).toBe('request-1')
+  })
+
+  it('evaluates bounded domain alerts without resource labels', () => {
+    const alerts = evaluateDomainAlerts({
+      reviewRequiredPayments: 1,
+      oldestReviewRequiredAgeSeconds: 600,
+      exhaustedIncomingIssues: 1,
+      custodyFailures: 1,
+      noProgressSeconds: 600,
+      databaseSaturationRatio: 0.95,
+      dependencyDegraded: true,
+      pendingWebhookDeliveries: 1,
+      restoreVerificationFailed: true,
+      runtimeIdentityMismatch: true,
+    })
+
+    expect(alerts.map((alert) => alert.name)).toEqual([
+      'REVIEW_REQUIRED_BACKLOG',
+      'REVIEW_REQUIRED_AGE',
+      'INCOMING_ISSUES_EXHAUSTED',
+      'CUSTODY_FAILURES',
+      'NO_PROGRESS',
+      'DATABASE_SATURATION',
+      'DEPENDENCY_DEGRADED',
+      'WEBHOOK_BACKLOG',
+      'RESTORE_VERIFICATION_FAILED',
+      'RUNTIME_IDENTITY_MISMATCH',
+    ])
   })
 })

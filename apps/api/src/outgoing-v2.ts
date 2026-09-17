@@ -18,6 +18,8 @@ import type {
   ConstrainedSignedEffect,
   WalletSecretCipher,
 } from './custody.js'
+import type { CapacityDependency, CapacityResult } from './capacity.js'
+import { retryAtAfter } from './capacity.js'
 
 const DEFAULT_LEASE_SECONDS = 30
 const DEFAULT_BATCH_SIZE = 10
@@ -71,6 +73,10 @@ export interface V2OutgoingWorkerOptions {
   >
   readonly signedPayloadCipher?: WalletSecretCipher
   readonly serviceIdentity?: string
+  readonly capacity?: {
+    acquire(dependency: CapacityDependency, now?: Date): Promise<CapacityResult>
+  }
+  readonly mode?: 'outgoing' | 'reconcile'
   readonly owner: string
   readonly leaseSeconds?: number
   readonly batchSize?: number
@@ -111,8 +117,16 @@ export class V2OutgoingWorker {
 
   private async processBatch(): Promise<void> {
     const batchSize = this.options.batchSize ?? DEFAULT_BATCH_SIZE
-    const kinds = ['OUTGOING_PAYMENT_ATTEMPT', 'OUTGOING_PAYMENT'] as const
+    const kinds =
+      this.options.mode === 'reconcile'
+        ? (['RECONCILE_PAYMENT_ATTEMPT'] as const)
+        : ([
+            'OUTGOING_PAYMENT_ATTEMPT',
+            'OUTGOING_PAYMENT',
+            'RECONCILE_PAYMENT_ATTEMPT',
+          ] as const)
     for (let index = 0; index < batchSize; index += 1) {
+      if (!(await this.acquireBatchCapacity())) break
       let claim: V2WorkItemClaim | null = null
       for (const kind of kinds) {
         claim = await this.options.repository.claimWorkItem({
@@ -128,7 +142,22 @@ export class V2OutgoingWorker {
     }
   }
 
+  private async acquireBatchCapacity(): Promise<boolean> {
+    if (this.options.capacity === undefined) return true
+    const result = await this.options.capacity.acquire('database', this.now())
+    return result.allowed
+  }
+
   private async processClaim(claim: V2WorkItemClaim): Promise<void> {
+    const heartbeat = this.startLeaseHeartbeat(claim)
+    try {
+      await this.processClaimWithLease(claim)
+    } finally {
+      heartbeat.stop()
+    }
+  }
+
+  private async processClaimWithLease(claim: V2WorkItemClaim): Promise<void> {
     try {
       if (claim.accountId === undefined) {
         throw new InvalidStateError('Outgoing work item has no owning account')
@@ -144,11 +173,19 @@ export class V2OutgoingWorker {
       }
       const attempt = view.attempts.at(-1)
       if (attempt === undefined) {
+        if (this.options.mode === 'reconcile') {
+          await this.requeueForOutgoing(claim)
+          return
+        }
         await this.options.repository.completeWorkItem(claim.id, this.options.owner)
         return
       }
       if (attempt.outcome === 'SUBMITTED' || attempt.outcome === 'UNKNOWN') {
         await this.processReconciliation(claim, view, attempt)
+        return
+      }
+      if (this.options.mode === 'reconcile') {
+        await this.requeueForOutgoing(claim)
         return
       }
       if (
@@ -168,6 +205,7 @@ export class V2OutgoingWorker {
         )
       }
       const restoredPrepared = restorePreparedEffect(attempt)
+      if (!(await this.acquireCapacity(claim, 'rail'))) return
       const prepared =
         restoredPrepared ?? (await this.options.executor.prepare({ view, attempt }))
       if (
@@ -241,6 +279,7 @@ export class V2OutgoingWorker {
         )
       } else {
         try {
+          if (!(await this.acquireCapacity(claim, 'custody'))) return
           signed = await this.options.executor.sign(prepared)
         } catch (error) {
           if (signingRequest.status === 'PENDING') {
@@ -299,6 +338,7 @@ export class V2OutgoingWorker {
       }
       if (!(await this.ensureActiveBeforeEffect(claim, currentView, currentAttempt)))
         return
+      if (!(await this.acquireCapacity(claim, 'rail'))) return
       const result = await this.options.executor.submit({ prepared, signed })
       await this.handleSubmissionResult(
         claim,
@@ -418,6 +458,7 @@ export class V2OutgoingWorker {
         retryAt: computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
         errorCode: 'SUBMISSION_OBSERVED',
         errorSafe: 'Submitted settlement awaits authoritative confirmation',
+        ...this.reconciliationKindInput(claim),
       })
       return
     }
@@ -452,6 +493,7 @@ export class V2OutgoingWorker {
         retryAt: computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
         errorCode: 'OUTCOME_UNKNOWN',
         errorSafe: 'Settlement outcome requires reconciliation',
+        ...this.reconciliationKindInput(claim),
       })
       return
     }
@@ -493,6 +535,7 @@ export class V2OutgoingWorker {
       })
       return
     }
+    if (!(await this.acquireCapacity(claim, 'rpc'))) return
     const result = await this.options.executor.reconcile({ view, attempt })
     if (result.status === 'CONFIRMED') {
       await this.options.repository.finalizeV2Payment({
@@ -554,6 +597,7 @@ export class V2OutgoingWorker {
       retryAt: computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
       errorCode: 'OUTCOME_UNKNOWN',
       errorSafe: 'Settlement outcome remains unknown',
+      ...this.reconciliationKindInput(claim),
     })
   }
 
@@ -609,6 +653,55 @@ export class V2OutgoingWorker {
     })
   }
 
+  private async acquireCapacity(
+    claim: V2WorkItemClaim,
+    dependency: CapacityDependency,
+  ): Promise<boolean> {
+    if (this.options.capacity === undefined) return true
+    const result = await this.options.capacity.acquire(dependency, this.now())
+    if (result.allowed) return true
+    await this.options.repository.retryWorkItem({
+      id: claim.id,
+      owner: this.options.owner,
+      retryAt: retryAtAfter(
+        result.retryAt,
+        computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
+      ),
+      errorCode: 'CAPACITY_BACKPRESSURE',
+      errorSafe: `${dependency} capacity is temporarily exhausted`,
+    })
+    return false
+  }
+
+  private startLeaseHeartbeat(claim: V2WorkItemClaim): { stop(): void } {
+    const repository = this.options.repository as V2DatabaseRepository & {
+      readonly renewWorkItemLease?: V2DatabaseRepository['renewWorkItemLease']
+    }
+    if (typeof repository.renewWorkItemLease !== 'function') {
+      return { stop: () => undefined }
+    }
+    const intervalMs = Math.max(
+      1_000,
+      Math.floor(((this.options.leaseSeconds ?? DEFAULT_LEASE_SECONDS) * 1_000) / 3),
+    )
+    const timer = setInterval(() => {
+      void repository
+        .renewWorkItemLease({
+          id: claim.id,
+          owner: this.options.owner,
+          leaseSeconds: this.options.leaseSeconds ?? DEFAULT_LEASE_SECONDS,
+          now: this.now(),
+        })
+        .catch((error: unknown) => {
+          this.options.logger?.info(
+            { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
+            'Outgoing work-item lease renewal failed',
+          )
+        })
+    }, intervalMs)
+    return { stop: () => clearInterval(timer) }
+  }
+
   private async loadClaimView(claim: V2WorkItemClaim): Promise<V2PaymentView | null> {
     if (claim.accountId === undefined) return null
     return this.options.repository.findPaymentView(
@@ -651,6 +744,32 @@ export class V2OutgoingWorker {
       retryAt: computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
       errorCode: 'OUTCOME_UNKNOWN',
       errorSafe: 'Submission outcome requires reconciliation',
+      ...this.reconciliationKindInput(claim),
+    })
+  }
+
+  private reconciliationKindFor(claim: V2WorkItemClaim): string | undefined {
+    return claim.kind === 'OUTGOING_PAYMENT_ATTEMPT' ||
+      claim.kind === 'OUTGOING_PAYMENT'
+      ? 'RECONCILE_PAYMENT_ATTEMPT'
+      : undefined
+  }
+
+  private reconciliationKindInput(claim: V2WorkItemClaim): {
+    readonly nextKind?: string
+  } {
+    const nextKind = this.reconciliationKindFor(claim)
+    return nextKind === undefined ? {} : { nextKind }
+  }
+
+  private async requeueForOutgoing(claim: V2WorkItemClaim): Promise<void> {
+    await this.options.repository.retryWorkItem({
+      id: claim.id,
+      owner: this.options.owner,
+      retryAt: this.now(),
+      errorCode: 'OUTGOING_WORK_ITEM_ROUTED_TO_EXECUTOR',
+      errorSafe: 'Work item requires the outgoing execution role',
+      nextKind: 'OUTGOING_PAYMENT_ATTEMPT',
     })
   }
 

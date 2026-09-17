@@ -181,6 +181,12 @@ export interface V2OperationsRepository {
     readonly leaseSeconds: number
     readonly now?: Date
   }): Promise<readonly V2WebhookDeliveryClaim[]>
+  renewWebhookDeliveryLease(input: {
+    readonly id: string
+    readonly owner: string
+    readonly leaseSeconds: number
+    readonly now?: Date
+  }): Promise<Date>
   markWebhookDelivered(id: string, owner: string, responseStatus: number): Promise<void>
   retryWebhookDelivery(input: {
     readonly id: string
@@ -528,6 +534,27 @@ export function createV2OperationsRepository(
           attemptCount: row.attempt_count + 1,
         }))
       })
+    },
+
+    async renewWebhookDeliveryLease(input) {
+      if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
+        throw new InvalidStateError('Webhook delivery lease must be positive')
+      }
+      const now = input.now ?? new Date()
+      const leaseExpiresAt = new Date(now.getTime() + input.leaseSeconds * 1000)
+      const result = await prisma.webhookDelivery.updateMany({
+        where: {
+          id: input.id,
+          status: 'CLAIMED',
+          leaseOwner: input.owner,
+          leaseExpiresAt: { gt: now },
+        },
+        data: { leaseExpiresAt },
+      })
+      if (result.count !== 1) {
+        throw new ConflictError('Webhook delivery lease is no longer owned')
+      }
+      return leaseExpiresAt
     },
 
     async markWebhookDelivered(id, owner, responseStatus) {

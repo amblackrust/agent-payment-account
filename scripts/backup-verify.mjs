@@ -10,9 +10,11 @@ if (command === 'backup') {
   createBackup(process.argv[3])
 } else if (command === 'verify') {
   verifyBackup(process.argv[3])
+} else if (command === 'complete-reconciliation') {
+  completeReconciliation(process.argv[3])
 } else {
   throw new Error(
-    'Usage: node scripts/backup-verify.mjs backup <encrypted-output> | verify <encrypted-input>',
+    'Usage: node scripts/backup-verify.mjs backup <encrypted-output> | verify <encrypted-input> | complete-reconciliation <evidence-reference>',
   )
 }
 
@@ -120,10 +122,12 @@ function verifyBackup(inputArgument) {
     runSql(
       targetDatabaseUrl,
       `UPDATE runtime_metadata
-          SET value = 'RESTORE_VERIFIED', updated_at = NOW()
+          SET value = 'RESTORE_RECONCILIATION_REQUIRED', updated_at = NOW()
         WHERE key = 'money_worker_gate'`,
     )
-    process.stdout.write(`Restore verification passed for ${backupReference}\n`)
+    process.stdout.write(
+      `Restore verification passed for ${backupReference}; external reconciliation is required before promotion\n`,
+    )
   } catch (error) {
     try {
       runSql(
@@ -141,11 +145,73 @@ function verifyBackup(inputArgument) {
     } catch {
       // A restore that never produced a usable schema cannot record its own
       // verification row; the original failure remains the actionable result.
+      process.stderr.write('Restore verification failure could not be recorded\n')
     }
     throw error
   } finally {
     rmSync(temporaryDirectory, { recursive: true, force: true })
   }
+}
+
+function completeReconciliation(evidenceArgument) {
+  const databaseUrl = requiredEnvironment('BACKUP_VERIFY_DATABASE_URL')
+  const environment = requiredEnvironment('BACKUP_VERIFY_ENVIRONMENT')
+  const custodyIdentity = requiredEnvironment('BACKUP_VERIFY_CUSTODY_IDENTITY')
+  const runtimeAuthorityId = requiredEnvironment('BACKUP_VERIFY_RUNTIME_AUTHORITY_ID')
+  const evidenceReference = requiredArgument(
+    evidenceArgument,
+    'reconciliation evidence reference',
+  )
+  if (environment === 'production') {
+    throw new Error(
+      'Restore reconciliation must be completed in the promoted non-production gate environment',
+    )
+  }
+  const verification = runSql(
+    databaseUrl,
+    `SELECT count(*)
+       FROM backup_restore_verifications
+      WHERE status = 'VERIFIED'
+        AND environment = :'environment'
+        AND custody_identity = :'custody_identity'
+        AND EXISTS (
+          SELECT 1 FROM runtime_metadata
+           WHERE key = 'runtime_authority'
+             AND value = :'runtime_authority'
+        )`,
+    {
+      environment,
+      custody_identity: custodyIdentity,
+      runtime_authority: runtimeAuthorityId,
+    },
+  )
+  const verifiedCount = Number(verification)
+  if (!Number.isSafeInteger(verifiedCount) || verifiedCount < 1) {
+    throw new Error(
+      'No verified restore exists for the requested environment and custody identity',
+    )
+  }
+  runSql(
+    databaseUrl,
+    `INSERT INTO runtime_metadata (key, value, created_at, updated_at)
+      VALUES ('restore_reconciliation_evidence', :'evidence', NOW(), NOW())
+      ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = NOW();
+     UPDATE runtime_metadata
+        SET value = 'RESTORE_VERIFIED', updated_at = NOW()
+      WHERE key = 'money_worker_gate';`,
+    {
+      evidence: JSON.stringify({
+        reference: evidenceReference,
+        environment,
+        custody_identity: custodyIdentity,
+        runtime_authority: runtimeAuthorityId,
+      }),
+    },
+  )
+  process.stdout.write(
+    `Restore reconciliation evidence ${evidenceReference} recorded; money workers may be promoted\n`,
+  )
 }
 
 function restoreInvariantQuery() {

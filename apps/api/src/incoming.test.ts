@@ -299,4 +299,37 @@ describe('incoming reconciliation worker', () => {
     })
     expect(reasonUpdates).toBe(0)
   })
+
+  it('leaves the account cursor untouched when shared RPC capacity is exhausted', async () => {
+    const harness = createHarness()
+    let scans = 0
+    const errors: object[] = []
+    const service = new IncomingReconciliationService(
+      harness.repository as never,
+      {
+        scan: async () => {
+          scans += 1
+          return [transfer]
+        },
+      },
+      { error: (data) => errors.push(data) },
+      {
+        capacity: {
+          acquire: async () => ({
+            allowed: false,
+            count: 50,
+            retryAt: new Date('2026-09-18T00:00:01.000Z'),
+          }),
+        },
+      },
+    )
+
+    await service.runOnce()
+
+    expect(scans).toBe(0)
+    expect(harness.state.cursor).toBeNull()
+    expect(errors).toEqual([
+      { accountId: 'acct_1', errorCode: 'CAPACITY_BACKPRESSURE' },
+    ])
+  })
 })
