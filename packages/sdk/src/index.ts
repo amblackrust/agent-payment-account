@@ -116,6 +116,8 @@ export interface V2Payment {
   readonly id: string
   readonly kind: PaymentKind
   readonly recipientId: string | null
+  readonly description: string | null
+  readonly externalReference: string | null
   readonly amount: string
   readonly denominationId: string
   readonly denominationSymbol: string
@@ -642,6 +644,8 @@ function parseV2Payment(value: unknown): V2Payment {
     id: response.id,
     kind: response.kind,
     recipientId: response.recipient_id,
+    description: response.description,
+    externalReference: response.external_reference,
     amount: response.amount,
     denominationId: response.denomination_id,
     denominationSymbol: response.denomination_symbol,

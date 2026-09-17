@@ -12,6 +12,7 @@ function view(): V2PaymentView {
       recipientId: 'rcpt_1',
       recipientManagedAccountId: null,
       kind: 'PAY',
+      description: null,
       externalReference: null,
       amountAtomic: 100n,
       amountScale: 2,

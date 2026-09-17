@@ -523,6 +523,8 @@ export function serializeV2PaymentView(
     id: view.payment.id,
     kind: view.payment.kind,
     recipient_id: view.payment.recipientId,
+    description: view.payment.description,
+    external_reference: view.payment.externalReference,
     amount: formatExactMoney(
       exactMoneyFromAtomicUnits(view.payment.amountAtomic, denomination),
     ),

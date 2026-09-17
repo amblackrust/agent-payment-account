@@ -78,6 +78,8 @@ export const v2PaymentResponseSchema = z
     id: z.string().min(1),
     kind: z.enum(['PAY', 'SEND', 'REFUND']),
     recipient_id: z.string().nullable(),
+    description: z.string().nullable(),
+    external_reference: z.string().nullable(),
     amount: exactAmountSchema,
     denomination_id: z.string().min(1),
     denomination_symbol: z.string().min(1),

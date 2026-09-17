@@ -77,6 +77,7 @@ export interface V2PaymentSnapshot {
   readonly recipientId: string | null
   readonly recipientManagedAccountId: string | null
   readonly kind: string
+  readonly description: string | null
   readonly externalReference: string | null
   readonly amountAtomic: bigint
   readonly amountScale: number | null
@@ -199,6 +200,7 @@ export interface V2DatabaseRepository {
     readonly version?: number
   }): Promise<V2DenominationRecord>
   findDenomination(id: string): Promise<V2DenominationRecord | null>
+  findDenominationBySymbol(symbol: string): Promise<V2DenominationRecord | null>
   findSettlementAsset(id: string): Promise<V2SettlementAssetRecord | null>
   findEconomicMapping(id: string): Promise<V2EconomicMappingRecord | null>
   findSettlementRoute(id: string): Promise<SettlementRoute | null>
@@ -442,6 +444,13 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 
     async findDenomination(id) {
       return prisma.denomination.findUnique({ where: { id } })
+    },
+
+    async findDenominationBySymbol(symbol) {
+      return prisma.denomination.findFirst({
+        where: { symbol, status: 'ACTIVE' },
+        orderBy: { version: 'desc' },
+      })
     },
 
     async findSettlementAsset(id) {
@@ -1611,6 +1620,7 @@ function toV2PaymentSnapshot(payment: {
   recipientId: string | null
   recipientManagedAccountId: string | null
   kind: string
+  description: string | null
   externalReference: string | null
   amountAtomic: bigint
   amountScale: number | null

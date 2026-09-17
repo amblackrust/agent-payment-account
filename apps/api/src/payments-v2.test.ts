@@ -103,6 +103,7 @@ function createHarness(destinationApproved: boolean) {
           recipientId: input.recipientId,
           recipientManagedAccountId: input.recipientManagedAccountId ?? null,
           kind: input.operation,
+          description: input.description ?? null,
           externalReference: input.externalReference ?? null,
           amountAtomic: input.amountAtomic,
           amountScale: input.amountScale,

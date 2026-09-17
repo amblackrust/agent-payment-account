@@ -3,7 +3,6 @@ import 'dotenv/config'
 import { createDatabaseClient } from '@agent-payment/db'
 import {
   createSolanaIncomingReader,
-  createSolanaPaymentRail,
   createSolanaRail,
 } from '@agent-payment/solana-rail'
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
@@ -18,19 +17,16 @@ import {
   RecoveryEnvelopeCipher,
   WalletSecretCipher,
 } from './custody.js'
-import { PaymentService } from './payments.js'
 import { RecipientService } from './recipients.js'
 import { ReceiveService } from './receives.js'
 import { V2ReceiveService } from './receives.js'
 import { IncomingReconciliationService } from './incoming.js'
-import { OutgoingPaymentReconciliationService } from './outgoing.js'
 import { TransactionService } from './transactions.js'
 import { V2PaymentService } from './payments-v2.js'
+import { V2PaymentServiceAdapter } from './payments-v1-adapter.js'
 import { V2ManagementService } from './v2-management.js'
 import { V2OperationsService } from './v2-operations.js'
-
-const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
-const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
+import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -115,46 +111,6 @@ async function startServer(): Promise<void> {
     database.v2Admin,
     rail,
   )
-  let paymentRail: ReturnType<typeof createSolanaPaymentRail> | undefined
-  let paymentService: PaymentService | undefined
-  if (legacyRuntimeEnabled) {
-    const feePayerSecret = config.solanaFeePayerSecret
-    if (feePayerSecret === undefined) {
-      throw new ConfigurationError(
-        'SOLANA_FEE_PAYER_SECRET is required for the development all-in-one runtime',
-      )
-    }
-    const payerSecretKeyProvider = async (accountId: string): Promise<Uint8Array> => {
-      const custody = await database.findAccountCustody(accountId)
-      if (custody === null) {
-        throw new ExternalRailError('Payer account custody is unavailable')
-      }
-      const secret = walletCipher.decrypt({
-        ciphertext: custody.encryptedSolanaSecret,
-        nonce: custody.encryptionNonce,
-        authTag: custody.encryptionAuthTag,
-      })
-      return secret
-    }
-    paymentRail = createSolanaPaymentRail({
-      rpcUrl: config.solanaRpcUrl,
-      expectedCluster: config.solanaCluster,
-      allowMainnet: config.allowMainnet,
-      settlementMint: config.solanaSettlementMint,
-      feePayerSecret,
-    })
-    paymentService = new PaymentService(
-      database,
-      rail,
-      [paymentRail],
-      payerSecretKeyProvider,
-      undefined,
-      {
-        maxLamportsPerDay: SPONSORSHIP_MAX_LAMPORTS_PER_DAY,
-        maxTransactionsPerHour: SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR,
-      },
-    )
-  }
   const transactionService = new TransactionService(database)
   const v2PaymentService = new V2PaymentService({
     repository: database.v2,
@@ -188,6 +144,10 @@ async function startServer(): Promise<void> {
     recoveryCipher,
   })
   const v2OperationsService = new V2OperationsService(database.v2Operations)
+  const v2OutgoingRuntime = legacyRuntimeEnabled
+    ? createV2OutgoingWorker({ config, database, walletCipher })
+    : undefined
+  const paymentService = new V2PaymentServiceAdapter(v2PaymentService, database.v2)
   const incomingReader = createSolanaIncomingReader({
     rpc: createSolanaRpc(config.solanaRpcUrl as ClusterUrl),
     readRail: rail,
@@ -200,7 +160,7 @@ async function startServer(): Promise<void> {
     checkReadiness: async (): Promise<void> => {
       await database.checkReadiness()
       await rail.checkReadiness?.()
-      await paymentRail?.checkReadiness?.()
+      await v2OutgoingRuntime?.checkReadiness()
     },
   }
   const app = buildApp({
@@ -210,7 +170,7 @@ async function startServer(): Promise<void> {
     accountService,
     solanaRail: rail,
     recipientService,
-    ...(paymentService === undefined ? {} : { paymentService }),
+    paymentService,
     reservationRepository: database,
     receiveService,
     v2ReceiveService,
@@ -246,21 +206,11 @@ async function startServer(): Promise<void> {
       },
     },
   })
-  paymentService?.setEventSink({
-    info: (data, message) => app.log.info(data, message),
-  })
   const incomingReconciliation = legacyRuntimeEnabled
     ? new IncomingReconciliationService(database, incomingReader, {
         error: (data, message) => app.log.error(data, message),
       })
     : undefined
-  const outgoingReconciliation =
-    legacyRuntimeEnabled && paymentService !== undefined
-      ? new OutgoingPaymentReconciliationService(database, paymentService, {
-          info: (data, message) => app.log.info(data, message),
-        })
-      : undefined
-
   const runWorkers = (): void => {
     void incomingReconciliation?.runOnce().catch((error: unknown) => {
       app.log.error(
@@ -268,10 +218,10 @@ async function startServer(): Promise<void> {
         'Incoming reconciliation loop failed',
       )
     })
-    void outgoingReconciliation?.runOnce().catch((error: unknown) => {
+    void v2OutgoingRuntime?.worker.runOnce().catch((error: unknown) => {
       app.log.error(
         { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
-        'Outgoing reconciliation loop failed',
+        'V2 outgoing execution loop failed',
       )
     })
   }
@@ -279,10 +229,10 @@ async function startServer(): Promise<void> {
   app.addHook('onClose', async () => {
     if (reconciliationTimer !== undefined) clearInterval(reconciliationTimer)
     incomingReconciliation?.stop()
-    outgoingReconciliation?.stop()
+    v2OutgoingRuntime?.worker.stop()
     await Promise.all([
       incomingReconciliation?.drain(),
-      outgoingReconciliation?.drain(),
+      v2OutgoingRuntime?.worker.drain(),
     ])
     await database.disconnect()
   })

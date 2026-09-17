@@ -22,7 +22,7 @@ import {
   authenticateAgentWithScope,
 } from './auth.js'
 import { serializePayment } from './payments.js'
-import type { PaymentService } from './payments.js'
+import type { PaymentServiceLike } from './payments.js'
 import { serializeRecipient } from './recipients.js'
 import type { RecipientService } from './recipients.js'
 import type { ReceiveService } from './receives.js'
@@ -49,7 +49,7 @@ export interface BuildAppOptions {
   readonly accountService?: AccountService
   readonly solanaRail?: SolanaRail
   readonly recipientService?: RecipientService
-  readonly paymentService?: PaymentService
+  readonly paymentService?: PaymentServiceLike
   readonly reservationRepository?: ReservationRepository
   readonly receiveService?: ReceiveService
   readonly v2ReceiveService?: V2ReceiveService
