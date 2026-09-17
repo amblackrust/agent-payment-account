@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   convertToSettlementAtomicUnits,
+  addExactMoney,
   createDenomination,
   createEconomicMapping,
   createSettlementAsset,
@@ -27,6 +28,20 @@ describe('exact money', () => {
 
   it('keeps denomination scale in the integer representation', () => {
     expect(parseExactMoney('1.23', usd).atomicUnits).toBe(1_230_000n)
+    expect(
+      formatExactMoney(
+        addExactMoney(parseExactMoney('1.23', usd), parseExactMoney('0.77', usd)),
+      ),
+    ).toBe('2')
+  })
+
+  it('allows the deployment precision limit to be configured', () => {
+    expect(
+      createDenomination(
+        { id: 'denom_high_precision', symbol: 'HP', maxScale: 24 },
+        { maxLogicalScale: 24 },
+      ).maxScale,
+    ).toBe(24)
   })
 
   it('rejects values that require rounding during economic conversion', () => {

@@ -56,6 +56,7 @@ export {
   formatExactMoney,
   parseExactMoney,
   subtractExactMoney,
+  withAtomicUnits,
 } from './exact-money.js'
 export type {
   Denomination,
@@ -64,6 +65,7 @@ export type {
   EconomicMappingInput,
   ExactMoney,
   LifecycleStatus,
+  MoneyPrecisionConfig,
   SettlementAsset,
   SettlementAssetInput,
 } from './exact-money.js'
@@ -111,9 +113,61 @@ export {
 export type {
   ApprovalState,
   AttemptOutcome,
+  PaymentPolicyDecision,
   PaymentStatusProjectionInput,
-  PolicyDecision,
 } from './payment-v2.js'
+
+export {
+  AGENT_CREDENTIAL_SCOPES,
+  AgentAccountLifecycleStatus,
+  AgentCredentialStatus,
+  assertAccountCanStartMoneyOperation,
+  assertAgentAccountTransition,
+  assertCredentialUsable,
+  canTransitionAgentAccount,
+} from './account-v2.js'
+export type {
+  AgentAccountLifecycleStatus as AgentAccountLifecycleStatusValue,
+  AgentCredentialScope,
+  AgentCredentialStatus as AgentCredentialStatusValue,
+} from './account-v2.js'
+
+export {
+  evaluateSpendPolicy,
+  policyDecisionFingerprint,
+  SpendPolicyStatus,
+  subtractHeldReservation,
+} from './policy.js'
+export type {
+  PolicyDecision,
+  SpendPolicy,
+  SpendPolicyEvaluationInput,
+} from './policy.js'
+
+export { selectSettlementRoute } from './routing-v2.js'
+export type {
+  RouteCapability,
+  SettlementRoute,
+  SettlementRouteSelection,
+  SettlementRouteSelectionInput,
+  SettlementRouteStatus,
+} from './routing-v2.js'
+
+export {
+  assertAttemptProgression,
+  assertCanCreateNextAttempt,
+  assertPaymentAttemptSequence,
+  assertReservationCanBeReleased,
+  assertReservationTransition,
+  canCreateNextAttempt,
+} from './payment-lifecycle-v2.js'
+export type {
+  PaymentAttemptOutcome,
+  PaymentAttemptState,
+  PaymentExecutionState,
+  ReservationLifecycleStatus,
+  ReservationState,
+} from './payment-lifecycle-v2.js'
 
 export { selectPaymentRail } from './router.js'
 export type {

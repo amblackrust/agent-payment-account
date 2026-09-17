@@ -18,7 +18,7 @@ export const V2PaymentStatus = {
 
 export type V2PaymentStatus = (typeof V2PaymentStatus)[keyof typeof V2PaymentStatus]
 
-export type PolicyDecision = 'ALLOW' | 'REQUIRE_APPROVAL' | 'DENY'
+export type PaymentPolicyDecision = 'ALLOW' | 'REQUIRE_APPROVAL' | 'DENY'
 export type ApprovalState =
   'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED'
 export type AttemptOutcome =
@@ -31,7 +31,7 @@ export type AttemptOutcome =
   | 'FAILED'
 
 export interface PaymentStatusProjectionInput {
-  readonly policyDecision: PolicyDecision
+  readonly policyDecision: PaymentPolicyDecision
   readonly approvalState: ApprovalState
   readonly attemptOutcomes: readonly AttemptOutcome[]
   readonly planExhausted: boolean

@@ -54,6 +54,10 @@ export interface DenominationInput {
   readonly version?: number
 }
 
+export interface MoneyPrecisionConfig {
+  readonly maxLogicalScale: number
+}
+
 export interface SettlementAssetInput {
   readonly id: string
   readonly rail: string
@@ -74,10 +78,15 @@ export interface EconomicMappingInput {
   readonly version?: number
 }
 
-export function createDenomination(input: DenominationInput): Denomination {
+export function createDenomination(
+  input: DenominationInput,
+  precision: MoneyPrecisionConfig = {
+    maxLogicalScale: DEFAULT_MAX_LOGICAL_MONEY_SCALE,
+  },
+): Denomination {
   assertNonEmpty(input.id, 'Denomination id')
   assertNonEmpty(input.symbol, 'Denomination symbol')
-  assertScale(input.maxScale)
+  assertScale(input.maxScale, precision.maxLogicalScale)
   return {
     id: input.id,
     symbol: input.symbol,
@@ -183,7 +192,7 @@ export function formatExactMoney(money: ExactMoney): string {
 
 export function addExactMoney(left: ExactMoney, right: ExactMoney): ExactMoney {
   assertSameMoneyShape(left, right)
-  return { ...left, atomicUnits: left.atomicUnits + right.atomicUnits }
+  return withAtomicUnits(left, left.atomicUnits + right.atomicUnits)
 }
 
 export function subtractExactMoney(left: ExactMoney, right: ExactMoney): ExactMoney {
@@ -192,7 +201,18 @@ export function subtractExactMoney(left: ExactMoney, right: ExactMoney): ExactMo
   if (atomicUnits < 0n) {
     throw new InsufficientFundsError()
   }
-  return { ...left, atomicUnits }
+  return withAtomicUnits(left, atomicUnits)
+}
+
+export function withAtomicUnits(money: ExactMoney, atomicUnits: bigint): ExactMoney {
+  if (atomicUnits < 0n) {
+    throw new ValidationError('Money atomic units cannot be negative')
+  }
+  return {
+    ...money,
+    amount: formatAtomicUnits(atomicUnits, money.scale),
+    atomicUnits,
+  }
 }
 
 export function compareExactMoney(left: ExactMoney, right: ExactMoney): -1 | 0 | 1 {
@@ -256,6 +276,13 @@ function canonicalDecimal(wholePart: string, fractionPart: string): string {
     : `${canonicalWhole}.${trimmedFraction}`
 }
 
+function formatAtomicUnits(atomicUnits: bigint, scale: number): string {
+  const divisor = 10n ** BigInt(scale)
+  const wholePart = atomicUnits / divisor
+  const fractionPart = (atomicUnits % divisor).toString().padStart(scale, '0')
+  return canonicalDecimal(wholePart.toString(), fractionPart)
+}
+
 function assertSameMoneyShape(left: ExactMoney, right: ExactMoney): void {
   if (left.denominationId !== right.denominationId || left.scale !== right.scale) {
     throw new ValidationError('Money values must use the same denomination and scale')
@@ -274,14 +301,16 @@ function assertNonEmpty(value: string, name: string): void {
   }
 }
 
-function assertScale(value: number): void {
+function assertScale(value: number, maxLogicalScale: number): void {
   if (
     !Number.isInteger(value) ||
     value < 0 ||
-    value > DEFAULT_MAX_LOGICAL_MONEY_SCALE
+    !Number.isInteger(maxLogicalScale) ||
+    maxLogicalScale < 0 ||
+    value > maxLogicalScale
   ) {
     throw new ValidationError(
-      `Denomination maxScale must be an integer from 0 to ${DEFAULT_MAX_LOGICAL_MONEY_SCALE}`,
+      `Denomination maxScale must be an integer from 0 to ${maxLogicalScale}`,
     )
   }
 }
