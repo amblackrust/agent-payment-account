@@ -190,6 +190,11 @@ export {
   v2PolicyResponseSchema,
   v2PaymentResponseSchema,
   v2PaymentStatusSchema,
+  v2RecipientDestinationSchema,
+  v2RecipientResponseSchema,
+  v2RecipientListResponseSchema,
+  v2ReceiveResponseSchema,
+  v2ReceiveListResponseSchema,
 } from './v2.js'
 export type {
   V2BalanceResponse,
@@ -206,4 +211,9 @@ export type {
   V2PaymentResponse,
   V2PaymentStatus,
   V2PolicyResponse,
+  V2RecipientDestination,
+  V2RecipientResponse,
+  V2RecipientListResponse,
+  V2ReceiveResponse,
+  V2ReceiveListResponse,
 } from './v2.js'

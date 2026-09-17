@@ -12,6 +12,10 @@ import {
   v2PaymentCreateRequestSchema,
   v2PaymentListResponseSchema,
   v2PaymentResponseSchema,
+  v2RecipientResponseSchema,
+  v2RecipientListResponseSchema,
+  v2ReceiveResponseSchema,
+  v2ReceiveListResponseSchema,
   type ApiErrorResponse,
   type BalanceResponse,
   type PaymentResponse,
@@ -24,6 +28,10 @@ import {
   type V2AccountResponse,
   type V2FundingDestinationResponse,
   type V2HistoryResponse,
+  type V2RecipientResponse,
+  type V2RecipientListResponse,
+  type V2ReceiveResponse,
+  type V2ReceiveListResponse,
 } from '@agent-payment/contracts'
 
 export type Currency = 'USD'
@@ -157,17 +165,17 @@ export interface V2RefundInput {
 
 export interface V2Account {
   readonly id: string
-  readonly name?: string
+  readonly name: string
   readonly status: V2AccountResponse['status']
-  readonly solanaPublicKey?: string
-  readonly workspaceId?: string | null
+  readonly solanaPublicKey: string
+  readonly workspaceId: string | null
   readonly runtimeVersion: string | null
   readonly provisioningFailureCode: string | null
   readonly disabledAt: string | null
   readonly disabledReason: string | null
-  readonly rowVersion?: number
-  readonly createdAt?: string
-  readonly updatedAt?: string
+  readonly rowVersion: number
+  readonly createdAt: string
+  readonly updatedAt: string
 }
 
 export interface V2Balance {
@@ -230,6 +238,50 @@ export interface V2HistoryItem {
 
 export interface V2HistoryPage {
   readonly items: readonly V2HistoryItem[]
+  readonly nextCursor: string | null
+}
+
+export interface V2RecipientDestination {
+  readonly id: string
+  readonly rail: string
+  readonly type: string
+  readonly walletAddress: string
+}
+
+export interface V2Recipient {
+  readonly id: string
+  readonly displayName: string
+  readonly type: string
+  readonly managedAccountId: string | null
+  readonly destinations: readonly V2RecipientDestination[]
+  readonly createdAt: string
+  readonly updatedAt: string
+}
+
+export interface V2RecipientInput {
+  readonly displayName: string
+  readonly type: string
+  readonly managedAccountId?: string
+  readonly destination: {
+    readonly type: 'SOLANA_SPL'
+    readonly walletAddress: string
+  }
+}
+
+export interface V2RecipientUpdateInput {
+  readonly displayName?: string
+  readonly type?: string
+  readonly managedAccountId?: string | null
+  readonly rowVersion: number
+  readonly destination?: {
+    readonly id: string
+    readonly type: 'SOLANA_SPL'
+    readonly walletAddress: string
+  }
+}
+
+export interface V2RecipientPage {
+  readonly recipients: readonly V2Recipient[]
   readonly nextCursor: string | null
 }
 
@@ -634,11 +686,17 @@ function parseV2Account(value: unknown): V2Account {
   )
   return {
     id: response.id,
+    name: response.name,
     status: response.status,
+    solanaPublicKey: response.solana_public_key,
+    workspaceId: response.workspace_id,
     runtimeVersion: response.runtime_version,
     provisioningFailureCode: response.provisioning_failure_code,
     disabledAt: response.disabled_at,
     disabledReason: response.disabled_reason,
+    rowVersion: response.row_version,
+    createdAt: response.created_at,
+    updatedAt: response.updated_at,
   }
 }
 
@@ -656,8 +714,18 @@ function parseV2Balance(value: unknown): V2Balance {
     {
       safeParse(input: unknown) {
         if (!isRecord(input)) return { success: false as const }
-        const fields = ['account_id', 'denomination_id', 'settled', 'reserved', 'spendable', 'observed_at']
-        if (fields.some((field) => typeof input[field] !== 'string') || typeof input.degraded !== 'boolean') {
+        const fields = [
+          'account_id',
+          'denomination_id',
+          'settled',
+          'reserved',
+          'spendable',
+          'observed_at',
+        ]
+        if (
+          fields.some((field) => typeof input[field] !== 'string') ||
+          typeof input.degraded !== 'boolean'
+        ) {
           return { success: false as const }
         }
         return { success: true as const, data: input as never }
@@ -697,44 +765,80 @@ function parseV2FundingDestination(value: unknown): V2FundingDestination {
 }
 
 function parseV2Receive(value: unknown): V2ReceiveRequest {
-  if (!isRecord(value)) throw new ExternalServiceError('API returned an invalid V2 receive response')
-  const destination = value.destination
-  const settlement = value.settlement
-  if (
-    typeof value.id !== 'string' ||
-    typeof value.account_id !== 'string' ||
-    (value.amount !== null && typeof value.amount !== 'string') ||
-    (value.denomination_id !== null && typeof value.denomination_id !== 'string') ||
-    typeof value.currency !== 'string' ||
-    typeof value.reference !== 'string' ||
-    typeof value.status !== 'string' ||
-    typeof value.created_at !== 'string' ||
-    !isRecord(destination) ||
-    typeof destination.reference !== 'string' ||
-    !isRecord(settlement) ||
-    typeof settlement.owner !== 'string' ||
-    typeof settlement.token_account !== 'string' ||
-    typeof settlement.mint !== 'string'
-  ) {
-    throw new ExternalServiceError('API returned an invalid V2 receive response')
-  }
+  const response = parseContract<V2ReceiveResponse>(
+    value,
+    v2ReceiveResponseSchema,
+    'API returned an invalid V2 receive response',
+  )
   return {
-    id: value.id,
-    accountId: value.account_id,
-    amount: value.amount,
-    denominationId: value.denomination_id,
-    currency: value.currency,
-    reference: value.reference,
-    status: value.status as V2ReceiveRequest['status'],
-    createdAt: value.created_at,
-    expiresAt: typeof value.expires_at === 'string' ? value.expires_at : null,
-    paidAt: typeof value.paid_at === 'string' ? value.paid_at : null,
-    destination: { type: 'external_transfer_target', reference: destination.reference },
-    settlement: {
-      owner: settlement.owner,
-      tokenAccount: settlement.token_account,
-      mint: settlement.mint,
+    id: response.id,
+    accountId: response.account_id,
+    amount: response.amount,
+    denominationId: response.denomination_id,
+    currency: response.currency,
+    reference: response.reference,
+    status: response.status,
+    createdAt: response.created_at,
+    expiresAt: response.expires_at,
+    paidAt: response.paid_at,
+    destination: {
+      type: 'external_transfer_target',
+      reference: response.destination.reference,
     },
+    settlement: {
+      owner: response.settlement.owner,
+      tokenAccount: response.settlement.token_account,
+      mint: response.settlement.mint,
+    },
+  }
+}
+
+function parseV2ReceivePage(value: unknown): {
+  readonly receiveRequests: readonly V2ReceiveRequest[]
+  readonly nextCursor: string | null
+} {
+  const response = parseContract<V2ReceiveListResponse>(
+    value,
+    v2ReceiveListResponseSchema,
+    'API returned an invalid V2 receive list response',
+  )
+  return {
+    receiveRequests: response.receive_requests.map(parseV2Receive),
+    nextCursor: response.next_cursor,
+  }
+}
+
+function parseV2Recipient(value: unknown): V2Recipient {
+  const response = parseContract<V2RecipientResponse>(
+    value,
+    v2RecipientResponseSchema,
+    'API returned an invalid V2 recipient response',
+  )
+  return {
+    id: response.id,
+    displayName: response.display_name,
+    type: response.type,
+    managedAccountId: response.managed_account_id,
+    destinations: response.destinations.map((destination) => ({
+      id: destination.id,
+      rail: destination.rail,
+      type: destination.type,
+      walletAddress: destination.wallet_address,
+    })),
+    createdAt: response.created_at,
+    updatedAt: response.updated_at,
+  }
+}
+
+function parseV2RecipientPage(value: unknown): V2RecipientPage {
+  const response = parseContract<V2RecipientListResponse>(
+    value,
+    v2RecipientListResponseSchema,
+    'API returned an invalid V2 recipient list response',
+  )
+  return {
+    recipients: response.recipients.map(parseV2Recipient),
+    nextCursor: response.next_cursor,
   }
 }
 
@@ -901,9 +1005,83 @@ export class AgentPaymentAccount {
   public async getFundingDestinationV2(
     routeId?: string,
   ): Promise<V2FundingDestination> {
-    const suffix = routeId === undefined ? '' : `?route_id=${encodeURIComponent(routeId)}`
+    const suffix =
+      routeId === undefined ? '' : `?route_id=${encodeURIComponent(routeId)}`
     return parseV2FundingDestination(
       await this.request(`/v2/funding-destination${suffix}`, 'GET'),
+    )
+  }
+
+  public async createRecipientV2(input: V2RecipientInput): Promise<V2Recipient> {
+    return parseV2Recipient(
+      await this.request('/v2/recipients', 'POST', {
+        display_name: input.displayName,
+        type: input.type,
+        ...(input.managedAccountId === undefined
+          ? {}
+          : { managed_account_id: input.managedAccountId }),
+        destination: {
+          type: input.destination.type,
+          wallet_address: input.destination.walletAddress,
+        },
+      }),
+    )
+  }
+
+  public async listRecipientsV2Page(
+    input: {
+      readonly limit?: number
+      readonly cursor?: string
+    } = {},
+  ): Promise<V2RecipientPage> {
+    const query = new URLSearchParams()
+    if (input.limit !== undefined) query.set('limit', String(input.limit))
+    if (input.cursor !== undefined) query.set('cursor', input.cursor)
+    const suffix = query.toString()
+    return parseV2RecipientPage(
+      await this.request(`/v2/recipients${suffix === '' ? '' : `?${suffix}`}`, 'GET'),
+    )
+  }
+
+  public async getRecipientV2(recipientId: string): Promise<V2Recipient> {
+    return parseV2Recipient(
+      await this.request(`/v2/recipients/${encodeURIComponent(recipientId)}`, 'GET'),
+    )
+  }
+
+  public async updateRecipientV2(
+    recipientId: string,
+    input: V2RecipientUpdateInput,
+  ): Promise<V2Recipient> {
+    return parseV2Recipient(
+      await this.request(`/v2/recipients/${encodeURIComponent(recipientId)}`, 'PATCH', {
+        ...(input.displayName === undefined ? {} : { display_name: input.displayName }),
+        ...(input.type === undefined ? {} : { type: input.type }),
+        ...(input.managedAccountId === undefined
+          ? {}
+          : { managed_account_id: input.managedAccountId }),
+        row_version: input.rowVersion,
+        ...(input.destination === undefined
+          ? {}
+          : {
+              destination: {
+                id: input.destination.id,
+                type: input.destination.type,
+                wallet_address: input.destination.walletAddress,
+              },
+            }),
+      }),
+    )
+  }
+
+  public async archiveRecipientV2(
+    recipientId: string,
+    rowVersion: number,
+  ): Promise<void> {
+    await this.request(
+      `/v2/recipients/${encodeURIComponent(recipientId)}/archive`,
+      'POST',
+      { row_version: rowVersion },
     )
   }
 
@@ -929,28 +1107,31 @@ export class AgentPaymentAccount {
 
   public async getReceiveV2(receiveId: string): Promise<V2ReceiveRequest> {
     return parseV2Receive(
-      await this.request(`/v2/receive-requests/${encodeURIComponent(receiveId)}`, 'GET'),
+      await this.request(
+        `/v2/receive-requests/${encodeURIComponent(receiveId)}`,
+        'GET',
+      ),
     )
   }
 
-  public async listReceiveV2Page(input: {
-    readonly limit?: number
-    readonly cursor?: string
-  } = {}): Promise<{ readonly receiveRequests: readonly V2ReceiveRequest[]; readonly nextCursor: string | null }> {
+  public async listReceiveV2Page(
+    input: {
+      readonly limit?: number
+      readonly cursor?: string
+    } = {},
+  ): Promise<{
+    readonly receiveRequests: readonly V2ReceiveRequest[]
+    readonly nextCursor: string | null
+  }> {
     const query = new URLSearchParams()
     if (input.limit !== undefined) query.set('limit', String(input.limit))
     if (input.cursor !== undefined) query.set('cursor', input.cursor)
-    const value = await this.request(
-      `/v2/receive-requests${query.size === 0 ? '' : `?${query.toString()}`}`,
-      'GET',
+    return parseV2ReceivePage(
+      await this.request(
+        `/v2/receive-requests${query.size === 0 ? '' : `?${query.toString()}`}`,
+        'GET',
+      ),
     )
-    if (!isRecord(value) || !Array.isArray(value.receive_requests)) {
-      throw new ExternalServiceError('API returned an invalid V2 receive list response')
-    }
-    return {
-      receiveRequests: value.receive_requests.map(parseV2Receive),
-      nextCursor: typeof value.next_cursor === 'string' ? value.next_cursor : null,
-    }
   }
 
   public async cancelReceiveV2(receiveId: string): Promise<V2ReceiveRequest> {
@@ -962,15 +1143,20 @@ export class AgentPaymentAccount {
     )
   }
 
-  public async listHistoryV2Page(input: {
-    readonly limit?: number
-    readonly cursor?: string
-  } = {}): Promise<V2HistoryPage> {
+  public async listHistoryV2Page(
+    input: {
+      readonly limit?: number
+      readonly cursor?: string
+    } = {},
+  ): Promise<V2HistoryPage> {
     const query = new URLSearchParams()
     if (input.limit !== undefined) query.set('limit', String(input.limit))
     if (input.cursor !== undefined) query.set('cursor', input.cursor)
     return parseV2History(
-      await this.request(`/v2/history${query.size === 0 ? '' : `?${query.toString()}`}`, 'GET'),
+      await this.request(
+        `/v2/history${query.size === 0 ? '' : `?${query.toString()}`}`,
+        'GET',
+      ),
     )
   }
 
@@ -1009,7 +1195,8 @@ export class AgentPaymentAccount {
     if (input.status !== undefined) query.set('status', input.status)
     if (input.outcomeState !== undefined) query.set('outcome_state', input.outcomeState)
     if (input.recipientId !== undefined) query.set('recipient_id', input.recipientId)
-    if (input.denominationId !== undefined) query.set('denomination_id', input.denominationId)
+    if (input.denominationId !== undefined)
+      query.set('denomination_id', input.denominationId)
     const suffix = query.toString()
     return parseV2PaymentPage(
       await this.request(`/v2/payments${suffix === '' ? '' : `?${suffix}`}`, 'GET'),
@@ -1164,7 +1351,7 @@ export class AgentPaymentAccount {
 
   private async request(
     path: string,
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'PATCH',
     body?: unknown,
     idempotencyKey?: string,
   ): Promise<unknown> {

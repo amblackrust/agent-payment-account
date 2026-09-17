@@ -422,6 +422,11 @@ export interface ReceiveRepository {
     id: string,
   ): Promise<ReceiveRequestRecord | null>
   listReceiveRequests(accountId: string): Promise<readonly ReceiveRequestRecord[]>
+  readonly listReceiveRequestsPage?: (
+    accountId: string,
+    limit: number,
+    cursor?: { readonly createdAt: Date; readonly id: string },
+  ) => Promise<readonly ReceiveRequestRecord[]>
   matchIncomingPayment(input: IncomingMatchInput): Promise<string | null>
   expireOpenReceiveRequests(accountId: string, now: Date): Promise<void>
   readonly cancelReceiveRequest?: (
@@ -1810,7 +1815,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ...(input.denominationId === undefined
               ? {}
               : { denominationId: input.denominationId }),
-            ...(input.amountScale === undefined ? {} : { amountScale: input.amountScale }),
+            ...(input.amountScale === undefined
+              ? {}
+              : { amountScale: input.amountScale }),
             currency: input.currency,
             reference: input.reference,
             ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
@@ -1834,7 +1841,25 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     async listReceiveRequests(accountId) {
       const requests = await prisma.receiveRequest.findMany({
         where: { accountId },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      })
+      return requests.map(toReceiveRequestRecord)
+    },
+    async listReceiveRequestsPage(accountId, limit, cursor) {
+      const requests = await prisma.receiveRequest.findMany({
+        where: {
+          accountId,
+          ...(cursor === undefined
+            ? {}
+            : {
+                OR: [
+                  { createdAt: { lt: cursor.createdAt } },
+                  { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+                ],
+              }),
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
       })
       return requests.map(toReceiveRequestRecord)
     },
@@ -1850,7 +1875,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         data: { status: 'CANCELLED', updatedAt: now },
       })
       if (result.count !== 1) {
-        const current = await prisma.receiveRequest.findFirst({ where: { id, accountId } })
+        const current = await prisma.receiveRequest.findFirst({
+          where: { id, accountId },
+        })
         if (current === null) throw new ValidationError('Receive request was not found')
         throw new ConflictError('Receive request is already terminal')
       }

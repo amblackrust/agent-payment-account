@@ -124,11 +124,17 @@ export const v2PaymentListResponseSchema = z
 export const v2AccountResponseSchema = z
   .object({
     id: z.string().min(1),
+    name: z.string().min(1),
     status: z.enum(['PROVISIONING', 'ACTIVE', 'DISABLED', 'PROVISIONING_FAILED']),
+    solana_public_key: z.string().min(1),
+    workspace_id: z.string().nullable(),
     runtime_version: z.string().nullable(),
     provisioning_failure_code: z.string().nullable(),
     disabled_at: z.string().nullable(),
     disabled_reason: z.string().nullable(),
+    row_version: z.number().int().positive(),
+    created_at: z.string().min(1),
+    updated_at: z.string().min(1),
   })
   .strict()
 
@@ -218,6 +224,69 @@ export const v2HistoryResponseSchema = z
   })
   .strict()
 
+export const v2RecipientDestinationSchema = z
+  .object({
+    id: z.string().min(1),
+    rail: z.string().min(1),
+    type: z.string().min(1),
+    wallet_address: z.string().min(1),
+  })
+  .strict()
+
+export const v2RecipientResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    display_name: z.string().min(1),
+    type: z.string().min(1),
+    managed_account_id: z.string().nullable(),
+    destinations: z.array(v2RecipientDestinationSchema),
+    created_at: z.string().min(1),
+    updated_at: z.string().min(1),
+  })
+  .strict()
+
+export const v2RecipientListResponseSchema = z
+  .object({
+    recipients: z.array(v2RecipientResponseSchema),
+    next_cursor: z.string().nullable(),
+  })
+  .strict()
+
+export const v2ReceiveResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    account_id: z.string().min(1),
+    amount: exactAmountSchema.nullable(),
+    denomination_id: z.string().nullable(),
+    currency: z.string().min(1),
+    reference: z.string().min(1),
+    status: z.enum(['OPEN', 'PAID', 'EXPIRED', 'CANCELLED']),
+    created_at: z.string().min(1),
+    expires_at: z.string().nullable(),
+    paid_at: z.string().nullable(),
+    destination: z
+      .object({
+        type: z.literal('external_transfer_target'),
+        reference: z.string().min(1),
+      })
+      .strict(),
+    settlement: z
+      .object({
+        owner: z.string().min(1),
+        token_account: z.string().min(1),
+        mint: z.string().min(1),
+      })
+      .strict(),
+  })
+  .strict()
+
+export const v2ReceiveListResponseSchema = z
+  .object({
+    receive_requests: z.array(v2ReceiveResponseSchema),
+    next_cursor: z.string().nullable(),
+  })
+  .strict()
+
 export type V2PaymentStatus = z.infer<typeof v2PaymentStatusSchema>
 export type V2ErrorCode = z.infer<typeof v2ErrorCodeSchema>
 export type V2ErrorEnvelope = z.infer<typeof v2ErrorEnvelopeSchema>
@@ -229,6 +298,13 @@ export type V2AccountResponse = z.infer<typeof v2AccountResponseSchema>
 export type V2CredentialResponse = z.infer<typeof v2CredentialResponseSchema>
 export type V2PolicyResponse = z.infer<typeof v2PolicyResponseSchema>
 export type V2ApprovalResponse = z.infer<typeof v2ApprovalResponseSchema>
-export type V2FundingDestinationResponse = z.infer<typeof v2FundingDestinationResponseSchema>
+export type V2FundingDestinationResponse = z.infer<
+  typeof v2FundingDestinationResponseSchema
+>
 export type V2HistoryItem = z.infer<typeof v2HistoryItemSchema>
 export type V2HistoryResponse = z.infer<typeof v2HistoryResponseSchema>
+export type V2RecipientDestination = z.infer<typeof v2RecipientDestinationSchema>
+export type V2RecipientResponse = z.infer<typeof v2RecipientResponseSchema>
+export type V2RecipientListResponse = z.infer<typeof v2RecipientListResponseSchema>
+export type V2ReceiveResponse = z.infer<typeof v2ReceiveResponseSchema>
+export type V2ReceiveListResponse = z.infer<typeof v2ReceiveListResponseSchema>

@@ -93,8 +93,8 @@ async function fastifyFetch(
         ? input.toString()
         : input.url
   const response = await app.inject({
-    method: (init?.method ?? 'GET') as 'GET' | 'POST',
-    url: new URL(inputUrl).pathname,
+    method: (init?.method ?? 'GET') as 'GET' | 'POST' | 'PATCH',
+    url: `${new URL(inputUrl).pathname}${new URL(inputUrl).search}`,
     headers: Object.fromEntries(headers.entries()),
     ...(init?.body === undefined ? {} : { payload: JSON.parse(String(init.body)) }),
   })
@@ -152,7 +152,144 @@ async function createLocalApi() {
   return { app, requests }
 }
 
+const v2Account = {
+  id: 'acct_test',
+  name: 'Test account',
+  status: 'ACTIVE',
+  solana_public_key: 'owner-address',
+  workspace_id: null,
+  runtime_version: 'v2',
+  provisioning_failure_code: null,
+  disabled_at: null,
+  disabled_reason: null,
+  row_version: 1,
+  created_at: '2026-09-06T00:00:00.000Z',
+  updated_at: '2026-09-06T00:00:00.000Z',
+}
+
+const v2Recipient = {
+  id: 'rcpt_test',
+  display_name: 'Test recipient',
+  type: 'SOLANA_SPL',
+  managed_account_id: null,
+  destinations: [
+    {
+      id: 'dest_test',
+      rail: 'SOLANA_SPL',
+      type: 'SOLANA_SPL',
+      wallet_address: 'recipient-address',
+    },
+  ],
+  created_at: '2026-09-06T00:00:00.000Z',
+  updated_at: '2026-09-06T00:00:00.000Z',
+}
+
+const v2Receive = {
+  id: 'recv_v2_test',
+  account_id: 'acct_test',
+  amount: '1.250',
+  denomination_id: 'usd',
+  currency: 'USD',
+  reference: 'receive-v2-reference',
+  status: 'OPEN',
+  created_at: '2026-09-06T00:00:00.000Z',
+  expires_at: null,
+  paid_at: null,
+  destination: {
+    type: 'external_transfer_target',
+    reference: 'token-account',
+  },
+  settlement: {
+    owner: 'owner-address',
+    token_account: 'token-account',
+    mint: 'mint-address',
+  },
+}
+
+async function createLocalV2Api() {
+  const app = Fastify()
+  app.get('/v2/accounts/:accountId', async () => v2Account)
+  app.post('/v2/recipients', async () => v2Recipient)
+  app.get('/v2/recipients', async () => ({
+    recipients: [v2Recipient],
+    next_cursor: null,
+  }))
+  app.get('/v2/recipients/:recipientId', async () => v2Recipient)
+  app.patch('/v2/recipients/:recipientId', async () => v2Recipient)
+  app.post('/v2/recipients/:recipientId/archive', async () => ({ status: 'ARCHIVED' }))
+  app.post('/v2/receive-requests', async () => v2Receive)
+  app.get('/v2/receive-requests/:receiveId', async () => v2Receive)
+  app.get('/v2/receive-requests', async () => ({
+    receive_requests: [v2Receive],
+    next_cursor: null,
+  }))
+  app.post('/v2/receive-requests/:receiveId/cancel', async () => ({
+    ...v2Receive,
+    status: 'CANCELLED',
+  }))
+  return app
+}
+
 describe('AgentPaymentAccount SDK', () => {
+  it('keeps V2 account, recipient, and receive contracts in parity with HTTP', async () => {
+    const app = await createLocalV2Api()
+    const account = new AgentPaymentAccount({
+      baseUrl: 'http://localhost:3000/',
+      apiKey: 'agent-secret',
+      fetch: fastifyFetch.bind(undefined, app),
+    })
+
+    try {
+      await expect(account.getAccount('acct_test')).resolves.toMatchObject({
+        id: 'acct_test',
+        name: 'Test account',
+        rowVersion: 1,
+      })
+      await expect(
+        account.createRecipientV2({
+          displayName: 'Test recipient',
+          type: 'SOLANA_SPL',
+          destination: { type: 'SOLANA_SPL', walletAddress: 'recipient-address' },
+        }),
+      ).resolves.toMatchObject({
+        id: 'rcpt_test',
+        destinations: [{ walletAddress: 'recipient-address' }],
+      })
+      await expect(account.listRecipientsV2Page({ limit: 1 })).resolves.toMatchObject({
+        recipients: [{ id: 'rcpt_test' }],
+        nextCursor: null,
+      })
+      await expect(account.getRecipientV2('rcpt_test')).resolves.toMatchObject({
+        displayName: 'Test recipient',
+      })
+      await expect(
+        account.updateRecipientV2('rcpt_test', {
+          rowVersion: 1,
+          displayName: 'Renamed',
+        }),
+      ).resolves.toMatchObject({ id: 'rcpt_test' })
+      await expect(account.archiveRecipientV2('rcpt_test', 2)).resolves.toBeUndefined()
+      await expect(
+        account.createReceiveV2(
+          { denominationId: 'usd', amount: '1.250' },
+          { idempotencyKey: 'receive-v2-key' },
+        ),
+      ).resolves.toMatchObject({ denominationId: 'usd', amount: '1.250' })
+      await expect(account.getReceiveV2('recv_v2_test')).resolves.toMatchObject({
+        id: 'recv_v2_test',
+      })
+      await expect(account.listReceiveV2Page({ limit: 1 })).resolves.toMatchObject({
+        receiveRequests: [{ id: 'recv_v2_test' }],
+        nextCursor: null,
+      })
+      await expect(account.cancelReceiveV2('recv_v2_test')).resolves.toMatchObject({
+        status: 'CANCELLED',
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
   it('uses the local Fastify HTTP contract for the basic financial flow', async () => {
     const { app, requests } = await createLocalApi()
     const account = new AgentPaymentAccount({

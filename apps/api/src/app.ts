@@ -835,8 +835,17 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         '/v2/payments',
         {
           preHandler: async (request) => {
-            await authenticateAgentWithScope(request, accountRepository, 'payments:create')
-            await enforceRateLimit(options.v2AdminRepository, request, 'payment:create', 60)
+            await authenticateAgentWithScope(
+              request,
+              accountRepository,
+              'payments:create',
+            )
+            await enforceRateLimit(
+              options.v2AdminRepository,
+              request,
+              'payment:create',
+              60,
+            )
           },
           schema: v2PaymentSchema,
         },
@@ -978,8 +987,17 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         '/v2/payments/:paymentId/refunds',
         {
           preHandler: async (request) => {
-            await authenticateAgentWithScope(request, accountRepository, 'payments:create')
-            await enforceRateLimit(options.v2AdminRepository, request, 'payment:create', 60)
+            await authenticateAgentWithScope(
+              request,
+              accountRepository,
+              'payments:create',
+            )
+            await enforceRateLimit(
+              options.v2AdminRepository,
+              request,
+              'payment:create',
+              60,
+            )
           },
           schema: {
             headers: v2PaymentSchema.headers,
@@ -1035,11 +1053,17 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           required: ['recipientId'],
         } as const
         app.post<{
-          Body: { display_name: string; type: string; managed_account_id?: string; destination: { type: string; wallet_address: string } }
+          Body: {
+            display_name: string
+            type: string
+            managed_account_id?: string
+            destination: { type: string; wallet_address: string }
+          }
         }>(
           '/v2/recipients',
           {
-            preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
+            preHandler: async (request) =>
+              authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
             schema: {
               body: {
                 type: 'object',
@@ -1048,7 +1072,15 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                   display_name: { type: 'string', minLength: 1, maxLength: 120 },
                   type: { type: 'string', minLength: 1, maxLength: 64 },
                   managed_account_id: { type: 'string', minLength: 1, maxLength: 64 },
-                  destination: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', const: 'SOLANA_SPL' }, wallet_address: { type: 'string', minLength: 1, maxLength: 128 } }, required: ['type', 'wallet_address'] },
+                  destination: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      type: { type: 'string', const: 'SOLANA_SPL' },
+                      wallet_address: { type: 'string', minLength: 1, maxLength: 128 },
+                    },
+                    required: ['type', 'wallet_address'],
+                  },
                 },
                 required: ['display_name', 'type', 'destination'],
               },
@@ -1056,40 +1088,153 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
           async (request, reply) => {
             const account = requireAgentAccount(request)
-            const recipient = await recipients.createRecipient(account.account.id, { displayName: request.body.display_name, type: request.body.type, ...(request.body.managed_account_id === undefined ? {} : { managedAccountId: request.body.managed_account_id }), destination: { type: request.body.destination.type, walletAddress: request.body.destination.wallet_address } })
+            const recipient = await recipients.createRecipient(account.account.id, {
+              displayName: request.body.display_name,
+              type: request.body.type,
+              ...(request.body.managed_account_id === undefined
+                ? {}
+                : { managedAccountId: request.body.managed_account_id }),
+              destination: {
+                type: request.body.destination.type,
+                walletAddress: request.body.destination.wallet_address,
+              },
+            })
             return reply.code(201).send(serializeRecipient(recipient))
           },
         )
         app.get<{ Querystring: { limit?: number; cursor?: string } }>(
           '/v2/recipients',
-          { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'contacts:manage'), schema: { querystring: { type: 'object', additionalProperties: false, properties: { limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 }, cursor: { type: 'string', minLength: 1 } } } } },
+          {
+            preHandler: async (request) =>
+              authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
+            schema: {
+              querystring: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                  cursor: { type: 'string', minLength: 1 },
+                },
+              },
+            },
+          },
           async (request) => {
-            const page = await recipients.listRecipientsPage(requireAgentAccount(request).account.id, request.query)
-            return { recipients: page.recipients.map(serializeRecipient), next_cursor: page.next_cursor }
+            const page = await recipients.listRecipientsPage(
+              requireAgentAccount(request).account.id,
+              request.query,
+            )
+            return {
+              recipients: page.recipients.map(serializeRecipient),
+              next_cursor: page.next_cursor,
+            }
           },
         )
         app.get<{ Params: { recipientId: string } }>(
           '/v2/recipients/:recipientId',
-          { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'contacts:manage'), schema: { params: recipientParams } },
-          async (request) => serializeRecipient(await recipients.getRecipient(requireAgentAccount(request).account.id, request.params.recipientId)),
+          {
+            preHandler: async (request) =>
+              authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
+            schema: { params: recipientParams },
+          },
+          async (request) =>
+            serializeRecipient(
+              await recipients.getRecipient(
+                requireAgentAccount(request).account.id,
+                request.params.recipientId,
+              ),
+            ),
         )
         app.patch<{
           Params: { recipientId: string }
-          Body: { display_name?: string; type?: string; managed_account_id?: string | null; row_version: number; destination?: { id: string; type: string; wallet_address: string } }
+          Body: {
+            display_name?: string
+            type?: string
+            managed_account_id?: string | null
+            row_version: number
+            destination?: { id: string; type: string; wallet_address: string }
+          }
         }>(
           '/v2/recipients/:recipientId',
           {
-            preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
-            schema: { params: recipientParams, body: { type: 'object', additionalProperties: false, properties: { display_name: { type: 'string', minLength: 1, maxLength: 120 }, type: { type: 'string', minLength: 1, maxLength: 64 }, managed_account_id: { type: ['string', 'null'], maxLength: 64 }, row_version: { type: 'integer', minimum: 1 }, destination: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', minLength: 1, maxLength: 64 }, type: { type: 'string', const: 'SOLANA_SPL' }, wallet_address: { type: 'string', minLength: 1, maxLength: 128 } }, required: ['id', 'type', 'wallet_address'] } }, required: ['row_version'], minProperties: 1 } },
+            preHandler: async (request) =>
+              authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
+            schema: {
+              params: recipientParams,
+              body: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  display_name: { type: 'string', minLength: 1, maxLength: 120 },
+                  type: { type: 'string', minLength: 1, maxLength: 64 },
+                  managed_account_id: { type: ['string', 'null'], maxLength: 64 },
+                  row_version: { type: 'integer', minimum: 1 },
+                  destination: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      id: { type: 'string', minLength: 1, maxLength: 64 },
+                      type: { type: 'string', const: 'SOLANA_SPL' },
+                      wallet_address: { type: 'string', minLength: 1, maxLength: 128 },
+                    },
+                    required: ['id', 'type', 'wallet_address'],
+                  },
+                },
+                required: ['row_version'],
+                minProperties: 1,
+              },
+            },
           },
-          async (request) => serializeRecipient(await recipients.updateRecipient(requireAgentAccount(request).account.id, request.params.recipientId, { ...(request.body.display_name === undefined ? {} : { displayName: request.body.display_name }), ...(request.body.type === undefined ? {} : { type: request.body.type }), ...(request.body.managed_account_id === undefined ? {} : { managedAccountId: request.body.managed_account_id }), ...(request.body.destination === undefined ? {} : { destination: { id: request.body.destination.id, type: request.body.destination.type, walletAddress: request.body.destination.wallet_address } }), rowVersion: request.body.row_version })),
+          async (request) =>
+            serializeRecipient(
+              await recipients.updateRecipient(
+                requireAgentAccount(request).account.id,
+                request.params.recipientId,
+                {
+                  ...(request.body.display_name === undefined
+                    ? {}
+                    : { displayName: request.body.display_name }),
+                  ...(request.body.type === undefined
+                    ? {}
+                    : { type: request.body.type }),
+                  ...(request.body.managed_account_id === undefined
+                    ? {}
+                    : { managedAccountId: request.body.managed_account_id }),
+                  ...(request.body.destination === undefined
+                    ? {}
+                    : {
+                        destination: {
+                          id: request.body.destination.id,
+                          type: request.body.destination.type,
+                          walletAddress: request.body.destination.wallet_address,
+                        },
+                      }),
+                  rowVersion: request.body.row_version,
+                },
+              ),
+            ),
         )
         app.post<{ Params: { recipientId: string }; Body: { row_version: number } }>(
           '/v2/recipients/:recipientId/archive',
-          { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'contacts:manage'), schema: { params: recipientParams, body: { type: 'object', additionalProperties: false, properties: { row_version: { type: 'integer', minimum: 1 } }, required: ['row_version'] } } },
+          {
+            preHandler: async (request) =>
+              authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
+            schema: {
+              params: recipientParams,
+              body: {
+                type: 'object',
+                additionalProperties: false,
+                properties: { row_version: { type: 'integer', minimum: 1 } },
+                required: ['row_version'],
+              },
+            },
+          },
           async (request) => {
             const account = requireAgentAccount(request)
-            await management.archiveRecipient({ ownerAccountId: account.account.id, recipientId: request.params.recipientId, rowVersion: request.body.row_version })
+            await management.archiveRecipient({
+              ownerAccountId: account.account.id,
+              recipientId: request.params.recipientId,
+              rowVersion: request.body.row_version,
+            })
             return { status: 'ARCHIVED' }
           },
         )
@@ -1116,7 +1261,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         required: ['denomination_id'],
       } as const
 
-      app.get<{ Params: { accountId: string } }>(
+      app.get<{
+        Params: { accountId: string }
+        Querystring: { limit?: number; cursor?: string }
+      }>(
         '/v2/accounts/:accountId',
         {
           preHandler: async (request) =>
@@ -1137,13 +1285,20 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         { schema: { params: accountParams } },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
-          return { credentials: await management.listCredentials(request.params.accountId) }
+          return {
+            credentials: await management.listCredentials(request.params.accountId),
+          }
         },
       )
 
       app.post<{
         Params: { accountId: string }
-        Body: { current_status: 'PROVISIONING' | 'ACTIVE' | 'DISABLED' | 'PROVISIONING_FAILED'; next_status: 'PROVISIONING' | 'ACTIVE' | 'DISABLED' | 'PROVISIONING_FAILED'; row_version: number; reason?: string }
+        Body: {
+          current_status: 'PROVISIONING' | 'ACTIVE' | 'DISABLED' | 'PROVISIONING_FAILED'
+          next_status: 'PROVISIONING' | 'ACTIVE' | 'DISABLED' | 'PROVISIONING_FAILED'
+          row_version: number
+          reason?: string
+        }
       }>(
         '/v2/accounts/:accountId/lifecycle',
         {
@@ -1169,7 +1324,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             currentStatus: request.body.current_status,
             nextStatus: request.body.next_status,
             rowVersion: request.body.row_version,
-            ...(request.body.reason === undefined ? {} : { reason: request.body.reason }),
+            ...(request.body.reason === undefined
+              ? {}
+              : { reason: request.body.reason }),
           })
         },
       )
@@ -1178,10 +1335,24 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         Params: { accountId: string; credentialId: string }
       }>(
         '/v2/accounts/:accountId/credentials/:credentialId/revoke',
-        { schema: { params: { ...accountParams, properties: { ...accountParams.properties, credentialId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['accountId', 'credentialId'] } } },
+        {
+          schema: {
+            params: {
+              ...accountParams,
+              properties: {
+                ...accountParams.properties,
+                credentialId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['accountId', 'credentialId'],
+            },
+          },
+        },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
-          await management.revokeCredential(request.params.accountId, request.params.credentialId)
+          await management.revokeCredential(
+            request.params.accountId,
+            request.params.credentialId,
+          )
           return { status: 'REVOKED' }
         },
       )
@@ -1192,10 +1363,19 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         '/v2/accounts/:accountId/credentials/:credentialId/rotate',
         {
           schema: {
-            params: { ...accountParams, properties: { ...accountParams.properties, credentialId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['accountId', 'credentialId'] },
+            params: {
+              ...accountParams,
+              properties: {
+                ...accountParams.properties,
+                credentialId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['accountId', 'credentialId'],
+            },
             headers: {
               type: 'object',
-              properties: { 'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 } },
+              properties: {
+                'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+              },
               required: ['idempotency-key'],
             },
           },
@@ -1238,28 +1418,65 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           const policy = await management.createPolicy({
             accountId: request.params.accountId,
             denominationId: request.body.denomination_id,
-            ...(request.body.max_per_payment === undefined ? {} : { maxPerPayment: request.body.max_per_payment }),
-            ...(request.body.rolling_budget === undefined ? {} : { rollingBudget: request.body.rolling_budget }),
-            ...(request.body.rolling_window_seconds === undefined ? {} : { rollingWindowSeconds: request.body.rolling_window_seconds }),
-            ...(request.body.transaction_count_cap === undefined ? {} : { transactionCountCap: request.body.transaction_count_cap }),
-            ...(request.body.approval_threshold === undefined ? {} : { approvalThreshold: request.body.approval_threshold }),
-            ...(request.body.rolling_budget_escalatable === undefined ? {} : { rollingBudgetEscalatable: request.body.rolling_budget_escalatable }),
-            ...(request.body.transaction_count_escalatable === undefined ? {} : { transactionCountEscalatable: request.body.transaction_count_escalatable }),
+            ...(request.body.max_per_payment === undefined
+              ? {}
+              : { maxPerPayment: request.body.max_per_payment }),
+            ...(request.body.rolling_budget === undefined
+              ? {}
+              : { rollingBudget: request.body.rolling_budget }),
+            ...(request.body.rolling_window_seconds === undefined
+              ? {}
+              : { rollingWindowSeconds: request.body.rolling_window_seconds }),
+            ...(request.body.transaction_count_cap === undefined
+              ? {}
+              : { transactionCountCap: request.body.transaction_count_cap }),
+            ...(request.body.approval_threshold === undefined
+              ? {}
+              : { approvalThreshold: request.body.approval_threshold }),
+            ...(request.body.rolling_budget_escalatable === undefined
+              ? {}
+              : { rollingBudgetEscalatable: request.body.rolling_budget_escalatable }),
+            ...(request.body.transaction_count_escalatable === undefined
+              ? {}
+              : {
+                  transactionCountEscalatable:
+                    request.body.transaction_count_escalatable,
+                }),
           })
           return reply.code(201).send(policy)
         },
       )
-      app.post<{ Params: { policyId: string }; Body: { account_id: string; version?: number } }>(
+      app.post<{
+        Params: { policyId: string }
+        Body: { account_id: string; version?: number }
+      }>(
         '/v2/policies/:policyId/activate',
         {
           schema: {
-            params: { type: 'object', additionalProperties: false, properties: { policyId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['policyId'] },
-            body: { type: 'object', additionalProperties: false, properties: { account_id: { type: 'string', minLength: 1, maxLength: 64 }, version: { type: 'integer', minimum: 1 } }, required: ['account_id'] },
+            params: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { policyId: { type: 'string', minLength: 1, maxLength: 64 } },
+              required: ['policyId'],
+            },
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                account_id: { type: 'string', minLength: 1, maxLength: 64 },
+                version: { type: 'integer', minimum: 1 },
+              },
+              required: ['account_id'],
+            },
           },
         },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
-          return management.activatePolicy(request.body.account_id, request.params.policyId, request.body.version)
+          return management.activatePolicy(
+            request.body.account_id,
+            request.params.policyId,
+            request.body.version,
+          )
         },
       )
 
@@ -1273,13 +1490,35 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       )
       app.post<{
         Params: { accountId: string; approvalId: string }
-        Body: { action: 'APPROVE' | 'REJECT' | 'EXPIRE'; actor_id: string; comment?: string; row_version: number }
+        Body: {
+          action: 'APPROVE' | 'REJECT' | 'EXPIRE'
+          actor_id: string
+          comment?: string
+          row_version: number
+        }
       }>(
         '/v2/accounts/:accountId/approvals/:approvalId/decision',
         {
           schema: {
-            params: { ...accountParams, properties: { ...accountParams.properties, approvalId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['accountId', 'approvalId'] },
-            body: { type: 'object', additionalProperties: false, properties: { action: { type: 'string', enum: ['APPROVE', 'REJECT', 'EXPIRE'] }, actor_id: { type: 'string', minLength: 1, maxLength: 255 }, comment: { type: 'string', maxLength: 500 }, row_version: { type: 'integer', minimum: 1 } }, required: ['action', 'actor_id', 'row_version'] },
+            params: {
+              ...accountParams,
+              properties: {
+                ...accountParams.properties,
+                approvalId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['accountId', 'approvalId'],
+            },
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                action: { type: 'string', enum: ['APPROVE', 'REJECT', 'EXPIRE'] },
+                actor_id: { type: 'string', minLength: 1, maxLength: 255 },
+                comment: { type: 'string', maxLength: 500 },
+                row_version: { type: 'integer', minimum: 1 },
+              },
+              required: ['action', 'actor_id', 'row_version'],
+            },
           },
         },
         async (request) => {
@@ -1290,7 +1529,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             action: request.body.action,
             actorId: request.body.actor_id,
             rowVersion: request.body.row_version,
-            ...(request.body.comment === undefined ? {} : { comment: request.body.comment }),
+            ...(request.body.comment === undefined
+              ? {}
+              : { comment: request.body.comment }),
           })
         },
       )
@@ -1300,18 +1541,50 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         { schema: { params: accountParams } },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
-          return { approved_destinations: await management.listApprovedDestinations(request.params.accountId) }
+          return {
+            approved_destinations: await management.listApprovedDestinations(
+              request.params.accountId,
+            ),
+          }
         },
       )
       app.post<{
         Params: { accountId: string }
-        Body: { fingerprint: string; rail: string; network: string; asset_reference: string; destination: string; actor_id: string; reason?: string }
+        Body: {
+          fingerprint: string
+          rail: string
+          network: string
+          asset_reference: string
+          destination: string
+          actor_id: string
+          reason?: string
+        }
       }>(
         '/v2/accounts/:accountId/approved-destinations',
         {
           schema: {
             params: accountParams,
-            body: { type: 'object', additionalProperties: false, properties: { fingerprint: { type: 'string', minLength: 1, maxLength: 64 }, rail: { type: 'string', minLength: 1, maxLength: 64 }, network: { type: 'string', minLength: 1, maxLength: 64 }, asset_reference: { type: 'string', minLength: 1, maxLength: 255 }, destination: { type: 'string', minLength: 1, maxLength: 255 }, actor_id: { type: 'string', minLength: 1, maxLength: 255 }, reason: { type: 'string', maxLength: 500 } }, required: ['fingerprint', 'rail', 'network', 'asset_reference', 'destination', 'actor_id'] },
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                fingerprint: { type: 'string', minLength: 1, maxLength: 64 },
+                rail: { type: 'string', minLength: 1, maxLength: 64 },
+                network: { type: 'string', minLength: 1, maxLength: 64 },
+                asset_reference: { type: 'string', minLength: 1, maxLength: 255 },
+                destination: { type: 'string', minLength: 1, maxLength: 255 },
+                actor_id: { type: 'string', minLength: 1, maxLength: 255 },
+                reason: { type: 'string', maxLength: 500 },
+              },
+              required: [
+                'fingerprint',
+                'rail',
+                'network',
+                'asset_reference',
+                'destination',
+                'actor_id',
+              ],
+            },
           },
         },
         async (request, reply) => {
@@ -1324,22 +1597,47 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             assetReference: request.body.asset_reference,
             destination: request.body.destination,
             actorId: request.body.actor_id,
-            ...(request.body.reason === undefined ? {} : { reason: request.body.reason }),
+            ...(request.body.reason === undefined
+              ? {}
+              : { reason: request.body.reason }),
           })
           return reply.code(201).send(destination)
         },
       )
-      app.post<{ Params: { accountId: string; destinationId: string }; Body: { actor_id: string; reason: string } }>(
+      app.post<{
+        Params: { accountId: string; destinationId: string }
+        Body: { actor_id: string; reason: string }
+      }>(
         '/v2/accounts/:accountId/approved-destinations/:destinationId/revoke',
         {
           schema: {
-            params: { ...accountParams, properties: { ...accountParams.properties, destinationId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['accountId', 'destinationId'] },
-            body: { type: 'object', additionalProperties: false, properties: { actor_id: { type: 'string', minLength: 1, maxLength: 255 }, reason: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['actor_id', 'reason'] },
+            params: {
+              ...accountParams,
+              properties: {
+                ...accountParams.properties,
+                destinationId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['accountId', 'destinationId'],
+            },
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                actor_id: { type: 'string', minLength: 1, maxLength: 255 },
+                reason: { type: 'string', minLength: 1, maxLength: 500 },
+              },
+              required: ['actor_id', 'reason'],
+            },
           },
         },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
-          await management.revokeApprovedDestination({ accountId: request.params.accountId, id: request.params.destinationId, actorId: request.body.actor_id, reason: request.body.reason })
+          await management.revokeApprovedDestination({
+            accountId: request.params.accountId,
+            id: request.params.destinationId,
+            actorId: request.body.actor_id,
+            reason: request.body.reason,
+          })
           return { status: 'REVOKED' }
         },
       )
@@ -1347,77 +1645,150 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       app.get<{ Params: { accountId: string }; Querystring: { route_id?: string } }>(
         '/v2/accounts/:accountId/funding-destination',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
           schema: {
             params: accountParams,
-            querystring: { type: 'object', additionalProperties: false, properties: { route_id: { type: 'string', minLength: 1, maxLength: 64 } } },
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { route_id: { type: 'string', minLength: 1, maxLength: 64 } },
+            },
           },
         },
         async (request) => {
           const account = requireAgentAccount(request)
-          if (account.account.id !== request.params.accountId) throw new ValidationError('Funding destination was not found')
-          return management.getFundingDestination(request.params.accountId, request.query.route_id)
+          if (account.account.id !== request.params.accountId)
+            throw new ValidationError('Funding destination was not found')
+          return management.getFundingDestination(
+            request.params.accountId,
+            request.query.route_id,
+          )
         },
       )
 
-      app.get<{ Params: { accountId: string }; Querystring: { denomination_id: string } }>(
+      app.get<{
+        Params: { accountId: string }
+        Querystring: { denomination_id: string }
+      }>(
         '/v2/accounts/:accountId/balance',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'balance:read'),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'balance:read'),
           schema: {
             params: accountParams,
-            querystring: { type: 'object', additionalProperties: false, properties: { denomination_id: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['denomination_id'] },
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['denomination_id'],
+            },
           },
         },
         async (request) => {
           const account = requireAgentAccount(request)
-          if (account.account.id !== request.params.accountId) throw new ValidationError('Account was not found')
-          return management.getBalance(request.params.accountId, request.query.denomination_id)
+          if (account.account.id !== request.params.accountId)
+            throw new ValidationError('Account was not found')
+          return management.getBalance(
+            request.params.accountId,
+            request.query.denomination_id,
+          )
         },
       )
       app.get<{ Querystring: { denomination_id: string } }>(
         '/v2/balance',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'balance:read'),
-          schema: { querystring: { type: 'object', additionalProperties: false, properties: { denomination_id: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['denomination_id'] } },
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'balance:read'),
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['denomination_id'],
+            },
+          },
         },
         async (request) => {
           const account = requireAgentAccount(request)
-          return management.getBalance(account.account.id, request.query.denomination_id)
+          return management.getBalance(
+            account.account.id,
+            request.query.denomination_id,
+          )
         },
       )
       app.get<{ Querystring: { route_id?: string } }>(
         '/v2/funding-destination',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
-          schema: { querystring: { type: 'object', additionalProperties: false, properties: { route_id: { type: 'string', minLength: 1, maxLength: 64 } } } },
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { route_id: { type: 'string', minLength: 1, maxLength: 64 } },
+            },
+          },
         },
         async (request) => {
           const account = requireAgentAccount(request)
-          return management.getFundingDestination(account.account.id, request.query.route_id)
+          return management.getFundingDestination(
+            account.account.id,
+            request.query.route_id,
+          )
         },
       )
       app.get<{ Querystring: { limit?: number; cursor?: string } }>(
         '/v2/history',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'history:read'),
-          schema: { querystring: { type: 'object', additionalProperties: false, properties: { limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 }, cursor: { type: 'string', minLength: 1 } } } },
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'history:read'),
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                cursor: { type: 'string', minLength: 1 },
+              },
+            },
+          },
         },
-        async (request) => management.listHistory(requireAgentAccount(request).account.id, request.query),
+        async (request) =>
+          management.listHistory(
+            requireAgentAccount(request).account.id,
+            request.query,
+          ),
       )
 
-      app.get<{ Params: { accountId: string }; Querystring: { limit?: number; cursor?: string } }>(
+      app.get<{
+        Params: { accountId: string }
+        Querystring: { limit?: number; cursor?: string }
+      }>(
         '/v2/accounts/:accountId/history',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'history:read'),
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'history:read'),
           schema: {
             params: accountParams,
-            querystring: { type: 'object', additionalProperties: false, properties: { limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 }, cursor: { type: 'string', minLength: 1 } } },
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                cursor: { type: 'string', minLength: 1 },
+              },
+            },
           },
         },
         async (request) => {
           const account = requireAgentAccount(request)
-          if (account.account.id !== request.params.accountId) throw new ValidationError('Account was not found')
+          if (account.account.id !== request.params.accountId)
+            throw new ValidationError('Account was not found')
           return management.listHistory(request.params.accountId, request.query)
         },
       )
@@ -1433,104 +1804,298 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       } as const
       app.post<{
         Params: { accountId: string }
-        Body: { amount?: string; denomination_id: string; reference?: string; expires_at?: string }
+        Body: {
+          amount?: string
+          denomination_id: string
+          reference?: string
+          expires_at?: string
+        }
       }>(
         '/v2/accounts/:accountId/receive-requests',
         {
           preHandler: async (request) => {
-            await authenticateAgentWithScope(request, accountRepository, 'receive:manage')
-            await enforceRateLimit(options.v2AdminRepository, request, 'receive:create', 120)
+            await authenticateAgentWithScope(
+              request,
+              accountRepository,
+              'receive:manage',
+            )
+            await enforceRateLimit(
+              options.v2AdminRepository,
+              request,
+              'receive:create',
+              120,
+            )
           },
           schema: {
             params: receiveParams,
             headers: {
               type: 'object',
-              properties: { 'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 } },
+              properties: {
+                'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+              },
               required: ['idempotency-key'],
             },
-            body: { type: 'object', additionalProperties: false, properties: { amount: { type: 'string', minLength: 1, maxLength: 256 }, denomination_id: { type: 'string', minLength: 1, maxLength: 64 }, reference: { type: 'string', minLength: 1, maxLength: 255 }, expires_at: { type: 'string', minLength: 1 } }, required: ['denomination_id'] },
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                amount: { type: 'string', minLength: 1, maxLength: 256 },
+                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
+                reference: { type: 'string', minLength: 1, maxLength: 255 },
+                expires_at: { type: 'string', minLength: 1 },
+              },
+              required: ['denomination_id'],
+            },
           },
         },
         async (request, reply) => {
           const account = requireAgentAccount(request)
-          if (account.account.id !== request.params.accountId) throw new ValidationError('Account was not found')
-          const result = await receive.createReceiveRequest(account.account.id, account.account.solanaPublicKey, { denominationId: request.body.denomination_id, ...(request.body.amount === undefined ? {} : { amount: request.body.amount }), ...(request.body.reference === undefined ? {} : { reference: request.body.reference }), ...(request.body.expires_at === undefined ? {} : { expiresAt: request.body.expires_at }) }, getIdempotencyKey(request))
+          if (account.account.id !== request.params.accountId)
+            throw new ValidationError('Account was not found')
+          const result = await receive.createReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            {
+              denominationId: request.body.denomination_id,
+              ...(request.body.amount === undefined
+                ? {}
+                : { amount: request.body.amount }),
+              ...(request.body.reference === undefined
+                ? {}
+                : { reference: request.body.reference }),
+              ...(request.body.expires_at === undefined
+                ? {}
+                : { expiresAt: request.body.expires_at }),
+            },
+            getIdempotencyKey(request),
+          )
           return reply.code(201).send(result)
         },
       )
       app.post<{
-        Body: { amount?: string; denomination_id: string; reference?: string; expires_at?: string }
+        Body: {
+          amount?: string
+          denomination_id: string
+          reference?: string
+          expires_at?: string
+        }
       }>(
         '/v2/receive-requests',
         {
           preHandler: async (request) => {
-            await authenticateAgentWithScope(request, accountRepository, 'receive:manage')
-            await enforceRateLimit(options.v2AdminRepository, request, 'receive:create', 120)
+            await authenticateAgentWithScope(
+              request,
+              accountRepository,
+              'receive:manage',
+            )
+            await enforceRateLimit(
+              options.v2AdminRepository,
+              request,
+              'receive:create',
+              120,
+            )
           },
           schema: {
             headers: {
               type: 'object',
-              properties: { 'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 } },
+              properties: {
+                'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+              },
               required: ['idempotency-key'],
             },
-            body: { type: 'object', additionalProperties: false, properties: { amount: { type: 'string', minLength: 1, maxLength: 256 }, denomination_id: { type: 'string', minLength: 1, maxLength: 64 }, reference: { type: 'string', minLength: 1, maxLength: 255 }, expires_at: { type: 'string', minLength: 1 } }, required: ['denomination_id'] },
+            body: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                amount: { type: 'string', minLength: 1, maxLength: 256 },
+                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
+                reference: { type: 'string', minLength: 1, maxLength: 255 },
+                expires_at: { type: 'string', minLength: 1 },
+              },
+              required: ['denomination_id'],
+            },
           },
         },
         async (request, reply) => {
           const account = requireAgentAccount(request)
-          const result = await receive.createReceiveRequest(account.account.id, account.account.solanaPublicKey, { denominationId: request.body.denomination_id, ...(request.body.amount === undefined ? {} : { amount: request.body.amount }), ...(request.body.reference === undefined ? {} : { reference: request.body.reference }), ...(request.body.expires_at === undefined ? {} : { expiresAt: request.body.expires_at }) }, getIdempotencyKey(request))
+          const result = await receive.createReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            {
+              denominationId: request.body.denomination_id,
+              ...(request.body.amount === undefined
+                ? {}
+                : { amount: request.body.amount }),
+              ...(request.body.reference === undefined
+                ? {}
+                : { reference: request.body.reference }),
+              ...(request.body.expires_at === undefined
+                ? {}
+                : { expiresAt: request.body.expires_at }),
+            },
+            getIdempotencyKey(request),
+          )
           return reply.code(201).send(result)
         },
       )
-      app.get<{ Params: { accountId: string } }>(
+      app.get<{
+        Params: { accountId: string }
+        Querystring: { limit?: number; cursor?: string }
+      }>(
         '/v2/accounts/:accountId/receive-requests',
-        { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'), schema: { params: receiveParams } },
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          schema: {
+            params: receiveParams,
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                cursor: { type: 'string', minLength: 1 },
+              },
+            },
+          },
+        },
         async (request) => {
           const account = requireAgentAccount(request)
-          if (account.account.id !== request.params.accountId) throw new ValidationError('Account was not found')
-          return { receive_requests: await receive.listReceiveRequests(account.account.id, account.account.solanaPublicKey) }
+          if (account.account.id !== request.params.accountId)
+            throw new ValidationError('Account was not found')
+          return receive.listReceiveRequestsPage(
+            account.account.id,
+            account.account.solanaPublicKey,
+            request.query,
+          )
         },
       )
       app.get<{ Params: { accountId: string; receiveId: string } }>(
         '/v2/accounts/:accountId/receive-requests/:receiveId',
-        { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'), schema: { params: { ...receiveParams, properties: { ...receiveParams.properties, receiveId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['accountId', 'receiveId'] } } },
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          schema: {
+            params: {
+              ...receiveParams,
+              properties: {
+                ...receiveParams.properties,
+                receiveId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['accountId', 'receiveId'],
+            },
+          },
+        },
         async (request) => {
           const account = requireAgentAccount(request)
-          if (account.account.id !== request.params.accountId) throw new ValidationError('Account was not found')
-          return receive.getReceiveRequest(account.account.id, account.account.solanaPublicKey, request.params.receiveId)
+          if (account.account.id !== request.params.accountId)
+            throw new ValidationError('Account was not found')
+          return receive.getReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            request.params.receiveId,
+          )
         },
       )
       app.post<{ Params: { accountId: string; receiveId: string } }>(
         '/v2/accounts/:accountId/receive-requests/:receiveId/cancel',
-        { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'), schema: { params: { ...receiveParams, properties: { ...receiveParams.properties, receiveId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['accountId', 'receiveId'] } } },
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          schema: {
+            params: {
+              ...receiveParams,
+              properties: {
+                ...receiveParams.properties,
+                receiveId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['accountId', 'receiveId'],
+            },
+          },
+        },
         async (request) => {
           const account = requireAgentAccount(request)
-          if (account.account.id !== request.params.accountId) throw new ValidationError('Account was not found')
-          return receive.cancelReceiveRequest(account.account.id, account.account.solanaPublicKey, request.params.receiveId)
+          if (account.account.id !== request.params.accountId)
+            throw new ValidationError('Account was not found')
+          return receive.cancelReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            request.params.receiveId,
+          )
         },
       )
       app.get<{ Querystring: { limit?: number; cursor?: string } }>(
         '/v2/receive-requests',
         {
-          preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
-          schema: { querystring: { type: 'object', additionalProperties: false, properties: { limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 }, cursor: { type: 'string', minLength: 1 } } } },
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                cursor: { type: 'string', minLength: 1 },
+              },
+            },
+          },
         },
-        async (request) => ({ receive_requests: await receive.listReceiveRequests(requireAgentAccount(request).account.id, requireAgentAccount(request).account.solanaPublicKey) }),
+        async (request) => {
+          const account = requireAgentAccount(request).account
+          return receive.listReceiveRequestsPage(
+            account.id,
+            account.solanaPublicKey,
+            request.query,
+          )
+        },
       )
       app.get<{ Params: { receiveId: string } }>(
         '/v2/receive-requests/:receiveId',
-        { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'), schema: { params: { type: 'object', additionalProperties: false, properties: { receiveId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['receiveId'] } } },
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          schema: {
+            params: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                receiveId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['receiveId'],
+            },
+          },
+        },
         async (request) => {
           const account = requireAgentAccount(request)
-          return receive.getReceiveRequest(account.account.id, account.account.solanaPublicKey, request.params.receiveId)
+          return receive.getReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            request.params.receiveId,
+          )
         },
       )
       app.post<{ Params: { receiveId: string } }>(
         '/v2/receive-requests/:receiveId/cancel',
-        { preHandler: async (request) => authenticateAgentWithScope(request, accountRepository, 'receive:manage'), schema: { params: { type: 'object', additionalProperties: false, properties: { receiveId: { type: 'string', minLength: 1, maxLength: 64 } }, required: ['receiveId'] } } },
+        {
+          preHandler: async (request) =>
+            authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
+          schema: {
+            params: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                receiveId: { type: 'string', minLength: 1, maxLength: 64 },
+              },
+              required: ['receiveId'],
+            },
+          },
+        },
         async (request) => {
           const account = requireAgentAccount(request)
-          return receive.cancelReceiveRequest(account.account.id, account.account.solanaPublicKey, request.params.receiveId)
+          return receive.cancelReceiveRequest(
+            account.account.id,
+            account.account.solanaPublicKey,
+            request.params.receiveId,
+          )
         },
       )
     }

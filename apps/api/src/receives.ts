@@ -108,7 +108,11 @@ export class ReceiveService {
     return requests.map((request) => serializeReceiveRequest(request, destination))
   }
 
-  public async cancelReceiveRequest(accountId: string, owner: string, receiveId: string) {
+  public async cancelReceiveRequest(
+    accountId: string,
+    owner: string,
+    receiveId: string,
+  ) {
     if (this.repository.cancelReceiveRequest === undefined) {
       throw new ValidationError('Receive cancellation is unavailable')
     }
@@ -139,8 +143,11 @@ export class V2ReceiveService {
     input: CreateV2ReceiveRequest,
     idempotencyKey?: string,
   ) {
-    const denominationRecord = await this.v2Repository.findDenomination(input.denominationId)
-    if (denominationRecord === null) throw new NotFoundError('Denomination was not found')
+    const denominationRecord = await this.v2Repository.findDenomination(
+      input.denominationId,
+    )
+    if (denominationRecord === null)
+      throw new NotFoundError('Denomination was not found')
     const denomination = createDenomination({
       id: denominationRecord.id,
       symbol: denominationRecord.symbol,
@@ -149,15 +156,21 @@ export class V2ReceiveService {
       version: denominationRecord.version,
     })
     const amount =
-      input.amount === undefined ? undefined : parseExactMoney(input.amount, denomination)
+      input.amount === undefined
+        ? undefined
+        : parseExactMoney(input.amount, denomination)
     const reference = input.reference?.trim() || createReceiveId()
     if (Buffer.byteLength(reference, 'utf8') > MAX_REFERENCE_BYTES) {
       throw new ValidationError(
         `Receive reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
       )
     }
-    const expiresAt = input.expiresAt === undefined ? undefined : new Date(input.expiresAt)
-    if (expiresAt !== undefined && (Number.isNaN(expiresAt.getTime()) || expiresAt <= this.now())) {
+    const expiresAt =
+      input.expiresAt === undefined ? undefined : new Date(input.expiresAt)
+    if (
+      expiresAt !== undefined &&
+      (Number.isNaN(expiresAt.getTime()) || expiresAt <= this.now())
+    ) {
       throw new ValidationError('Receive expiration must be a valid date')
     }
     const requestInput = {
@@ -208,8 +221,61 @@ export class V2ReceiveService {
     )
   }
 
+  public async listReceiveRequestsPage(
+    accountId: string,
+    owner: string,
+    input: { readonly limit?: number; readonly cursor?: string },
+  ) {
+    const limit = input.limit ?? 50
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new ValidationError(
+        'Receive request limit must be an integer from 1 to 100',
+      )
+    }
+    await this.repository.expireOpenReceiveRequests(accountId, this.now())
+    const destination = await this.rail.getReceiveDestination(owner)
+    const cursor = decodeReceiveCursor(input.cursor)
+    const records =
+      this.repository.listReceiveRequestsPage === undefined
+        ? await this.repository.listReceiveRequests(accountId)
+        : await this.repository.listReceiveRequestsPage(accountId, limit + 1, cursor)
+    const ordered =
+      this.repository.listReceiveRequestsPage === undefined
+        ? records
+            .filter(
+              (request) =>
+                cursor === undefined ||
+                request.createdAt < cursor.createdAt ||
+                (request.createdAt.getTime() === cursor.createdAt.getTime() &&
+                  request.id < cursor.id),
+            )
+            .sort(compareReceiveRequests)
+            .slice(0, limit + 1)
+        : records
+    const visible = ordered.slice(0, limit)
+    const last = visible.at(-1)
+    return {
+      receive_requests: await Promise.all(
+        visible.map(async (request) =>
+          serializeV2ReceiveRequest(
+            request,
+            destination,
+            request.denominationId === null || request.denominationId === undefined
+              ? null
+              : await this.loadDenomination(request.denominationId),
+          ),
+        ),
+      ),
+      next_cursor:
+        ordered.length > limit && last !== undefined ? encodeReceiveCursor(last) : null,
+    }
+  }
+
   public async getReceiveRequest(accountId: string, owner: string, receiveId: string) {
-    const request = await this.repository.findReceiveRequestForOwner(accountId, receiveId)
+    const request = await this.repository.findReceiveRequestForOwner(
+      accountId,
+      receiveId,
+    )
     if (request === null) throw new NotFoundError('Receive request was not found')
     const denomination =
       request.denominationId === null || request.denominationId === undefined
@@ -222,11 +288,19 @@ export class V2ReceiveService {
     )
   }
 
-  public async cancelReceiveRequest(accountId: string, owner: string, receiveId: string) {
+  public async cancelReceiveRequest(
+    accountId: string,
+    owner: string,
+    receiveId: string,
+  ) {
     if (this.repository.cancelReceiveRequest === undefined) {
       throw new DependencyUnavailableError('Receive cancellation is unavailable')
     }
-    const request = await this.repository.cancelReceiveRequest(accountId, receiveId, this.now())
+    const request = await this.repository.cancelReceiveRequest(
+      accountId,
+      receiveId,
+      this.now(),
+    )
     const denomination =
       request.denominationId === null || request.denominationId === undefined
         ? null
@@ -303,7 +377,9 @@ function serializeV2ReceiveRequest(
         ? null
         : denomination === null
           ? request.amountAtomic.toString()
-          : formatExactMoney(exactMoneyFromAtomicUnits(request.amountAtomic, denomination)),
+          : formatExactMoney(
+              exactMoneyFromAtomicUnits(request.amountAtomic, denomination),
+            ),
     denomination_id: request.denominationId ?? null,
     currency: request.currency,
     reference: request.reference,
@@ -320,5 +396,44 @@ function serializeV2ReceiveRequest(
       token_account: destination.tokenAccount,
       mint: destination.settlementMint,
     },
+  }
+}
+
+function compareReceiveRequests(
+  left: ReceiveRequestRecord,
+  right: ReceiveRequestRecord,
+): number {
+  const time = right.createdAt.getTime() - left.createdAt.getTime()
+  return time === 0 ? right.id.localeCompare(left.id) : time
+}
+
+function encodeReceiveCursor(request: ReceiveRequestRecord): string {
+  return Buffer.from(
+    JSON.stringify({ createdAt: request.createdAt.toISOString(), id: request.id }),
+  ).toString('base64url')
+}
+
+function decodeReceiveCursor(
+  value: string | undefined,
+): { readonly createdAt: Date; readonly id: string } | undefined {
+  if (value === undefined) return undefined
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      typeof (parsed as { createdAt?: unknown }).createdAt !== 'string' ||
+      typeof (parsed as { id?: unknown }).id !== 'string'
+    ) {
+      throw new Error('invalid cursor')
+    }
+    const createdAt = new Date((parsed as { createdAt: string }).createdAt)
+    const id = (parsed as { id: string }).id
+    if (Number.isNaN(createdAt.getTime()) || id.length === 0) {
+      throw new Error('invalid cursor')
+    }
+    return { createdAt, id }
+  } catch {
+    throw new ValidationError('Receive request cursor is invalid')
   }
 }
