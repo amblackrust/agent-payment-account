@@ -112,7 +112,7 @@ Requires admin authentication. Creates an active account, its managed Solana sig
 Request:
 
 ```json
-{"name":"research-agent"}
+{ "name": "research-agent" }
 ```
 
 Response:
@@ -128,7 +128,10 @@ Response:
     "id": "recv_...",
     "currency": "USD",
     "status": "OPEN",
-    "destination": {"type":"external_transfer_target","reference":"<spl-token-account>"},
+    "destination": {
+      "type": "external_transfer_target",
+      "reference": "<spl-token-account>"
+    },
     "settlement": {
       "owner": "<account-public-key>",
       "token_account": "<spl-token-account>",
@@ -383,14 +386,14 @@ Errors use this shape:
 
 `details` is optional. Messages for server-side failures are sanitized to `Internal Server Error`.
 
-| Status | Typical meaning |
-| --- | --- |
-| `400` | Fastify request-schema validation failed |
-| `401` | Admin or agent authentication failed |
-| `404` | An account-owned recipient, receive request, payment, or transaction was not found |
-| `409` | Insufficient available funds or conflicting idempotency/resource state |
-| `422` | Domain validation, recipient resolution, unsupported rail/currency/refund, or deterministic rail failure |
-| `502` | Retryable or ambiguous external rail failure |
-| `500` | Internal failure with a sanitized response |
+| Status | Typical meaning                                                                                          |
+| ------ | -------------------------------------------------------------------------------------------------------- |
+| `400`  | Fastify request-schema validation failed                                                                 |
+| `401`  | Admin or agent authentication failed                                                                     |
+| `404`  | An account-owned recipient, receive request, payment, or transaction was not found                       |
+| `409`  | Insufficient available funds or conflicting idempotency/resource state                                   |
+| `422`  | Domain validation, recipient resolution, unsupported rail/currency/refund, or deterministic rail failure |
+| `502`  | Retryable or ambiguous external rail failure                                                             |
+| `500`  | Internal failure with a sanitized response                                                               |
 
 For money operations, a transport failure can leave the outcome unknown. Retry with the same idempotency key or fetch the payment rather than creating a new logical operation.

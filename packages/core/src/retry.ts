@@ -20,7 +20,11 @@ export function classifyWorkFailure(
   if (error instanceof ExternalRailError) return classifyRailFailure(error.kind)
   if (isDomainError(error)) {
     if (error.code === 'CUSTODY_UNAVAILABLE') {
-      return { classification: 'CUSTODY_BOUNDED', reasonCode: error.code, retryable: true }
+      return {
+        classification: 'CUSTODY_BOUNDED',
+        reasonCode: error.code,
+        retryable: true,
+      }
     }
     if (
       error.code === 'VALIDATION_ERROR' ||
@@ -49,11 +53,23 @@ export function classifyWorkFailure(
 export function classifyRailFailure(kind: RailFailureKind): RetryDecision {
   switch (kind) {
     case 'DETERMINISTIC':
-      return { classification: 'NO_RETRY', reasonCode: 'RAIL_DETERMINISTIC_FAILURE', retryable: false }
+      return {
+        classification: 'NO_RETRY',
+        reasonCode: 'RAIL_DETERMINISTIC_FAILURE',
+        retryable: false,
+      }
     case 'AMBIGUOUS':
-      return { classification: 'AMBIGUOUS_RECONCILIATION', reasonCode: 'RAIL_OUTCOME_UNKNOWN', retryable: false }
+      return {
+        classification: 'AMBIGUOUS_RECONCILIATION',
+        reasonCode: 'RAIL_OUTCOME_UNKNOWN',
+        retryable: false,
+      }
     case 'RETRYABLE':
-      return { classification: 'TRANSIENT', reasonCode: 'RAIL_TRANSIENT_FAILURE', retryable: true }
+      return {
+        classification: 'TRANSIENT',
+        reasonCode: 'RAIL_TRANSIENT_FAILURE',
+        retryable: true,
+      }
   }
 }
 

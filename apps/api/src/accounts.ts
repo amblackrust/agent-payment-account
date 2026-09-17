@@ -113,11 +113,18 @@ export class AccountService {
       throw new ValidationError('Account name must contain 1 to 120 characters')
     }
     const requestHash = hashProvisioningRequest(normalizedName)
-    const replay = await this.v2Admin.findProvisioningReplay({ idempotencyKey, requestHash })
+    const replay = await this.v2Admin.findProvisioningReplay({
+      idempotencyKey,
+      requestHash,
+    })
     if (replay !== null) {
       const existingAccount = await this.v2Admin.findAccount(replay.accountId)
-      if (existingAccount === null) throw new Error('Provisioned account is unavailable')
-      await this.finishV2Provisioning(existingAccount.id, existingAccount.solanaPublicKey)
+      if (existingAccount === null)
+        throw new Error('Provisioned account is unavailable')
+      await this.finishV2Provisioning(
+        existingAccount.id,
+        existingAccount.solanaPublicKey,
+      )
       const envelope = await this.v2Admin.consumeRecoveryEnvelope(
         replay.accountId,
         idempotencyKey,
@@ -126,9 +133,7 @@ export class AccountService {
       if (envelope === null) {
         throw new ValidationError('Credential recovery window has expired')
       }
-      const apiKey = decodeOneTimeSecret(
-        this.recoveryCipher.decrypt(envelope),
-      )
+      const apiKey = decodeOneTimeSecret(this.recoveryCipher.decrypt(envelope))
       const account = await this.v2Admin.findAccount(replay.accountId)
       if (account === null) throw new Error('Provisioned account is unavailable')
       const requests = await this.repository.listReceiveRequests(account.id)
@@ -218,7 +223,9 @@ export class AccountService {
     }
     try {
       if (this.v2FundingProvisioner === undefined) {
-        throw new DependencyUnavailableError('Funding destination provisioning is unavailable')
+        throw new DependencyUnavailableError(
+          'Funding destination provisioning is unavailable',
+        )
       }
       await this.v2FundingProvisioner.provision({ accountId, owner })
       const current = await this.v2Admin.findAccount(accountId)
@@ -246,9 +253,7 @@ export class AccountService {
 }
 
 function hashProvisioningRequest(name: string): string {
-  return createHash('sha256')
-    .update(JSON.stringify({ name }), 'utf8')
-    .digest('hex')
+  return createHash('sha256').update(JSON.stringify({ name }), 'utf8').digest('hex')
 }
 
 function decodeOneTimeSecret(secret: Uint8Array): string {

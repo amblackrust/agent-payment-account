@@ -157,9 +157,10 @@ export interface V2ReceiveRequestAdminRecord {
 }
 
 export interface V2AdminRepository {
-  findProvisioningReplay(
-    input: { readonly idempotencyKey: string; readonly requestHash: string },
-  ): Promise<{ readonly accountId: string; readonly credentialId: string } | null>
+  findProvisioningReplay(input: {
+    readonly idempotencyKey: string
+    readonly requestHash: string
+  }): Promise<{ readonly accountId: string; readonly credentialId: string } | null>
   createReceiveRequestIdempotent(input: {
     readonly id: string
     readonly accountId: string
@@ -222,9 +223,7 @@ export interface V2AdminRepository {
     readonly recoveryExpiresAt: Date
   }): Promise<V2CredentialRecord>
   revokeCredential(accountId: string, credentialId: string): Promise<void>
-  listSpendPolicies(
-    accountId: string,
-  ): Promise<readonly V2SpendPolicyAdminRecord[]>
+  listSpendPolicies(accountId: string): Promise<readonly V2SpendPolicyAdminRecord[]>
   createSpendPolicy(input: {
     readonly id: string
     readonly accountId: string
@@ -303,7 +302,9 @@ export interface V2AdminRepository {
     readonly keyReference: string
     readonly rootKeyFingerprint: string
   }): Promise<V2CustodyKeyVersionRecord>
-  findActiveCustodyKeyVersion(accountId: string): Promise<V2CustodyKeyVersionRecord | null>
+  findActiveCustodyKeyVersion(
+    accountId: string,
+  ): Promise<V2CustodyKeyVersionRecord | null>
   createSigningRequest(input: {
     readonly id: string
     readonly paymentId: string
@@ -331,7 +332,11 @@ export interface V2AdminRepository {
     readonly windowSeconds: number
     readonly limit: number
     readonly now?: Date
-  }): Promise<{ readonly allowed: boolean; readonly count: number; readonly retryAt: Date }>
+  }): Promise<{
+    readonly allowed: boolean
+    readonly count: number
+    readonly retryAt: Date
+  }>
 }
 
 export interface V2ApprovedDestinationRecord {
@@ -414,7 +419,10 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             expiresAt: input.recoveryExpiresAt,
           },
         })
-        if (input.receiveRequestId !== undefined && input.receiveReference !== undefined) {
+        if (
+          input.receiveRequestId !== undefined &&
+          input.receiveReference !== undefined
+        ) {
           await transaction.receiveRequest.create({
             data: {
               id: input.receiveRequestId,
@@ -481,9 +489,15 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           data: {
             id: input.id,
             accountId: input.accountId,
-            ...(input.amountAtomic === undefined ? {} : { amountAtomic: input.amountAtomic }),
-            ...(input.denominationId === undefined ? {} : { denominationId: input.denominationId }),
-            ...(input.amountScale === undefined ? {} : { amountScale: input.amountScale }),
+            ...(input.amountAtomic === undefined
+              ? {}
+              : { amountAtomic: input.amountAtomic }),
+            ...(input.denominationId === undefined
+              ? {}
+              : { denominationId: input.denominationId }),
+            ...(input.amountScale === undefined
+              ? {}
+              : { amountScale: input.amountScale }),
             currency: input.currency,
             reference: input.reference,
             createdAt: input.createdAt,
@@ -545,7 +559,10 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           where: { id: input.accountId },
         })
         if (current === null) throw new NotFoundError('Agent account was not found')
-        if (current.status !== input.currentStatus || current.rowVersion !== input.rowVersion) {
+        if (
+          current.status !== input.currentStatus ||
+          current.rowVersion !== input.rowVersion
+        ) {
           throw new ConflictError('Account lifecycle changed concurrently')
         }
         const updated = await transaction.agentAccount.updateMany({
@@ -560,7 +577,11 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             ...(input.nextStatus === 'DISABLED'
               ? { disabledAt: new Date(), disabledReason: input.reason ?? null }
               : input.nextStatus === 'ACTIVE'
-                ? { disabledAt: null, disabledReason: null, provisioningFailureCode: null }
+                ? {
+                    disabledAt: null,
+                    disabledReason: null,
+                    provisioningFailureCode: null,
+                  }
                 : input.nextStatus === 'PROVISIONING_FAILED'
                   ? { provisioningFailureCode: input.reason ?? 'PROVISIONING_FAILED' }
                   : {}),
@@ -641,9 +662,14 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     async revokeCredential(accountId, credentialId) {
       const result = await prisma.apiCredential.updateMany({
         where: { id: credentialId, accountId, revokedAt: null },
-        data: { status: 'REVOKED', revokedAt: new Date(), rowVersion: { increment: 1 } },
+        data: {
+          status: 'REVOKED',
+          revokedAt: new Date(),
+          rowVersion: { increment: 1 },
+        },
       })
-      if (result.count !== 1) throw new NotFoundError('Credential was not found or already revoked')
+      if (result.count !== 1)
+        throw new NotFoundError('Credential was not found or already revoked')
     },
 
     async listSpendPolicies(accountId) {
@@ -685,7 +711,8 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           where: { id: policyId, accountId },
         })
         if (policy === null) throw new NotFoundError('Spend policy was not found')
-        if (policy.status !== 'DRAFT') throw new ConflictError('Only a DRAFT policy can be activated')
+        if (policy.status !== 'DRAFT')
+          throw new ConflictError('Only a DRAFT policy can be activated')
         if (rowVersion !== undefined && policy.version !== rowVersion) {
           throw new ConflictError('Spend policy version changed concurrently')
         }
@@ -755,7 +782,8 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             where: { id: input.accountId },
             select: { status: true },
           })
-          if (account.status !== 'ACTIVE') throw new InvalidStateError('Agent account is not active')
+          if (account.status !== 'ACTIVE')
+            throw new InvalidStateError('Agent account is not active')
           const reserved = await transaction.outgoingReservation.aggregate({
             where: {
               ownerAccountId: input.accountId,
@@ -764,7 +792,8 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             },
             _sum: { amountAtomic: true },
           })
-          const available = (input.settledAtomic ?? 0n) - (reserved._sum.amountAtomic ?? 0n)
+          const available =
+            (input.settledAtomic ?? 0n) - (reserved._sum.amountAtomic ?? 0n)
           if (payment.amountAtomic > available) throw new InsufficientFundsError()
           await transaction.outgoingReservation.create({
             data: {
@@ -798,7 +827,11 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           })
           await transaction.payment.update({
             where: { id: payment.id },
-            data: { status: 'ROUTING', executionState: 'QUEUED', rowVersion: { increment: 1 } },
+            data: {
+              status: 'ROUTING',
+              executionState: 'QUEUED',
+              rowVersion: { increment: 1 },
+            },
           })
         } else {
           await transaction.payment.update({
@@ -833,7 +866,10 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             actorId: input.actorId,
             source: 'V2_APPROVAL_ADMIN',
             occurredAt: now,
-            newStateJson: JSON.stringify({ status: nextStatus, payment_id: payment.id }),
+            newStateJson: JSON.stringify({
+              status: nextStatus,
+              payment_id: payment.id,
+            }),
           },
         })
         return toApprovalAdminRecord(updated)
@@ -870,7 +906,8 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
         where: { id: input.id, accountId: input.accountId, status: 'ACTIVE' },
         data: { status: 'REVOKED', revokedAt: new Date(), reason: input.reason },
       })
-      if (result.count !== 1) throw new NotFoundError('Approved destination was not found')
+      if (result.count !== 1)
+        throw new NotFoundError('Approved destination was not found')
     },
 
     async findFundingDestination(accountId, routeId) {
@@ -947,7 +984,10 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
               : {
                   OR: [
                     { confirmedAt: { lt: input.cursor.occurredAt } },
-                    { confirmedAt: input.cursor.occurredAt, id: { lt: input.cursor.id } },
+                    {
+                      confirmedAt: input.cursor.occurredAt,
+                      id: { lt: input.cursor.id },
+                    },
                   ],
                 }),
           },
@@ -1040,7 +1080,8 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
         where: { id, effectHash, status: 'PENDING' },
         data: { status, completedAt: new Date() },
       })
-      if (result.count !== 1) throw new ConflictError('Signing request changed concurrently')
+      if (result.count !== 1)
+        throw new ConflictError('Signing request changed concurrently')
       return toSigningRequestRecord(
         await prisma.signingRequest.findUniqueOrThrow({ where: { id } }),
       )

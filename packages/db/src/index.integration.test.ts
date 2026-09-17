@@ -411,14 +411,24 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         )
         expect(timestamps.rows[0]?.same).toBe(true)
       } finally {
-        await sql.query('UPDATE incoming_payments SET receive_request_id = NULL WHERE id = $1', [incomingId])
-        await sql.query('UPDATE receive_requests SET matched_incoming_payment_id = NULL WHERE id = $1', [receiveId])
+        await sql.query(
+          'UPDATE incoming_payments SET receive_request_id = NULL WHERE id = $1',
+          [incomingId],
+        )
+        await sql.query(
+          'UPDATE receive_requests SET matched_incoming_payment_id = NULL WHERE id = $1',
+          [receiveId],
+        )
         await sql.query('DELETE FROM receive_requests WHERE id = $1', [receiveId])
         await sql.query('DELETE FROM incoming_payments WHERE id = $1', [incomingId])
         await sql.query('DELETE FROM payment_attempts WHERE id = $1', [attemptId])
         await sql.query('DELETE FROM payments WHERE id = $1', [paymentId])
-        await sql.query('DELETE FROM api_credentials WHERE account_id = ANY($1)', [[payerId, merchantId]])
-        await sql.query('DELETE FROM agent_accounts WHERE id = ANY($1)', [[payerId, merchantId]])
+        await sql.query('DELETE FROM api_credentials WHERE account_id = ANY($1)', [
+          [payerId, merchantId],
+        ])
+        await sql.query('DELETE FROM agent_accounts WHERE id = ANY($1)', [
+          [payerId, merchantId],
+        ])
         await sql.end()
         await database.disconnect()
       }

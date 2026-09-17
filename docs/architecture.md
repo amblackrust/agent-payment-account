@@ -120,15 +120,15 @@ The platform fee payer is a different signer supplied through `SOLANA_FEE_PAYER_
 
 ## Data and State Boundaries
 
-| State | Location | Meaning |
-| --- | --- | --- |
-| Account identity and Solana public key | PostgreSQL | Off-chain account ownership and managed signer address |
-| Agent credential | Application receives plaintext once; PostgreSQL stores hash and prefix | Bearer authentication, rotation, and revocation |
-| Encrypted account signer | PostgreSQL | Custodial signing material protected by `WALLET_MASTER_KEY` |
-| Payment intent, attempts, idempotency, reservations | PostgreSQL | Durable workflow and recovery state |
-| Receive requests and reconciliation cursors | PostgreSQL | Expected incoming activity and scanner progress |
-| SPL token balances and transaction result | Solana | Settlement state observed through the configured RPC |
-| Platform fee-payer secret | Process environment | Network fee authority; not stored through the account repository |
+| State                                               | Location                                                               | Meaning                                                          |
+| --------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Account identity and Solana public key              | PostgreSQL                                                             | Off-chain account ownership and managed signer address           |
+| Agent credential                                    | Application receives plaintext once; PostgreSQL stores hash and prefix | Bearer authentication, rotation, and revocation                  |
+| Encrypted account signer                            | PostgreSQL                                                             | Custodial signing material protected by `WALLET_MASTER_KEY`      |
+| Payment intent, attempts, idempotency, reservations | PostgreSQL                                                             | Durable workflow and recovery state                              |
+| Receive requests and reconciliation cursors         | PostgreSQL                                                             | Expected incoming activity and scanner progress                  |
+| SPL token balances and transaction result           | Solana                                                                 | Settlement state observed through the configured RPC             |
+| Platform fee-payer secret                           | Process environment                                                    | Network fee authority; not stored through the account repository |
 
 Runtime metadata pins the configured rail version, cluster, settlement mint, and custody-key fingerprint. Startup validation prevents silently opening existing custody state with incompatible runtime configuration.
 
