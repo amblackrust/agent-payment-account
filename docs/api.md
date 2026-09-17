@@ -2,6 +2,18 @@
 
 The Mux API is served at `http://127.0.0.1:3000` by default. Domain request and response payloads use snake_case; errors use the envelope documented below. All responses include `x-request-id`.
 
+## Health and metrics
+
+- `GET /health/live` — process liveness only; it does not require the database
+  or settlement rail.
+- `GET /health/ready` — dependency readiness, including database and the
+  configured settlement rail/runtime gate.
+- `GET /health/domain` — durable workflow health and active domain alerts such
+  as review backlog, exhausted incoming issues, webhook backlog, restore
+  verification failure, and runtime identity mismatch.
+- `GET /metrics` — process metrics in Prometheus text format. These metrics are
+  operational telemetry; durable workflow state remains the source of truth.
+
 ## Authentication
 
 ### Admin authentication

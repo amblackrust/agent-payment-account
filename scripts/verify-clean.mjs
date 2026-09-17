@@ -40,6 +40,7 @@ try {
   run('pnpm', ['--filter', '@agent-payment/db', 'migrate:deploy'], {
     DATABASE_URL: databaseUrl,
   })
+  run('pnpm', ['format:check'])
   run('pnpm', ['lint'])
   run('pnpm', ['typecheck'])
   run('pnpm', ['test'], { DATABASE_URL: databaseUrl })
