@@ -40,6 +40,7 @@ import { V2ManagementService } from './v2-management.js'
 import { V2OperationsService } from './v2-operations.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { evaluateDomainAlerts } from './observability.js'
+import { waitForShutdown } from './lifecycle.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -267,11 +268,22 @@ async function startServer(): Promise<void> {
     if (reconciliationTimer !== undefined) clearInterval(reconciliationTimer)
     incomingReconciliation?.stop()
     v2OutgoingRuntime?.worker.stop()
-    await Promise.all([
-      incomingReconciliation?.drain(),
-      v2OutgoingRuntime?.worker.drain(),
-    ])
-    await database.disconnect()
+    try {
+      await waitForShutdown(
+        Promise.all([
+          incomingReconciliation?.drain(),
+          v2OutgoingRuntime?.worker.drain(),
+        ]).then(() => undefined),
+        limits.shutdownTimeoutMs,
+        () =>
+          app.log.warn(
+            { shutdownTimeoutMs: limits.shutdownTimeoutMs },
+            'API shutdown deadline reached; durable leases will be reclaimed',
+          ),
+      )
+    } finally {
+      await database.disconnect()
+    }
   })
 
   let shutdownPromise: Promise<void> | undefined
@@ -302,7 +314,7 @@ async function startServer(): Promise<void> {
     await runtimeReadiness.checkReadiness()
     if (legacyRuntimeEnabled) {
       runWorkers()
-      reconciliationTimer = setInterval(runWorkers, 5_000)
+      reconciliationTimer = setInterval(runWorkers, limits.workerIntervalMs)
     }
     await app.listen({ host: '0.0.0.0', port: config.port })
     app.log.info({ config: redactConfig(config) }, 'API started')

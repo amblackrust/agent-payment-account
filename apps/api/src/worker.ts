@@ -31,8 +31,8 @@ import {
 } from './custody.js'
 import type { V2OutgoingWorker } from './outgoing-v2.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
+import { waitForShutdown } from './lifecycle.js'
 
-const WORKER_INTERVAL_MS = 5_000
 const execFileAsync = promisify(execFile)
 
 interface RuntimeWorker {
@@ -302,8 +302,16 @@ async function startWorker(): Promise<void> {
   app.addHook('onClose', async () => {
     if (timer !== undefined) clearInterval(timer)
     worker.stop()
-    await worker.drain()
-    await database.disconnect()
+    try {
+      await waitForShutdown(worker.drain(), limits.shutdownTimeoutMs, () =>
+        app.log.warn(
+          { shutdownTimeoutMs: limits.shutdownTimeoutMs },
+          'Worker shutdown deadline reached; durable leases will be reclaimed',
+        ),
+      )
+    } finally {
+      await database.disconnect()
+    }
   })
 
   let shutdownPromise: Promise<void> | undefined
@@ -330,7 +338,7 @@ async function startWorker(): Promise<void> {
     await v2OutgoingRuntime?.checkReadiness()
     await app.listen({ host: '0.0.0.0', port: config.port })
     runWorker()
-    timer = setInterval(runWorker, WORKER_INTERVAL_MS)
+    timer = setInterval(runWorker, limits.workerIntervalMs)
     app.log.info(
       { config: redactConfig(config), role: config.runtimeRole },
       'Worker started',

@@ -48,10 +48,11 @@ settlement dependency readiness, and `/health/domain` for workflow backlog and
 dependency degradation. Worker processes expose the same endpoints while their
 worker health is included in domain checks.
 
-On shutdown, stop accepting work, stop the claim loop, drain the current safe
-step, and close the Fastify and database resources. If a worker cannot finish a
-durable step, its lease must expire and be recoverable by another worker; no
-recovery-critical state may exist only in memory.
+On shutdown, stop accepting work, stop the claim loop, and drain the current
+safe step up to `SHUTDOWN_TIMEOUT_MS` (default `30000`). After that deadline,
+close the database and let durable leases expire for recovery by another
+worker; no recovery-critical state may exist only in memory. The claim cadence
+is controlled by `WORKER_INTERVAL_MS` (default `5000`).
 
 ## Promotion and restore gate
 

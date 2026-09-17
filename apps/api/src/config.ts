@@ -5,7 +5,9 @@ const positiveInt = (defaultValue: number, maximum: number) =>
 
 export interface RuntimeLimits {
   readonly workerBatchSize: number
+  readonly workerIntervalMs: number
   readonly workerLeaseSeconds: number
+  readonly shutdownTimeoutMs: number
   readonly incomingAccountConcurrency: number
   readonly requestRateLimitWindowSeconds: number
   readonly paymentRateLimitPerWindow: number
@@ -25,7 +27,9 @@ export interface RuntimeLimits {
 
 export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = {
   workerBatchSize: 10,
+  workerIntervalMs: 5_000,
   workerLeaseSeconds: 30,
+  shutdownTimeoutMs: 30_000,
   incomingAccountConcurrency: 8,
   requestRateLimitWindowSeconds: 60,
   paymentRateLimitPerWindow: 60,
@@ -85,7 +89,9 @@ const configSchema = z.object({
   CUSTODY_BACKEND_IDENTITY: z.string().trim().min(1).optional(),
   CUSTODY_BACKEND_MODE: z.enum(['EXTERNAL', 'LOCAL_TEST']).optional(),
   WORKER_BATCH_SIZE: positiveInt(DEFAULT_RUNTIME_LIMITS.workerBatchSize, 1_000),
+  WORKER_INTERVAL_MS: positiveInt(DEFAULT_RUNTIME_LIMITS.workerIntervalMs, 300_000),
   WORKER_LEASE_SECONDS: positiveInt(DEFAULT_RUNTIME_LIMITS.workerLeaseSeconds, 3_600),
+  SHUTDOWN_TIMEOUT_MS: positiveInt(DEFAULT_RUNTIME_LIMITS.shutdownTimeoutMs, 300_000),
   INCOMING_ACCOUNT_CONCURRENCY: positiveInt(
     DEFAULT_RUNTIME_LIMITS.incomingAccountConcurrency,
     1_000,
@@ -331,7 +337,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     allowMainnet: result.data.ALLOW_MAINNET,
     limits: {
       workerBatchSize: result.data.WORKER_BATCH_SIZE,
+      workerIntervalMs: result.data.WORKER_INTERVAL_MS,
       workerLeaseSeconds: result.data.WORKER_LEASE_SECONDS,
+      shutdownTimeoutMs: result.data.SHUTDOWN_TIMEOUT_MS,
       incomingAccountConcurrency: result.data.INCOMING_ACCOUNT_CONCURRENCY,
       requestRateLimitWindowSeconds: result.data.REQUEST_RATE_LIMIT_WINDOW_SECONDS,
       paymentRateLimitPerWindow: result.data.PAYMENT_RATE_LIMIT_PER_WINDOW,
