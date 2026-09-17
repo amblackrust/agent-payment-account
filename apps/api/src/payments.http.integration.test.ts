@@ -19,6 +19,7 @@ const testConfig: AppConfig = {
   databaseUrl: databaseUrl ?? 'postgresql://postgres:postgres@localhost:5432/test',
   port: 3000,
   nodeEnv: 'test',
+  runtimeRole: 'all',
   adminApiKey: 'test-admin-key',
   solanaRpcUrl: 'http://127.0.0.1:8899',
   solanaCluster: 'localnet',

@@ -687,6 +687,8 @@ export interface RuntimeIdentity {
   readonly cluster: string
   readonly settlementMint: string
   readonly custodyKeyFingerprint: string
+  readonly custodyBackendIdentity?: string
+  readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
 }
 
 async function matchIncomingPaymentInTransaction(

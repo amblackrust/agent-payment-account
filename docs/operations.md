@@ -1,0 +1,61 @@
+# Operations
+
+## Runtime roles
+
+Production starts with one explicit `RUNTIME_ROLE`: `api`, `outgoing`,
+`incoming`, `webhook`, or `maintenance`. The API role does not load the
+platform fee-payer secret or mount the legacy payment signer. Development may
+use `RUNTIME_ROLE=all` for the local compatibility runtime.
+
+Run the API and a dedicated worker from the API package after building:
+
+```bash
+pnpm --filter @agent-payment/api build
+RUNTIME_ROLE=api pnpm --filter @agent-payment/api start
+RUNTIME_ROLE=incoming pnpm --filter @agent-payment/api start:worker
+RUNTIME_ROLE=outgoing pnpm --filter @agent-payment/api start:worker
+RUNTIME_ROLE=webhook pnpm --filter @agent-payment/api start:worker
+```
+
+Use separate service identities and secret-manager-injected environments for
+each deployment. Worker leases are durable; stopping a worker allows its
+claims to expire and be recovered by another worker.
+
+## Health
+
+- `GET /health/live` checks only that the process is serving requests.
+- `GET /health/ready` checks PostgreSQL and configured settlement dependencies.
+- `GET /health/domain` reports worker/dependency degradation separately from
+  process liveness.
+- `GET /metrics` exposes low-cardinality process metrics. Resource IDs and
+  secrets are intentionally excluded from metric labels.
+
+## Encrypted backup and verified restore
+
+Backups require `pg_dump` and `age`. The database URL and age material are
+read only from environment variables; private custody keys are not exported
+into the dump.
+
+Create an encrypted custom-format backup:
+
+```bash
+BACKUP_AGE_RECIPIENT='age1...' \
+  pnpm backup:create -- .local/backups/mux-$(date -u +%Y%m%dT%H%M%SZ).dump.age
+```
+
+Restore into an isolated PostgreSQL database and validate required tables,
+runtime identity, payment-attempt links, and the no-terminal-held-reservation
+invariant:
+
+```bash
+BACKUP_AGE_IDENTITY=/secure/restore/age-key.txt \
+BACKUP_VERIFY_DATABASE_URL='postgresql://.../mux_restore' \
+BACKUP_VERIFY_ENVIRONMENT=isolated-restore \
+  pnpm backup:verify -- .local/backups/mux-20260917T000000Z.dump.age
+```
+
+Do not point verification at production. A restored environment must remain
+non-authoritative until its runtime identity and custody configuration are
+validated. Start incoming reconciliation first, inspect the durable
+`backup_restore_verifications` record, and only then enable outgoing workers.
+Exact RPO/RTO and retention values remain workload/risk decisions (OD-008).

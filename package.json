@@ -24,6 +24,8 @@
     "db:migrate": "node scripts/run-with-root-env.mjs pnpm --filter @agent-payment/db migrate:dev",
     "db:migrate:deploy": "node scripts/run-with-root-env.mjs pnpm --filter @agent-payment/db migrate:deploy",
     "db:validate": "node scripts/run-with-root-env.mjs pnpm --filter @agent-payment/db prisma:validate",
+    "backup:create": "node scripts/backup-verify.mjs backup",
+    "backup:verify": "node scripts/backup-verify.mjs verify",
     "local:setup": "node scripts/local.mjs setup",
     "local:status": "node scripts/local.mjs status",
     "local:down": "node scripts/local.mjs down"

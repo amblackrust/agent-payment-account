@@ -47,6 +47,7 @@ const testConfig: AppConfig = {
     'postgresql://postgres:postgres@127.0.0.1:5432/agent_payment_account',
   port: 0,
   nodeEnv: 'test',
+  runtimeRole: 'all',
   adminApiKey: 'test-admin-key',
   solanaRpcUrl: 'http://surfpool.local',
   solanaCluster: 'localnet',

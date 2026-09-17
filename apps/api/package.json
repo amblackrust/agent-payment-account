@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "pnpm --filter @agent-payment/api... build && tsx watch src/server.ts",
+    "dev:worker": "pnpm --filter @agent-payment/api... build && tsx watch src/worker.ts",
     "start": "node dist/server.js",
+    "start:worker": "node dist/worker.js",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

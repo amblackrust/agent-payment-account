@@ -11,7 +11,7 @@ import { DependencyUnavailableError, ExternalRailError } from '@agent-payment/co
 
 import { buildApp } from './app.js'
 import { AccountService } from './accounts.js'
-import { loadConfig, redactConfig } from './config.js'
+import { ConfigurationError, loadConfig, redactConfig } from './config.js'
 import {
   fingerprintWalletMasterKey,
   validateLegacyWalletCustody,
@@ -34,6 +34,12 @@ const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
+  if (config.runtimeRole !== 'api' && config.runtimeRole !== 'all') {
+    throw new ConfigurationError(
+      `RUNTIME_ROLE=${config.runtimeRole} must use the dedicated worker entrypoint`,
+    )
+  }
+  const legacyRuntimeEnabled = config.runtimeRole === 'all'
   const database = createDatabaseClient(config.databaseUrl)
   const rail = createSolanaRail({
     rpcUrl: config.solanaRpcUrl,
@@ -50,11 +56,20 @@ async function startServer(): Promise<void> {
       cluster: config.solanaCluster,
       settlementMint: config.solanaSettlementMint,
       custodyKeyFingerprint: fingerprintWalletMasterKey(config.walletMasterKey),
+      ...(config.custodyBackendIdentity === undefined
+        ? {}
+        : { custodyBackendIdentity: config.custodyBackendIdentity }),
+      ...(config.custodyBackendMode === undefined
+        ? {}
+        : { custodyBackendMode: config.custodyBackendMode }),
     },
     (custody) => validateLegacyWalletCustody(walletCipher, custody),
   )
   const fundingProvisioner = {
-    provision: async (input: { readonly accountId: string; readonly owner: string }) => {
+    provision: async (input: {
+      readonly accountId: string
+      readonly owner: string
+    }) => {
       const routes = await database.v2.listActiveSettlementRoutes()
       const route = routes[0]
       if (route === undefined) {
@@ -62,7 +77,9 @@ async function startServer(): Promise<void> {
       }
       const asset = await database.v2.findSettlementAsset(route.settlementAssetId)
       if (asset === null) {
-        throw new DependencyUnavailableError('Settlement asset configuration is unavailable')
+        throw new DependencyUnavailableError(
+          'Settlement asset configuration is unavailable',
+        )
       }
       const destination = await rail.getReceiveDestination(input.owner)
       await database.v2Admin.upsertFundingDestination({
@@ -92,37 +109,52 @@ async function startServer(): Promise<void> {
   )
   const recipientService = new RecipientService(database)
   const receiveService = new ReceiveService(database, rail)
-  const v2ReceiveService = new V2ReceiveService(database, database.v2, database.v2Admin, rail)
-  const payerSecretKeyProvider = async (accountId: string): Promise<Uint8Array> => {
-    const custody = await database.findAccountCustody(accountId)
-    if (custody === null) {
-      throw new ExternalRailError('Payer account custody is unavailable')
-    }
-    const secret = walletCipher.decrypt({
-      ciphertext: custody.encryptedSolanaSecret,
-      nonce: custody.encryptionNonce,
-      authTag: custody.encryptionAuthTag,
-    })
-    return secret
-  }
-  const paymentRail = createSolanaPaymentRail({
-    rpcUrl: config.solanaRpcUrl,
-    expectedCluster: config.solanaCluster,
-    allowMainnet: config.allowMainnet,
-    settlementMint: config.solanaSettlementMint,
-    feePayerSecret: config.solanaFeePayerSecret,
-  })
-  const paymentService = new PaymentService(
+  const v2ReceiveService = new V2ReceiveService(
     database,
+    database.v2,
+    database.v2Admin,
     rail,
-    [paymentRail],
-    payerSecretKeyProvider,
-    undefined,
-    {
-      maxLamportsPerDay: SPONSORSHIP_MAX_LAMPORTS_PER_DAY,
-      maxTransactionsPerHour: SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR,
-    },
   )
+  let paymentRail: ReturnType<typeof createSolanaPaymentRail> | undefined
+  let paymentService: PaymentService | undefined
+  if (legacyRuntimeEnabled) {
+    const feePayerSecret = config.solanaFeePayerSecret
+    if (feePayerSecret === undefined) {
+      throw new ConfigurationError(
+        'SOLANA_FEE_PAYER_SECRET is required for the development all-in-one runtime',
+      )
+    }
+    const payerSecretKeyProvider = async (accountId: string): Promise<Uint8Array> => {
+      const custody = await database.findAccountCustody(accountId)
+      if (custody === null) {
+        throw new ExternalRailError('Payer account custody is unavailable')
+      }
+      const secret = walletCipher.decrypt({
+        ciphertext: custody.encryptedSolanaSecret,
+        nonce: custody.encryptionNonce,
+        authTag: custody.encryptionAuthTag,
+      })
+      return secret
+    }
+    paymentRail = createSolanaPaymentRail({
+      rpcUrl: config.solanaRpcUrl,
+      expectedCluster: config.solanaCluster,
+      allowMainnet: config.allowMainnet,
+      settlementMint: config.solanaSettlementMint,
+      feePayerSecret,
+    })
+    paymentService = new PaymentService(
+      database,
+      rail,
+      [paymentRail],
+      payerSecretKeyProvider,
+      undefined,
+      {
+        maxLamportsPerDay: SPONSORSHIP_MAX_LAMPORTS_PER_DAY,
+        maxTransactionsPerHour: SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR,
+      },
+    )
+  }
   const transactionService = new TransactionService(database)
   const v2PaymentService = new V2PaymentService({
     repository: database.v2,
@@ -168,7 +200,7 @@ async function startServer(): Promise<void> {
     checkReadiness: async (): Promise<void> => {
       await database.checkReadiness()
       await rail.checkReadiness?.()
-      await paymentRail.checkReadiness?.()
+      await paymentRail?.checkReadiness?.()
     },
   }
   const app = buildApp({
@@ -178,7 +210,7 @@ async function startServer(): Promise<void> {
     accountService,
     solanaRail: rail,
     recipientService,
-    paymentService,
+    ...(paymentService === undefined ? {} : { paymentService }),
     reservationRepository: database,
     receiveService,
     v2ReceiveService,
@@ -187,29 +219,56 @@ async function startServer(): Promise<void> {
     v2ManagementService,
     v2OperationsService,
     v2AdminRepository: database.v2Admin,
+    domainHealthDependency: {
+      checkDomainHealth: async () => {
+        const health = await database.v2Operations.getDomainHealth?.()
+        if (health === undefined) return { status: 'ok', checks: {} }
+        const checks = {
+          review_required:
+            health.reviewRequiredPayments === 0
+              ? ('ok' as const)
+              : ('degraded' as const),
+          incoming_issues:
+            health.exhaustedIncomingIssues === 0
+              ? ('ok' as const)
+              : ('degraded' as const),
+          webhooks:
+            health.pendingWebhookDeliveries === 0
+              ? ('ok' as const)
+              : ('degraded' as const),
+        }
+        return {
+          status: Object.values(checks).includes('degraded')
+            ? ('degraded' as const)
+            : ('ok' as const),
+          checks,
+        }
+      },
+    },
   })
-  paymentService.setEventSink({
+  paymentService?.setEventSink({
     info: (data, message) => app.log.info(data, message),
   })
-  const incomingReconciliation = new IncomingReconciliationService(
-    database,
-    incomingReader,
-    { error: (data, message) => app.log.error(data, message) },
-  )
-  const outgoingReconciliation = new OutgoingPaymentReconciliationService(
-    database,
-    paymentService,
-    { info: (data, message) => app.log.info(data, message) },
-  )
+  const incomingReconciliation = legacyRuntimeEnabled
+    ? new IncomingReconciliationService(database, incomingReader, {
+        error: (data, message) => app.log.error(data, message),
+      })
+    : undefined
+  const outgoingReconciliation =
+    legacyRuntimeEnabled && paymentService !== undefined
+      ? new OutgoingPaymentReconciliationService(database, paymentService, {
+          info: (data, message) => app.log.info(data, message),
+        })
+      : undefined
 
   const runWorkers = (): void => {
-    void incomingReconciliation.runOnce().catch((error: unknown) => {
+    void incomingReconciliation?.runOnce().catch((error: unknown) => {
       app.log.error(
         { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
         'Incoming reconciliation loop failed',
       )
     })
-    void outgoingReconciliation.runOnce().catch((error: unknown) => {
+    void outgoingReconciliation?.runOnce().catch((error: unknown) => {
       app.log.error(
         { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
         'Outgoing reconciliation loop failed',
@@ -219,9 +278,12 @@ async function startServer(): Promise<void> {
   let reconciliationTimer: NodeJS.Timeout | undefined
   app.addHook('onClose', async () => {
     if (reconciliationTimer !== undefined) clearInterval(reconciliationTimer)
-    incomingReconciliation.stop()
-    outgoingReconciliation.stop()
-    await Promise.all([incomingReconciliation.drain(), outgoingReconciliation.drain()])
+    incomingReconciliation?.stop()
+    outgoingReconciliation?.stop()
+    await Promise.all([
+      incomingReconciliation?.drain(),
+      outgoingReconciliation?.drain(),
+    ])
     await database.disconnect()
   })
 
@@ -251,8 +313,10 @@ async function startServer(): Promise<void> {
 
   try {
     await runtimeReadiness.checkReadiness()
-    runWorkers()
-    reconciliationTimer = setInterval(runWorkers, 5_000)
+    if (legacyRuntimeEnabled) {
+      runWorkers()
+      reconciliationTimer = setInterval(runWorkers, 5_000)
+    }
     await app.listen({ host: '0.0.0.0', port: config.port })
     app.log.info({ config: redactConfig(config) }, 'API started')
   } catch (error) {

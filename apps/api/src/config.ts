@@ -10,7 +10,7 @@ const configSchema = z.object({
     .enum(['localnet', 'devnet', 'testnet', 'mainnet-beta'])
     .default('localnet'),
   SOLANA_SETTLEMENT_MINT: z.string().min(1, 'SOLANA_SETTLEMENT_MINT is required'),
-  SOLANA_FEE_PAYER_SECRET: z.string().min(1, 'SOLANA_FEE_PAYER_SECRET is required'),
+  SOLANA_FEE_PAYER_SECRET: z.string().min(1).optional(),
   WALLET_MASTER_KEY: z
     .string()
     .regex(
@@ -23,6 +23,16 @@ const configSchema = z.object({
       /^[0-9a-fA-F]{64}$/,
       'RECOVERY_ENVELOPE_KEY must be 32 bytes encoded as 64 hexadecimal characters',
     ),
+  RUNTIME_ROLE: z
+    .enum(['api', 'outgoing', 'incoming', 'webhook', 'maintenance', 'all'])
+    .optional(),
+  WEBHOOK_SIGNING_KEYS_JSON: z.string().min(1).optional(),
+  BACKUP_AGE_RECIPIENT: z.string().min(1).optional(),
+  BACKUP_AGE_IDENTITY: z.string().min(1).optional(),
+  BACKUP_VERIFY_DATABASE_URL: z.string().trim().min(1).optional(),
+  BACKUP_OUTPUT_DIRECTORY: z.string().trim().min(1).optional(),
+  CUSTODY_BACKEND_IDENTITY: z.string().trim().min(1).optional(),
+  CUSTODY_BACKEND_MODE: z.enum(['EXTERNAL', 'LOCAL_TEST']).optional(),
   ALLOW_MAINNET: z.preprocess((value: unknown) => {
     if (value === undefined) {
       return false
@@ -37,17 +47,28 @@ const configSchema = z.object({
   }, z.boolean()),
 })
 
+export type RuntimeRole =
+  'api' | 'outgoing' | 'incoming' | 'webhook' | 'maintenance' | 'all'
+
 export type AppConfig = {
   readonly databaseUrl: string
   readonly port: number
   readonly nodeEnv: 'development' | 'test' | 'production'
+  readonly runtimeRole: RuntimeRole
   readonly adminApiKey: string
   readonly solanaRpcUrl: string
   readonly solanaCluster: 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
   readonly solanaSettlementMint: string
-  readonly solanaFeePayerSecret: string
+  readonly solanaFeePayerSecret: string | undefined
   readonly walletMasterKey: string
   readonly recoveryEnvelopeKey: string
+  readonly webhookSigningKeysJson?: string
+  readonly backupAgeRecipient?: string
+  readonly backupAgeIdentity?: string
+  readonly backupVerifyDatabaseUrl?: string
+  readonly backupOutputDirectory?: string
+  readonly custodyBackendIdentity?: string
+  readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
   readonly allowMainnet: boolean
 }
 
@@ -75,10 +96,56 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     )
   }
 
+  if (result.data.NODE_ENV === 'production' && result.data.RUNTIME_ROLE === undefined) {
+    throw new ConfigurationError(
+      'Production requires an explicit runtime role in RUNTIME_ROLE',
+    )
+  }
+  const runtimeRole: RuntimeRole = result.data.RUNTIME_ROLE ?? 'all'
+  if (result.data.NODE_ENV === 'production' && runtimeRole === 'all') {
+    throw new ConfigurationError(
+      'Production must select an explicit runtime role; RUNTIME_ROLE=all is development-only',
+    )
+  }
+  if (
+    (runtimeRole === 'outgoing' || runtimeRole === 'all') &&
+    result.data.SOLANA_FEE_PAYER_SECRET === undefined
+  ) {
+    throw new ConfigurationError(
+      'SOLANA_FEE_PAYER_SECRET is required for the outgoing runtime role',
+    )
+  }
+  if (
+    result.data.NODE_ENV === 'production' &&
+    (result.data.CUSTODY_BACKEND_IDENTITY === undefined ||
+      result.data.CUSTODY_BACKEND_MODE !== 'EXTERNAL')
+  ) {
+    throw new ConfigurationError(
+      'Production requires an explicitly configured external custody backend',
+    )
+  }
+  if (
+    runtimeRole === 'maintenance' &&
+    result.data.BACKUP_OUTPUT_DIRECTORY === undefined
+  ) {
+    throw new ConfigurationError(
+      'BACKUP_OUTPUT_DIRECTORY is required for the maintenance runtime role',
+    )
+  }
+  if (
+    (result.data.BACKUP_AGE_IDENTITY === undefined) !==
+    (result.data.BACKUP_VERIFY_DATABASE_URL === undefined)
+  ) {
+    throw new ConfigurationError(
+      'BACKUP_AGE_IDENTITY and BACKUP_VERIFY_DATABASE_URL must be configured together',
+    )
+  }
+
   return {
     databaseUrl: result.data.DATABASE_URL,
     port: result.data.PORT,
     nodeEnv: result.data.NODE_ENV,
+    runtimeRole,
     adminApiKey: result.data.ADMIN_API_KEY,
     solanaRpcUrl: result.data.SOLANA_RPC_URL,
     solanaCluster: result.data.SOLANA_CLUSTER,
@@ -86,6 +153,27 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     solanaFeePayerSecret: result.data.SOLANA_FEE_PAYER_SECRET,
     walletMasterKey: result.data.WALLET_MASTER_KEY,
     recoveryEnvelopeKey: result.data.RECOVERY_ENVELOPE_KEY,
+    ...(result.data.WEBHOOK_SIGNING_KEYS_JSON === undefined
+      ? {}
+      : { webhookSigningKeysJson: result.data.WEBHOOK_SIGNING_KEYS_JSON }),
+    ...(result.data.BACKUP_AGE_RECIPIENT === undefined
+      ? {}
+      : { backupAgeRecipient: result.data.BACKUP_AGE_RECIPIENT }),
+    ...(result.data.BACKUP_AGE_IDENTITY === undefined
+      ? {}
+      : { backupAgeIdentity: result.data.BACKUP_AGE_IDENTITY }),
+    ...(result.data.BACKUP_VERIFY_DATABASE_URL === undefined
+      ? {}
+      : { backupVerifyDatabaseUrl: result.data.BACKUP_VERIFY_DATABASE_URL }),
+    ...(result.data.BACKUP_OUTPUT_DIRECTORY === undefined
+      ? {}
+      : { backupOutputDirectory: result.data.BACKUP_OUTPUT_DIRECTORY }),
+    ...(result.data.CUSTODY_BACKEND_IDENTITY === undefined
+      ? {}
+      : { custodyBackendIdentity: result.data.CUSTODY_BACKEND_IDENTITY }),
+    ...(result.data.CUSTODY_BACKEND_MODE === undefined
+      ? {}
+      : { custodyBackendMode: result.data.CUSTODY_BACKEND_MODE }),
     allowMainnet: result.data.ALLOW_MAINNET,
   }
 }
@@ -93,6 +181,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
 export interface RedactedConfig {
   readonly port: number
   readonly nodeEnv: AppConfig['nodeEnv']
+  readonly runtimeRole: RuntimeRole
   readonly solanaCluster: AppConfig['solanaCluster']
   readonly solanaSettlementMint: string
   readonly allowMainnet: boolean
@@ -100,18 +189,31 @@ export interface RedactedConfig {
   readonly hasSolanaFeePayerSecret: boolean
   readonly hasWalletMasterKey: boolean
   readonly hasRecoveryEnvelopeKey: boolean
+  readonly hasWebhookSigningKeys: boolean
+  readonly hasBackupAgeIdentity: boolean
+  readonly custodyBackendIdentity?: string
+  readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
 }
 
 export function redactConfig(config: AppConfig): RedactedConfig {
   return {
     port: config.port,
     nodeEnv: config.nodeEnv,
+    runtimeRole: config.runtimeRole,
     solanaCluster: config.solanaCluster,
     solanaSettlementMint: config.solanaSettlementMint,
     allowMainnet: config.allowMainnet,
     hasAdminApiKey: config.adminApiKey.length > 0,
-    hasSolanaFeePayerSecret: config.solanaFeePayerSecret.length > 0,
+    hasSolanaFeePayerSecret: config.solanaFeePayerSecret !== undefined,
     hasWalletMasterKey: config.walletMasterKey.length > 0,
     hasRecoveryEnvelopeKey: config.recoveryEnvelopeKey.length > 0,
+    hasWebhookSigningKeys: config.webhookSigningKeysJson !== undefined,
+    hasBackupAgeIdentity: config.backupAgeIdentity !== undefined,
+    ...(config.custodyBackendIdentity === undefined
+      ? {}
+      : { custodyBackendIdentity: config.custodyBackendIdentity }),
+    ...(config.custodyBackendMode === undefined
+      ? {}
+      : { custodyBackendMode: config.custodyBackendMode }),
   }
 }

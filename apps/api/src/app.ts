@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify'
 import {
   AuthenticationError,
   formatMoney,
@@ -32,6 +32,11 @@ import { type V2CreatePaymentInput, type V2PaymentService } from './payments-v2.
 import type { V2ManagementService } from './v2-management.js'
 import { registerV2OperationsRoutes } from './v2-operations-routes.js'
 import type { V2OperationsService } from './v2-operations.js'
+import {
+  MetricsRegistry,
+  type DomainHealthDependency,
+  type DomainHealthSnapshot,
+} from './observability.js'
 
 export interface ReadinessDependency {
   checkReadiness(): Promise<void>
@@ -53,6 +58,8 @@ export interface BuildAppOptions {
   readonly v2ManagementService?: V2ManagementService
   readonly v2OperationsService?: V2OperationsService
   readonly v2AdminRepository?: Pick<V2AdminRepository, 'consumeRateLimit'>
+  readonly metrics?: MetricsRegistry
+  readonly domainHealthDependency?: DomainHealthDependency
 }
 
 interface ErrorWithCode {
@@ -139,6 +146,8 @@ function getErrorResponse(
 }
 
 export function buildApp(options: BuildAppOptions): FastifyInstance {
+  const metrics = options.metrics ?? new MetricsRegistry()
+  const requestStartTimes = new WeakMap<FastifyRequest, number>()
   const app = Fastify({
     logger: {
       level: options.config.nodeEnv === 'development' ? 'debug' : 'info',
@@ -153,6 +162,35 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     },
   })
 
+  app.addHook('onRequest', async (request) => {
+    requestStartTimes.set(request, performance.now())
+  })
+
+  app.addHook('onResponse', async (request, reply) => {
+    metrics.incrementCounter('mux_api_requests_total', {
+      status: String(Math.floor(reply.statusCode / 100) * 100),
+    })
+    const startedAt = requestStartTimes.get(request)
+    if (startedAt !== undefined) {
+      metrics.observeHistogram(
+        'mux_api_request_duration_ms',
+        performance.now() - startedAt,
+        {
+          status: String(Math.floor(reply.statusCode / 100) * 100),
+        },
+      )
+    }
+  })
+
+  app.addHook('onError', async (_request, _reply, error) => {
+    metrics.incrementCounter('mux_api_errors_total', {
+      error_code:
+        typeof (error as { code?: unknown }).code === 'string'
+          ? (error as { code: string }).code
+          : 'INTERNAL_ERROR',
+    })
+  })
+
   app.addHook('onSend', async (request, reply) => {
     reply.header('x-request-id', request.id)
   })
@@ -164,6 +202,55 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       status: 'ok',
     }),
   )
+
+  app.get(
+    '/health/live',
+    { schema: { response: { 200: healthResponseSchema } } },
+    async () => ({
+      status: 'ok',
+    }),
+  )
+
+  app.get(
+    '/health/domain',
+    {
+      schema: {
+        response: {
+          200: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              status: { type: 'string', enum: ['ok', 'degraded'] },
+              checks: { type: 'object', additionalProperties: { type: 'string' } },
+            },
+            required: ['status', 'checks'],
+          },
+          503: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              status: { type: 'string', const: 'degraded' },
+              checks: { type: 'object', additionalProperties: { type: 'string' } },
+            },
+            required: ['status', 'checks'],
+          },
+        },
+      },
+    },
+    async (_request, reply) => {
+      const snapshot: DomainHealthSnapshot =
+        options.domainHealthDependency === undefined
+          ? { status: 'ok', checks: {} }
+          : await options.domainHealthDependency.checkDomainHealth()
+      if (snapshot.status === 'degraded') return reply.code(503).send(snapshot)
+      return snapshot
+    },
+  )
+
+  app.get('/metrics', async (_request, reply) => {
+    reply.type('text/plain; version=0.0.4')
+    return metrics.renderPrometheus()
+  })
 
   if (
     options.accountRepository !== undefined &&
@@ -2111,6 +2198,34 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
   app.get(
     '/ready',
+    {
+      schema: {
+        response: {
+          200: healthResponseSchema,
+          503: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              status: { type: 'string', const: 'not_ready' },
+            },
+            required: ['status'],
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        await options.readinessDependency.checkReadiness()
+        return { status: 'ok' }
+      } catch {
+        request.log.error({ errorCode: 'READINESS_FAILURE' }, 'Readiness check failed')
+        return reply.code(503).send({ status: 'not_ready' })
+      }
+    },
+  )
+
+  app.get(
+    '/health/ready',
     {
       schema: {
         response: {

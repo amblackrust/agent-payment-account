@@ -20,6 +20,7 @@ describe('configuration', () => {
 
     expect(config.port).toBe(3000)
     expect(config.nodeEnv).toBe('development')
+    expect(config.runtimeRole).toBe('all')
     expect(config.allowMainnet).toBe(false)
   })
 
@@ -42,6 +43,29 @@ describe('configuration', () => {
         ALLOW_MAINNET: 'true',
       }).allowMainnet,
     ).toBe(true)
+  })
+
+  it('fails closed for an implicit all-in-one production runtime', () => {
+    expect(() =>
+      loadConfig({
+        ...validEnvironment,
+        NODE_ENV: 'production',
+        SOLANA_FEE_PAYER_SECRET: undefined,
+      }),
+    ).toThrow('RUNTIME_ROLE')
+  })
+
+  it('allows the API role without loading a fee-payer secret', () => {
+    const config = loadConfig({
+      ...validEnvironment,
+      NODE_ENV: 'production',
+      RUNTIME_ROLE: 'api',
+      SOLANA_FEE_PAYER_SECRET: undefined,
+      CUSTODY_BACKEND_IDENTITY: 'external-custody',
+      CUSTODY_BACKEND_MODE: 'EXTERNAL',
+    })
+    expect(config.runtimeRole).toBe('api')
+    expect(config.solanaFeePayerSecret).toBeUndefined()
   })
 
   it('redacts secrets from the serialized configuration', () => {

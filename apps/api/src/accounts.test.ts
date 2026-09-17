@@ -14,13 +14,15 @@ const config: AppConfig = {
   databaseUrl: 'postgresql://postgres:postgres@localhost:5432/test',
   port: 3000,
   nodeEnv: 'test',
+  runtimeRole: 'all',
   adminApiKey: 'admin-test-key',
   solanaRpcUrl: 'http://127.0.0.1:8899',
   solanaCluster: 'localnet',
   solanaSettlementMint: 'settlement-mint',
   solanaFeePayerSecret: 'fee-payer-test-secret',
   walletMasterKey: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
-  recoveryEnvelopeKey: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+  recoveryEnvelopeKey:
+    'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
   allowMainnet: false,
 }
 

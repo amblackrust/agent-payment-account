@@ -80,6 +80,12 @@ export interface V2WebhookDeliveryClaim {
   readonly attemptCount: number
 }
 
+export interface V2DomainHealthRecord {
+  readonly reviewRequiredPayments: number
+  readonly exhaustedIncomingIssues: number
+  readonly pendingWebhookDeliveries: number
+}
+
 export interface V2BackupRestoreVerificationRecord {
   readonly id: string
   readonly backupReference: string
@@ -94,6 +100,7 @@ export interface V2BackupRestoreVerificationRecord {
 }
 
 export interface V2OperationsRepository {
+  readonly getDomainHealth?: () => Promise<V2DomainHealthRecord>
   listTimeline(input: {
     readonly accountId: string
     readonly limit: number
@@ -200,6 +207,22 @@ export function createV2OperationsRepository(
   prisma: PrismaClient,
 ): V2OperationsRepository {
   return {
+    async getDomainHealth() {
+      const [reviewRequiredPayments, exhaustedIncomingIssues, pendingWebhookDeliveries] =
+        await Promise.all([
+          prisma.payment.count({ where: { status: 'REVIEW_REQUIRED' } }),
+          prisma.incomingReconciliationIssue.count({ where: { status: 'EXHAUSTED' } }),
+          prisma.webhookDelivery.count({
+            where: { status: { in: ['AVAILABLE', 'RETRY_WAIT', 'CLAIMED'] } },
+          }),
+        ])
+      return {
+        reviewRequiredPayments,
+        exhaustedIncomingIssues,
+        pendingWebhookDeliveries,
+      }
+    },
+
     async listTimeline(input) {
       const events = await prisma.operationTimelineEvent.findMany({
         where: {
