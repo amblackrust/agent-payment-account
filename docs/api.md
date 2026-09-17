@@ -14,6 +14,76 @@ Balance, recipient, receive, payment, refund, and transaction routes use `Author
 
 An agent API key begins with `apa_` and is returned only when an account or replacement credential is created. Mux stores a SHA-256 hash and a non-secret prefix, not the plaintext key. Revoked credentials and credentials for disabled accounts are rejected.
 
+## V2 API (canonical contract)
+
+The `/v2` surface is the canonical Agent Payment Account contract. The `/v1`
+surface below remains a compatibility API and keeps its fixed-two-decimal USD
+wire format; production `/v1` payment, send, and refund operations are adapted
+into the same durable V2 orchestrator.
+
+V2 amounts are plain decimal strings bound to a `denomination_id`. They do not
+use exponent notation, JavaScript numbers, or an implicit global two-decimal
+scale. The denomination and settlement route determine the permitted logical
+scale and asset conversion. Reusing an idempotency key with a different
+request returns a conflict; exact replays return the original durable result.
+
+Agent-authenticated V2 routes include:
+
+- `GET /v2/accounts/:accountId` — account identity and lifecycle state for the
+  authenticated account.
+- `GET /v2/balance?denomination_id=...` and
+  `GET /v2/accounts/:accountId/balance?denomination_id=...` — settled,
+  reserved, and spendable exact balances.
+- `GET /v2/funding-destination` and
+  `GET /v2/accounts/:accountId/funding-destination` — the usable funding
+  destination for an optional route.
+- `POST`, `GET`, `PATCH`, and archive operations under `/v2/recipients` —
+  account-owned recipient directory and approved destination checks.
+- `POST`, `GET`, list, and cancel operations under `/v2/receive-requests` —
+  exact-amount receive intents and their settlement destination.
+- `POST /v2/payments`, `GET /v2/payments/:paymentId`, and
+  `GET /v2/payments` — payment creation, polling, and cursor-paginated
+  filtering by status, outcome, recipient, or denomination.
+- `POST /v2/payments/:paymentId/refunds` — a new auditable refund payment.
+- `GET /v2/history` and `GET /v2/timeline` — unified history and append-only
+  operational events.
+- `GET`, `POST`, and archive operations under `/v2/webhooks` — signed,
+  at-least-once delivery subscriptions.
+
+Payment and receive creation require `idempotency-key`. Payment responses
+expose policy, approval, reservation, execution, settlement, outcome, attempt,
+and failure dimensions; `status` is a deterministic projection and is not a
+second source of truth. `RECONCILING`, `REVIEW_REQUIRED`, and
+`CLOSED_UNRESOLVED` are not ordinary failures.
+
+Admin-authenticated V2 routes manage account lifecycle and credentials,
+policies, approvals, approved destinations, and the operator exception inbox:
+
+- `POST /v2/accounts` provisions an account with an idempotent request.
+- `/v2/accounts/:accountId/credentials` lists credentials; lifecycle,
+  revoke, and rotate routes apply the corresponding guarded commands.
+- `/v2/accounts/:accountId/policies`, `/v2/policies/:policyId/activate`,
+  and `/v2/accounts/:accountId/approvals` manage versioned policy and approval
+  state.
+- `/v2/accounts/:accountId/approved-destinations` manages separately
+  authorized destinations.
+- `/v2/operator/exceptions` and its domain-command routes expose operational
+  review without allowing an operator to release an unresolved reservation by
+  timeout alone.
+
+V2 errors use the canonical envelope:
+
+```json
+{
+  "code": "REVIEW_REQUIRED",
+  "message": "Payment requires operational review",
+  "request_id": "req_...",
+  "payment_id": "pay_...",
+  "payment_status": "REVIEW_REQUIRED",
+  "reason_codes": ["CUSTODY_RETRY_EXHAUSTED"]
+}
+```
+
 ## Accounts
 
 ### Create an account

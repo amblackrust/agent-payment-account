@@ -29,6 +29,9 @@ The v1 custody boundary is intentionally narrow:
 - Account-owned recipients for external or managed Solana destinations
 - Idempotent `pay`, `send`, and managed-account refund operations
 - Durable reservations, attempts, confirmation, recovery, and reconciliation
+- Canonical V2 exact-money contracts with policy, approval, evidence, and
+  operator-control projections; `/v1` payment routes remain compatibility
+  adapters into the same durable workflow
 - Persistent receive requests and discovery of incoming SPL transfers
 - Payment lookup plus cursor-paginated payment and transaction history
 - TypeScript SDK for the agent-facing account operations
@@ -179,7 +182,9 @@ For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supp
 ## Current Scope and Limitations
 
 - The runtime is custodial and stores encrypted signer material in PostgreSQL.
-- Only `USD` is exposed and only one configured classic SPL mint settles it.
+- V2 exposes exact denomination-bound amounts; the current deployment still
+  activates one classic SPL settlement route. V1 remains a fixed-two-decimal
+  `USD` compatibility contract.
 - Refunds are supported only when the original recipient is another managed account and the reverse destination is known.
 - External recipient token accounts must already exist; sponsored associated-token-account creation is limited to verified managed recipients.
 - Cards, bank rails, x402, FX, off-ramp, KYC, a browser UI, and agent orchestration are not part of v1.

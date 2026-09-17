@@ -40,7 +40,10 @@ Core defines normalized money, identifiers, payment states, routing and rail int
 
 ### Contracts — `packages/contracts`
 
-Shared Zod schemas define the agent-facing request and response shapes consumed by the API and SDK. Public money values are fixed two-decimal `USD` strings.
+Shared Zod schemas define the agent-facing request and response shapes consumed
+by the API and SDK. The canonical V2 surface uses exact decimal strings plus an
+explicit `denomination_id`; the retained V1 compatibility surface uses fixed
+two-decimal `USD` strings.
 
 ### Database — `packages/db`
 
@@ -131,7 +134,13 @@ Runtime metadata pins the configured rail version, cluster, settlement mint, and
 
 ## Solana Settlement Rail
 
-The runtime exposes `USD` with two decimal places. The rail reads the configured mint's decimals and converts normalized amounts to mint atomic units before using `transferChecked`. Only the classic SPL Token program is accepted; Token-2022 is not the v1 settlement rail.
+The retained V1 runtime exposes `USD` with two decimal places. V2 keeps money
+exact at the logical-contract boundary and converts through an explicit
+denomination/economic-mapping/settlement-asset snapshot. The current configured
+route is still one classic SPL Token rail: it reads the settlement mint's
+decimals and converts the mapped amount to atomic units before using
+`transferChecked`. Only the classic SPL Token program is accepted; Token-2022
+is not the current settlement rail.
 
 An external recipient's `wallet_address` identifies its Solana owner/public key. Mux derives the associated token account for that owner and the configured settlement mint; the derived account must already exist because Mux does not sponsor token-account creation for arbitrary external recipients. A recipient tied to another managed account is checked against that account's canonical public key and may receive sponsored associated-token-account creation through the platform fee payer.
 
