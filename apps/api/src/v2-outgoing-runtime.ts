@@ -1,13 +1,16 @@
 import { DependencyUnavailableError } from '@agent-payment/core'
-import { createDatabaseClient } from '@agent-payment/db'
+import type { createDatabaseClient } from '@agent-payment/db'
 import {
   createSolanaV2OutgoingExecutor,
   signSolanaV2PreparedEffect,
 } from '@agent-payment/solana-rail'
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
 import { ConfigurationError, type AppConfig } from './config.js'
-import { ConstrainedCustodyBoundary, WalletSecretCipher } from './custody.js'
-import type { ConstrainedCustodyBackend } from './custody.js'
+import { ConstrainedCustodyBoundary } from './custody.js'
+import type {
+  ConstrainedCustodyBackend,
+  WalletSecretCipher,
+} from './custody.js'
 import { V2OutgoingWorker } from './outgoing-v2.js'
 
 const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n

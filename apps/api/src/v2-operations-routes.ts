@@ -1,9 +1,12 @@
 import type { FastifyInstance } from 'fastify'
 import { AuthenticationError } from '@agent-payment/core'
-import type { AccountRepository } from '@agent-payment/db'
+import type {
+  AccountRepository,
+  AuthenticatedAccount,
+} from '@agent-payment/db'
 import type { AppConfig } from './config.js'
 import { assertAdminApiKey, authenticateAgentWithScope } from './auth.js'
-import { V2OperationsService } from './v2-operations.js'
+import type { V2OperationsService } from './v2-operations.js'
 
 const exceptionParams = {
   type: 'object',
@@ -272,7 +275,7 @@ export function registerV2OperationsRoutes(
 }
 
 function requireAccount(request: {
-  readonly agentAccount: import('@agent-payment/db').AuthenticatedAccount | null
+  readonly agentAccount: AuthenticatedAccount | null
 }) {
   if (request.agentAccount === null) throw new AuthenticationError()
   return request.agentAccount

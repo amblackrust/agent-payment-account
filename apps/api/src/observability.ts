@@ -19,10 +19,6 @@ export interface DomainHealthDependency {
   checkDomainHealth(): Promise<DomainHealthSnapshot>
 }
 
-interface MetricLabels {
-  readonly [key: string]: string
-}
-
 interface HistogramState {
   readonly buckets: readonly number[]
   readonly counts: number[]

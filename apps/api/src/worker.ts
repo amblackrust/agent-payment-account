@@ -12,7 +12,6 @@ import {
   createSolanaRail,
 } from '@agent-payment/solana-rail'
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
-import { DependencyUnavailableError } from '@agent-payment/core'
 
 import { buildApp } from './app.js'
 import { ConfigurationError, loadConfig, redactConfig } from './config.js'
@@ -23,7 +22,7 @@ import {
   validateLegacyWalletCustody,
   WalletSecretCipher,
 } from './custody.js'
-import { V2OutgoingWorker } from './outgoing-v2.js'
+import type { V2OutgoingWorker } from './outgoing-v2.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 
 const WORKER_INTERVAL_MS = 5_000

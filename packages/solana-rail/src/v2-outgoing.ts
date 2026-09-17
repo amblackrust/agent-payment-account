@@ -612,7 +612,7 @@ export function createSolanaV2OutgoingExecutor(
     readonly failureCode?: string
     readonly failureMessageSafe?: string
   }> {
-    const payload = parsePreparedPayload(input.prepared.preparedPayload)
+    parsePreparedPayload(input.prepared.preparedPayload)
     const initial = await observeSignature(input.signed.externalId)
     if (initial.status === 'CONFIRMED') {
       return { status: 'CONFIRMED', externalId: input.signed.externalId }
@@ -851,7 +851,6 @@ function buildTransferMessage(
   payerSigner: KeyPairSigner | ReturnType<typeof createNoopSigner>,
   feePayerSigner: KeyPairSigner | ReturnType<typeof createNoopSigner>,
 ) {
-  const payerOwner = parseAddress(payload.payerOwner, 'payer public key')
   const recipientOwner = parseAddress(payload.recipientOwner, 'recipient public key')
   const payerAta = parseAddress(payload.payerAta, 'payer token account')
   const recipientAta = parseAddress(payload.recipientAta, 'recipient token account')
