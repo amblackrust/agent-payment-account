@@ -778,6 +778,53 @@ export interface RuntimeRouteIdentity {
   readonly economicMappingVersion: number
 }
 
+async function markIncomingReconciliationIssueExhausted(
+  transaction: Prisma.TransactionClient,
+  issueId: string,
+  reason: string,
+  now: Date,
+): Promise<void> {
+  const updated = await transaction.incomingReconciliationIssue.updateMany({
+    where: { id: issueId, status: 'PENDING' },
+    data: { status: 'EXHAUSTED', reason },
+  })
+  if (updated.count !== 1) return
+
+  const issue = await transaction.incomingReconciliationIssue.findUniqueOrThrow({
+    where: { id: issueId },
+  })
+  await transaction.operationalException.upsert({
+    where: { activeDedupeKey: `active:incoming-issue:${issue.id}` },
+    create: {
+      id: `opx_incoming_${randomBytes(16).toString('hex')}`,
+      accountId: issue.accountId,
+      resourceType: 'INCOMING_RECONCILIATION_ISSUE',
+      resourceId: issue.id,
+      dedupeKey: `incoming-issue:${issue.id}`,
+      activeDedupeKey: `active:incoming-issue:${issue.id}`,
+      reasonCode: 'INCOMING_ISSUE_RETRY_EXHAUSTED',
+      detailsJson: JSON.stringify({ signature: issue.signature, reason }),
+    },
+    update: {
+      updatedAt: now,
+      detailsJson: JSON.stringify({ signature: issue.signature, reason }),
+    },
+  })
+  await transaction.operationTimelineEvent.create({
+    data: {
+      id: `timeline_${randomBytes(16).toString('hex')}`,
+      accountId: issue.accountId,
+      resourceType: 'INCOMING_RECONCILIATION_ISSUE',
+      resourceId: issue.id,
+      eventType: 'INCOMING_ISSUE_EXHAUSTED',
+      actorType: 'SYSTEM',
+      source: 'INCOMING_RECONCILIATION',
+      occurredAt: now,
+      newStateJson: JSON.stringify({ status: 'EXHAUSTED', reason }),
+    },
+  })
+}
+
 async function matchIncomingPaymentInTransaction(
   transaction: Prisma.TransactionClient,
   input: IncomingMatchInput,
@@ -2342,59 +2389,96 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         throw new Error('Incoming reconciliation issue batch limit must be 1 to 100')
       }
       return prisma.$transaction(async (transaction) => {
-        const issues = await transaction.$queryRaw<
-          {
-            id: string
-            account_id: string
-            account_public_key: string
-            signature: string
-            reason: string
-            retry_count: number
-          }[]
-        >`
-          SELECT issue.id,
-                 issue.account_id,
-                 account.solana_public_key AS account_public_key,
-                 issue.signature,
-                 issue.reason,
-                 issue.retry_count
-          FROM "incoming_reconciliation_issues" issue
-          JOIN "agent_accounts" account ON account.id = issue.account_id
-          WHERE issue.status = 'PENDING'
-            AND issue.retry_count <= ${MAX_INCOMING_ISSUE_RETRIES + 1}
-            AND issue.next_retry_at <= ${now}
-          ORDER BY issue.next_retry_at ASC, issue.id ASC
-          LIMIT ${limit}
-          FOR UPDATE OF issue SKIP LOCKED
-        `
-        for (const issue of issues) {
-          // Keep the recovery claim at the bounded sentinel so a worker crash
-          // cannot move the row beyond the query's recovery boundary.
-          const retryCount = Math.min(
-            issue.retry_count + 1,
-            MAX_INCOMING_ISSUE_RETRIES + 1,
-          )
-          const backoffMilliseconds = Math.min(
-            5 * 60_000,
-            5_000 * 2 ** Math.min(retryCount - 1, 6),
-          )
-          await transaction.incomingReconciliationIssue.update({
-            where: { id: issue.id },
-            data: {
-              lastTriedAt: now,
-              nextRetryAt: new Date(now.getTime() + backoffMilliseconds),
+        const claims: IncomingReconciliationIssueRecord[] = []
+        while (claims.length < limit) {
+          const finalRows = await transaction.$queryRaw<
+            Array<{ id: string; reason: string }>
+          >`
+            SELECT issue.id, issue.reason
+            FROM "incoming_reconciliation_issues" issue
+            WHERE issue.status = 'PENDING'
+              AND issue.retry_count >= ${MAX_INCOMING_ISSUE_RETRIES + 1}
+              AND issue.recovery_count >= 1
+              AND issue.next_retry_at <= ${now}
+            ORDER BY issue.next_retry_at ASC, issue.id ASC
+            LIMIT 1
+            FOR UPDATE OF issue SKIP LOCKED
+          `
+          const finalRow = finalRows[0]
+          if (finalRow !== undefined) {
+            await markIncomingReconciliationIssueExhausted(
+              transaction,
+              finalRow.id,
+              finalRow.reason,
+              now,
+            )
+            continue
+          }
+
+          const issues = await transaction.$queryRaw<
+            {
+              id: string
+              account_id: string
+              account_public_key: string
+              signature: string
+              reason: string
+              retry_count: number
+            }[]
+          >`
+            SELECT issue.id,
+                   issue.account_id,
+                   account.solana_public_key AS account_public_key,
+                   issue.signature,
+                   issue.reason,
+                   issue.retry_count
+            FROM "incoming_reconciliation_issues" issue
+            JOIN "agent_accounts" account ON account.id = issue.account_id
+            WHERE issue.status = 'PENDING'
+              AND issue.next_retry_at <= ${now}
+              AND (
+                issue.retry_count < ${MAX_INCOMING_ISSUE_RETRIES + 1}
+                OR (
+                  issue.retry_count >= ${MAX_INCOMING_ISSUE_RETRIES + 1}
+                  AND issue.recovery_count < 1
+                )
+              )
+            ORDER BY issue.next_retry_at ASC, issue.id ASC
+            LIMIT ${limit - claims.length}
+            FOR UPDATE OF issue SKIP LOCKED
+          `
+          if (issues.length === 0) break
+
+          for (const issue of issues) {
+            const retryCount = Math.min(
+              issue.retry_count + 1,
+              MAX_INCOMING_ISSUE_RETRIES + 1,
+            )
+            const backoffMilliseconds = Math.min(
+              5 * 60_000,
+              5_000 * 2 ** Math.min(retryCount - 1, 6),
+            )
+            await transaction.incomingReconciliationIssue.update({
+              where: { id: issue.id },
+              data: {
+                lastTriedAt: now,
+                nextRetryAt: new Date(now.getTime() + backoffMilliseconds),
+                retryCount,
+                ...(issue.retry_count >= MAX_INCOMING_ISSUE_RETRIES
+                  ? { recoveryCount: { increment: 1 } }
+                  : {}),
+              },
+            })
+            claims.push({
+              id: issue.id,
+              accountId: issue.account_id,
+              accountPublicKey: issue.account_public_key,
+              signature: issue.signature,
+              reason: issue.reason,
               retryCount,
-            },
-          })
+            })
+          }
         }
-        return issues.map((issue) => ({
-          id: issue.id,
-          accountId: issue.account_id,
-          accountPublicKey: issue.account_public_key,
-          signature: issue.signature,
-          reason: issue.reason,
-          retryCount: Math.min(issue.retry_count + 1, MAX_INCOMING_ISSUE_RETRIES + 1),
-        }))
+        return claims
       })
     },
     async resolveIncomingReconciliationIssue(issueId, now = new Date()) {
@@ -2411,44 +2495,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     },
     async exhaustIncomingReconciliationIssue(issueId, reason, now = new Date()) {
       await prisma.$transaction(async (transaction) => {
-        const updated = await transaction.incomingReconciliationIssue.updateMany({
-          where: { id: issueId, status: 'PENDING' },
-          data: { status: 'EXHAUSTED', reason },
-        })
-        if (updated.count !== 1) return
-        const issue = await transaction.incomingReconciliationIssue.findUniqueOrThrow({
-          where: { id: issueId },
-        })
-        await transaction.operationalException.upsert({
-          where: { activeDedupeKey: `active:incoming-issue:${issue.id}` },
-          create: {
-            id: `opx_incoming_${randomBytes(16).toString('hex')}`,
-            accountId: issue.accountId,
-            resourceType: 'INCOMING_RECONCILIATION_ISSUE',
-            resourceId: issue.id,
-            dedupeKey: `incoming-issue:${issue.id}`,
-            activeDedupeKey: `active:incoming-issue:${issue.id}`,
-            reasonCode: 'INCOMING_ISSUE_RETRY_EXHAUSTED',
-            detailsJson: JSON.stringify({ signature: issue.signature, reason }),
-          },
-          update: {
-            updatedAt: now,
-            detailsJson: JSON.stringify({ signature: issue.signature, reason }),
-          },
-        })
-        await transaction.operationTimelineEvent.create({
-          data: {
-            id: `timeline_${randomBytes(16).toString('hex')}`,
-            accountId: issue.accountId,
-            resourceType: 'INCOMING_RECONCILIATION_ISSUE',
-            resourceId: issue.id,
-            eventType: 'INCOMING_ISSUE_EXHAUSTED',
-            actorType: 'SYSTEM',
-            source: 'INCOMING_RECONCILIATION',
-            occurredAt: now,
-            newStateJson: JSON.stringify({ status: 'EXHAUSTED', reason }),
-          },
-        })
+        await markIncomingReconciliationIssueExhausted(
+          transaction,
+          issueId,
+          reason,
+          now,
+        )
       })
     },
     async createIncomingPayment(input) {

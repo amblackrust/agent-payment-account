@@ -344,6 +344,7 @@ model IncomingReconciliationIssue {
   lastTriedAt DateTime?                         @map("last_tried_at")
   nextRetryAt DateTime                          @default(now()) @map("next_retry_at")
   retryCount  Int                               @default(0) @map("retry_count")
+  recoveryCount Int                             @default(0) @map("recovery_count")
   resolvedAt  DateTime?                         @map("resolved_at")
   account     AgentAccount                      @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
@@ -631,6 +632,7 @@ model DurableWorkItem {
   leaseExpiresAt DateTime? @map("lease_expires_at")
   attemptCount   Int       @default(0) @map("attempt_count")
   maxAttempts    Int       @default(10) @map("max_attempts")
+  leaseRecoveryCount Int   @default(0) @map("lease_recovery_count")
   lastErrorCode  String?   @map("last_error_code") @db.VarChar(128)
   lastErrorSafe  String?   @map("last_error_safe") @db.Text
   retryAfter     DateTime? @map("retry_after")

@@ -2330,48 +2330,100 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
       }
       const now = input.now ?? new Date()
       return prisma.$transaction(async (transaction) => {
-        const rows = await transaction.$queryRaw<
-          Array<{ id: string; attempt_count: number; max_attempts: number }>
-        >`
-          SELECT id, attempt_count, max_attempts FROM "durable_work_items"
-          WHERE kind = ${input.kind}
-            AND (status = 'AVAILABLE' OR status = 'RETRY_WAIT' OR (status = 'CLAIMED' AND lease_expires_at <= ${now}))
-            AND (
-              (status IN ('AVAILABLE', 'RETRY_WAIT') AND attempt_count < max_attempts)
-              OR (status = 'CLAIMED' AND attempt_count <= max_attempts)
+        while (true) {
+          const exhaustedRows = await transaction.$queryRaw<
+            Array<{
+              id: string
+              resource_type: string
+              resource_id: string
+              attempt_count: number
+            }>
+          >`
+            SELECT id, resource_type, resource_id, attempt_count
+            FROM "durable_work_items"
+            WHERE kind = ${input.kind}
+              AND status = 'CLAIMED'
+              AND lease_expires_at <= ${now}
+              AND attempt_count >= max_attempts
+              AND lease_recovery_count >= 1
+              AND available_at <= ${now}
+            ORDER BY available_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+          `
+          const exhaustedRow = exhaustedRows[0]
+          if (exhaustedRow !== undefined) {
+            await markWorkItemExhausted(
+              transaction,
+              {
+                id: exhaustedRow.id,
+                resourceType: exhaustedRow.resource_type,
+                resourceId: exhaustedRow.resource_id,
+                attemptCount: exhaustedRow.attempt_count,
+              },
+              'FINAL_LEASE_EXPIRED',
+              'Work item lease expired after final-attempt recovery',
             )
-            AND available_at <= ${now}
-          ORDER BY available_at ASC, id ASC
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
-        `
-        const row = rows[0]
-        if (row === undefined) return null
-        const leaseExpiresAt = new Date(now.getTime() + input.leaseSeconds * 1000)
-        const item = await transaction.durableWorkItem.update({
-          where: { id: row.id },
-          data: {
-            status: 'CLAIMED',
-            leaseOwner: input.owner,
-            leaseExpiresAt,
-            ...(row.attempt_count >= row.max_attempts
-              ? {}
-              : { attemptCount: { increment: 1 } }),
-          },
-        })
-        const accountId = await resolveWorkAccountId(
-          transaction,
-          item.resourceType,
-          item.resourceId,
-        )
-        return {
-          id: item.id,
-          kind: item.kind,
-          resourceType: item.resourceType,
-          resourceId: item.resourceId,
-          attemptCount: item.attemptCount,
-          payloadJson: item.payloadJson,
-          ...(accountId === undefined ? {} : { accountId }),
+            continue
+          }
+
+          const rows = await transaction.$queryRaw<
+            Array<{
+              id: string
+              attempt_count: number
+              max_attempts: number
+            }>
+          >`
+            SELECT id, attempt_count, max_attempts FROM "durable_work_items"
+            WHERE kind = ${input.kind}
+              AND (
+                status = 'AVAILABLE'
+                OR status = 'RETRY_WAIT'
+                OR (status = 'CLAIMED' AND lease_expires_at <= ${now})
+              )
+              AND (
+                (status IN ('AVAILABLE', 'RETRY_WAIT') AND attempt_count < max_attempts)
+                OR (
+                  status = 'CLAIMED'
+                  AND (
+                    attempt_count < max_attempts
+                    OR (attempt_count >= max_attempts AND lease_recovery_count < 1)
+                  )
+                )
+              )
+              AND available_at <= ${now}
+            ORDER BY available_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+          `
+          const row = rows[0]
+          if (row === undefined) return null
+          const leaseExpiresAt = new Date(now.getTime() + input.leaseSeconds * 1000)
+          const item = await transaction.durableWorkItem.update({
+            where: { id: row.id },
+            data: {
+              status: 'CLAIMED',
+              leaseOwner: input.owner,
+              leaseExpiresAt,
+              ...(row.attempt_count >= row.max_attempts
+                ? { leaseRecoveryCount: { increment: 1 } }
+                : { attemptCount: { increment: 1 } }),
+            },
+          })
+          const accountId = await resolveWorkAccountId(
+            transaction,
+            item.resourceType,
+            item.resourceId,
+          )
+          return {
+            id: item.id,
+            kind: item.kind,
+            resourceType: item.resourceType,
+            resourceId: item.resourceId,
+            attemptCount: item.attemptCount,
+            payloadJson: item.payloadJson,
+            ...(accountId === undefined ? {} : { accountId }),
+          }
         }
       })
     },

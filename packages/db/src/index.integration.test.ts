@@ -1423,11 +1423,15 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
 
     it('makes the final reconciliation attempt recoverable after a worker crash', async () => {
       const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`
       const issueId = `issue_${randomUUID().replaceAll('-', '')}`
       const signature = `crashed-issue-${randomUUID()}`
+      let sqlConnected = false
 
       try {
+        await sql.connect()
+        sqlConnected = true
         await database.createAgentAccount({
           id: accountId,
           name: 'incoming-issue-crash-agent',
@@ -1464,14 +1468,18 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         const recovered = await database.claimIncomingReconciliationIssues(1, now)
         expect(recovered).toHaveLength(1)
         expect(recovered[0]).toMatchObject({ id: issueId, retryCount: 9 })
-        const recoveredAgain = await database.claimIncomingReconciliationIssues(
+        const exhausted = await database.claimIncomingReconciliationIssues(
           1,
           new Date(now.getTime() + 10 * 60_000),
         )
-        expect(recoveredAgain).toHaveLength(1)
-        expect(recoveredAgain[0]).toMatchObject({ id: issueId, retryCount: 9 })
-        await database.resolveIncomingReconciliationIssue(issueId)
+        expect(exhausted).toHaveLength(0)
+        const status = await sql.query<{ status: string; recovery_count: number }>(
+          'SELECT status, recovery_count FROM incoming_reconciliation_issues WHERE id = $1',
+          [issueId],
+        )
+        expect(status.rows[0]).toMatchObject({ status: 'EXHAUSTED', recovery_count: 1 })
       } finally {
+        if (sqlConnected) await sql.end()
         await database.disconnect()
       }
     })
@@ -1529,16 +1537,23 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
            WHERE id = $1`,
           [finalWorkItemId],
         )
-        const recoveredAfterSecondCrash = await database.v2.claimWorkItem({
+        const exhaustedAfterSecondCrash = await database.v2.claimWorkItem({
           kind: 'OUTGOING_PAYMENT',
           owner: 'final-recovery-owner-2',
           leaseSeconds: 30,
         })
-        expect(recoveredAfterSecondCrash).toMatchObject({
-          id: finalWorkItemId,
-          attemptCount: 10,
+        expect(exhaustedAfterSecondCrash).toBeNull()
+        const exhaustedWorkItem = await sql.query<{
+          status: string
+          lease_recovery_count: number
+        }>(
+          'SELECT status, lease_recovery_count FROM durable_work_items WHERE id = $1',
+          [finalWorkItemId],
+        )
+        expect(exhaustedWorkItem.rows[0]).toMatchObject({
+          status: 'EXHAUSTED',
+          lease_recovery_count: 1,
         })
-        await database.v2.completeWorkItem(finalWorkItemId, 'final-recovery-owner-2')
 
         await expect(
           database.v2.completeWorkItem(workItemId, 'expired-owner'),
@@ -1562,6 +1577,9 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         ).rejects.toBeInstanceOf(ConflictError)
       } finally {
         if (sqlConnected) {
+          await sql.query('DELETE FROM operational_exceptions WHERE resource_id = $1', [
+            finalWorkItemId,
+          ])
           await sql.query('DELETE FROM durable_work_items WHERE id IN ($1, $2)', [
             workItemId,
             finalWorkItemId,
