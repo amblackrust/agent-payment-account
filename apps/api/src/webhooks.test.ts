@@ -1,6 +1,7 @@
 import { createHmac } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import {
+  assertSafeWebhookAddress,
   assertSafeWebhookEndpoint,
   type V2OperationsRepository,
   type V2WebhookDeliveryClaim,
@@ -111,6 +112,13 @@ describe('webhook delivery worker', () => {
     expect(() => assertSafeWebhookEndpoint('https://[::1]/webhook')).toThrow(
       'public address',
     )
+    expect(() => assertSafeWebhookEndpoint('https://[ff02::1]/webhook')).toThrow(
+      'public address',
+    )
+    expect(() => assertSafeWebhookEndpoint('https://[::ffff:7f00:1]/webhook')).toThrow(
+      'public address',
+    )
+    expect(() => assertSafeWebhookAddress('::ffff:7f00:1')).toThrow('public address')
     expect(() => assertSafeWebhookEndpoint('https://service.internal/webhook')).toThrow(
       'public address',
     )

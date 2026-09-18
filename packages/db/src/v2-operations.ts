@@ -1479,19 +1479,16 @@ function isPrivateWebhookIp(hostname: string): boolean {
   if (version === 6) {
     const mappedIpv4 = parseMappedIpv4(hostname)
     if (mappedIpv4 !== undefined) return isPrivateWebhookIp(mappedIpv4)
+    const mappedHexIpv4 = parseHexMappedIpv4(hostname)
+    if (mappedHexIpv4 !== undefined) return isPrivateWebhookIp(mappedHexIpv4)
+    const firstHextet = parseFirstIpv6Hextet(hostname)
+    if (firstHextet === undefined) return true
     return (
       hostname === '::' ||
       hostname === '::1' ||
-      hostname.startsWith('fc') ||
-      hostname.startsWith('fd') ||
-      hostname.startsWith('fe8') ||
-      hostname.startsWith('fe9') ||
-      hostname.startsWith('fea') ||
-      hostname.startsWith('feb') ||
-      hostname.startsWith('::ffff:10.') ||
-      hostname.startsWith('::ffff:127.') ||
-      hostname.startsWith('::ffff:192.168.') ||
-      hostname.startsWith('::ffff:169.254.')
+      (firstHextet & 0xfe00) === 0xfc00 ||
+      (firstHextet & 0xffc0) === 0xfe80 ||
+      (firstHextet & 0xff00) === 0xff00
     )
   }
   return false
@@ -1502,6 +1499,22 @@ function parseMappedIpv4(hostname: string): string | undefined {
   const mappedIpv4 = match?.[1]
   if (mappedIpv4 === undefined || isIP(mappedIpv4) !== 4) return undefined
   return mappedIpv4
+}
+
+function parseHexMappedIpv4(hostname: string): string | undefined {
+  const match = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u.exec(hostname)
+  if (match === null) return undefined
+  const high = Number.parseInt(match[1] ?? '', 16)
+  const low = Number.parseInt(match[2] ?? '', 16)
+  if (!Number.isInteger(high) || !Number.isInteger(low)) return undefined
+  return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`
+}
+
+function parseFirstIpv6Hextet(hostname: string): number | undefined {
+  const first = hostname.split(':', 1)[0]
+  if (first === undefined || first.length === 0) return 0
+  if (!/^[0-9a-f]{1,4}$/u.test(first)) return undefined
+  return Number.parseInt(first, 16)
 }
 
 function randomId(): string {
