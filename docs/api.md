@@ -58,6 +58,12 @@ Agent-authenticated V2 routes include:
 - `POST /v2/payments`, `GET /v2/payments/:paymentId`, and
   `GET /v2/payments` — payment creation, polling, and cursor-paginated
   filtering by status, outcome, recipient, or denomination.
+- `POST /v2/external-payments/x402` — creates an ordinary V2 payment intent for
+  the configured x402 proof target. The body contains only
+  `{ "denomination_id": "..." }`; `Idempotency-Key` is required. Mux performs
+  the live `402 Payment Required` negotiation server-side, persists the
+  resulting destination and amount in the normal payment snapshot, and never
+  accepts a caller-supplied pay-to, fee payer, amount, or resource URL.
 - `POST /v2/payments/:paymentId/refunds` — a new auditable refund payment.
 - `GET /v2/history` and `GET /v2/timeline` — unified history and append-only
   operational events.
@@ -360,6 +366,13 @@ Payment responses contain:
 ```
 
 Possible statuses are `CREATED`, `ROUTING`, `SUBMITTED`, `RECONCILING`, `CONFIRMED`, and `FAILED`. HTTP success means the operation was accepted or replayed; only `CONFIRMED` proves the configured chain confirmation was observed.
+
+The x402 proof adapter accepts only x402 v2 `exact` requirements for Solana
+mainnet and canonical USDC. It selects the current requirement from the
+provider's live 402 response and enforces an absolute cap of `100000` USDC
+atomic units (`$0.10`). Provider payment parameters are not configuration
+constants. The external provider's advertised `feePayer` remains distinct from
+the Mux platform fee payer; no Mux wallet secret is sent to the provider.
 
 ## Receive
 

@@ -168,6 +168,9 @@ See [`.env.example`](.env.example) for safe manual defaults and accepted secret 
 | `SOLANA_SETTLEMENT_MINT`          | One classic SPL mint used for settlement                        |
 | `SOLANA_PLATFORM_COST_ASSET_ID`   | Explicit asset identity for durable SOL fee/rent cost records   |
 | `SOLANA_FEE_PAYER_SECRET`         | Separate platform fee-payer signer secret                       |
+| `X402_RESOURCE_URL`               | Fixed x402 proof resource URL; payment terms remain live        |
+| `X402_HTTP_TIMEOUT_MS`            | x402 discovery/resource request timeout                         |
+| `X402_MAX_PAYMENT_ATOMIC`         | x402 USDC atomic-unit cap; cannot exceed `100000` (`$0.10`)     |
 | `WALLET_MASTER_KEY`               | 32-byte key used to encrypt managed signer secrets              |
 | `CREDENTIAL_RECOVERY_TTL_SECONDS` | Encrypted credential-recovery lifetime; defaults to 900 seconds |
 | `ALLOW_MAINNET`                   | Additional explicit mainnet opt-in; defaults to `false`         |

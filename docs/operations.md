@@ -32,6 +32,34 @@ Use separate service identities and secret-manager-injected environments for
 each deployment. Worker leases are durable; stopping a worker allows its
 claims to expire and be recovered by another worker.
 
+## x402 external payment proof
+
+The x402 proof endpoint is an adapter over the ordinary V2 payment lifecycle;
+it does not create a second payment engine. `POST
+/v2/external-payments/x402` creates a normal payment with credential
+authorization, approved-destination checks, spend policy, reservation,
+attempt, custody, evidence, reconciliation, timeline, and history handling.
+
+The adapter performs a live unauthenticated `GET` to the configured proof
+resource and accepts only one x402 v2 exact requirement for Solana mainnet and
+canonical USDC. Amount, recipient, and external fee-payer values are read from
+that response and persisted in the prepared effect; they are never hardcoded.
+The absolute proof spend cap is `100000` USDC atomic units (`$0.10`).
+
+The Agent Account signs only its payer position in the durable Solana
+transaction. The provider-advertised external fee payer/facilitator completes
+and submits the transaction; it is not the Mux Agent Account and does not
+replace the configured Mux platform fee payer used by the existing Solana
+rail. Mux does not import or handle a personal wallet's seed/private key.
+
+After a paid request, Mux requires both a successful x402 settlement response
+and a confirmed/finalized Solana signature from RPC before finalizing the V2
+payment. Transport errors, missing settlement headers, pending/failed
+signatures, and RPC uncertainty remain `UNKNOWN`. Recovery reuses the durable
+signed payload and never creates a fresh transaction solely because the prior
+response was lost. The adapter does not create a missing recipient token
+account automatically.
+
 ## Health
 
 - `GET /health/live` checks only that the process is serving requests.

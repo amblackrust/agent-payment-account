@@ -30,6 +30,7 @@ import type { ReceiveService } from './receives.js'
 import type { V2ReceiveService } from './receives.js'
 import type { TransactionService } from './transactions.js'
 import { type V2CreatePaymentInput, type V2PaymentService } from './payments-v2.js'
+import type { X402PaymentService } from './x402-service.js'
 import type { V2ManagementService } from './v2-management.js'
 import { registerV2OperationsRoutes } from './v2-operations-routes.js'
 import type { V2OperationsService } from './v2-operations.js'
@@ -88,6 +89,7 @@ export interface BuildAppOptions {
   readonly v2ReceiveService?: V2ReceiveService
   readonly transactionService?: TransactionService
   readonly v2PaymentService?: V2PaymentService
+  readonly x402PaymentService?: X402PaymentService
   readonly v2ManagementService?: V2ManagementService
   readonly v2OperationsService?: V2OperationsService
   readonly v2AdminRepository?: Pick<V2AdminRepository, 'consumeRateLimit'>
@@ -1112,6 +1114,76 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           return reply.code(result.created ? 201 : 200).send(response)
         },
       )
+
+      if (options.x402PaymentService !== undefined) {
+        app.post<{
+          Body: { denomination_id: string }
+        }>(
+          '/v2/external-payments/x402',
+          {
+            preHandler: async (request) => {
+              await authenticateAgentWithScope(
+                request,
+                accountRepository,
+                'payments:create',
+              )
+              await enforceRateLimit(
+                options.v2AdminRepository,
+                request,
+                'payment:create',
+                runtimeLimits.paymentRateLimitPerWindow,
+                runtimeLimits.requestRateLimitWindowSeconds,
+              )
+            },
+            schema: {
+              body: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
+                },
+                required: ['denomination_id'],
+              },
+              headers: {
+                type: 'object',
+                properties: {
+                  'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+                },
+                required: ['idempotency-key'],
+              },
+              response: {
+                200: v2PaymentResponseSchema,
+                201: v2PaymentResponseSchema,
+                403: v2ErrorResponseSchema,
+              },
+            },
+          },
+          async (request, reply) => {
+            const result = await options.x402PaymentService!.createPayment(
+              requireAgentAccount(request),
+              { denominationId: request.body.denomination_id },
+              getIdempotencyKey(request),
+              request.id,
+              normalizeCorrelationId(
+                request.headers[CORRELATION_ID_HEADER],
+                request.id,
+              ),
+            )
+            const response = await v2PaymentService.serialize(result.view)
+            if (result.view.policyDecision === 'DENY') {
+              return reply.code(403).send({
+                code: 'POLICY_DENIED',
+                message: 'Payment was denied by policy',
+                request_id: request.id,
+                payment_id: result.view.payment.id,
+                payment_status: result.view.payment.status,
+                reason_codes: [...result.view.reasonCodes],
+              })
+            }
+            return reply.code(result.created ? 201 : 200).send(response)
+          },
+        )
+      }
 
       app.get<{ Params: { paymentId: string } }>(
         '/v2/payments/:paymentId',

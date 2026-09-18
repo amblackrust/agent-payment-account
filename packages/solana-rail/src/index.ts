@@ -3,6 +3,7 @@ export type { GeneratedManagedWallet } from './wallet.js'
 export { createSolanaRail, createSolanaRailWithRpc, tokenToUsdMoney } from './read.js'
 export type {
   ReceiveDestination,
+  SettlementAtomicBalance,
   SettlementBalance,
   SolanaCluster,
   SolanaRail,
@@ -39,3 +40,12 @@ export type {
   SolanaV2SignedEffect,
   SolanaV2SigningRequest,
 } from './v2-outgoing.js'
+export {
+  parseSolanaX402PreparedPayload,
+  signSolanaX402PreparedEffect,
+} from './x402-signing.js'
+export type {
+  SolanaX402PreparedPayload,
+  SolanaX402SignedEffect,
+  SolanaX402SigningRequest,
+} from './x402-signing.js'

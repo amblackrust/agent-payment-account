@@ -56,14 +56,17 @@ export interface V2OutgoingExecutor {
     readonly failureCode?: string
     readonly failureMessageSafe?: string
     readonly platformCostActual?: V2PlatformCostObservation
+    readonly evidenceMetadataJson?: string
   }>
   reconcile?(input: {
     readonly view: V2PaymentView
     readonly attempt: V2PaymentAttemptSnapshot
+    readonly signedPayload?: Uint8Array
   }): Promise<{
     readonly status: 'CONFIRMED' | 'PROVED_NO_EFFECT' | 'UNKNOWN'
     readonly externalId?: string
     readonly platformCostActual?: V2PlatformCostObservation
+    readonly evidenceMetadataJson?: string
   }>
 }
 
@@ -515,6 +518,18 @@ export class V2OutgoingWorker {
           prepared,
           result.externalId ?? attempt.expectedExternalId ?? undefined,
         ),
+        ...(result.evidenceMetadataJson === undefined
+          ? {}
+          : {
+              metadataJson: mergeEvidenceMetadata(
+                evidenceFields(
+                  attempt,
+                  prepared,
+                  result.externalId ?? attempt.expectedExternalId ?? undefined,
+                ).metadataJson,
+                result.evidenceMetadataJson,
+              ),
+            }),
         confirmedAt: this.now(),
         reservation: 'CONSUME',
         evidenceOutcome: 'CONFIRMED',
@@ -546,6 +561,14 @@ export class V2OutgoingWorker {
         outcome: 'SUBMITTED',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
         ...evidenceFields(attempt, prepared, result.externalId),
+        ...(result.evidenceMetadataJson === undefined
+          ? {}
+          : {
+              metadataJson: mergeEvidenceMetadata(
+                evidenceFields(attempt, prepared, result.externalId).metadataJson,
+                result.evidenceMetadataJson,
+              ),
+            }),
         source: 'V2_OUTGOING_WORKER',
       })
       await this.options.repository.retryWorkItem({
@@ -581,6 +604,14 @@ export class V2OutgoingWorker {
         outcome: 'UNKNOWN',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
         ...evidenceFields(attempt, prepared, result.externalId),
+        ...(result.evidenceMetadataJson === undefined
+          ? {}
+          : {
+              metadataJson: mergeEvidenceMetadata(
+                evidenceFields(attempt, prepared, result.externalId).metadataJson,
+                result.evidenceMetadataJson,
+              ),
+            }),
         source: 'V2_OUTGOING_WORKER',
       })
       await this.options.repository.retryWorkItem({
@@ -632,7 +663,32 @@ export class V2OutgoingWorker {
       return
     }
     if (!(await this.acquireCapacity(claim, 'rpc'))) return
-    const result = await this.options.executor.reconcile({ view, attempt })
+    const prepared = restorePreparedEffect(attempt)
+    let signedPayload: Uint8Array | undefined
+    if (
+      prepared !== undefined &&
+      this.options.signedPayloadCipher !== undefined &&
+      attempt.signedPayloadEncrypted !== undefined &&
+      attempt.signedPayloadEncrypted !== null
+    ) {
+      signedPayload = restoreSignedEffect(
+        this.options.signedPayloadCipher,
+        attempt.signedPayloadEncrypted,
+        prepared,
+        attempt.expectedExternalId,
+        attempt.signedPayloadHash,
+      ).signedPayload
+    }
+    let result: Awaited<ReturnType<NonNullable<V2OutgoingExecutor['reconcile']>>>
+    try {
+      result = await this.options.executor.reconcile({
+        view,
+        attempt,
+        ...(signedPayload === undefined ? {} : { signedPayload }),
+      })
+    } finally {
+      signedPayload?.fill(0)
+    }
     if (result.status === 'CONFIRMED') {
       await this.options.repository.finalizeV2Payment({
         paymentId: view.payment.id,
@@ -651,6 +707,18 @@ export class V2OutgoingWorker {
           undefined,
           result.externalId ?? attempt.expectedExternalId ?? undefined,
         ),
+        ...(result.evidenceMetadataJson === undefined
+          ? {}
+          : {
+              metadataJson: mergeEvidenceMetadata(
+                evidenceFields(
+                  attempt,
+                  undefined,
+                  result.externalId ?? attempt.expectedExternalId ?? undefined,
+                ).metadataJson,
+                result.evidenceMetadataJson,
+              ),
+            }),
         confirmedAt: this.now(),
         reservation: 'CONSUME',
         evidenceOutcome: 'CONFIRMED',
@@ -682,12 +750,33 @@ export class V2OutgoingWorker {
       await this.options.repository.completeWorkItem(claim.id, this.options.owner)
       return
     }
+    if (
+      result.externalId !== undefined &&
+      result.externalId !== attempt.expectedExternalId
+    ) {
+      await this.options.repository.updateAttemptOutcome({
+        attemptId: attempt.id,
+        currentOutcome: attempt.outcome,
+        nextOutcome: attempt.outcome,
+        currentRowVersion: attempt.rowVersion,
+        status: 'RECONCILING',
+        externalId: result.externalId,
+      })
+    }
     await this.recordObservation({
       paymentId: view.payment.id,
       attemptId: attempt.id,
       outcome: 'UNKNOWN',
       ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
       ...evidenceFields(attempt, undefined, result.externalId),
+      ...(result.evidenceMetadataJson === undefined
+        ? {}
+        : {
+            metadataJson: mergeEvidenceMetadata(
+              evidenceFields(attempt, undefined, result.externalId).metadataJson,
+              result.evidenceMetadataJson,
+            ),
+          }),
       source: 'V2_RECONCILIATION_WORKER',
     })
     await this.options.repository.retryWorkItem({
@@ -1096,6 +1185,21 @@ function evidenceFields(
     ...(payloadHash === undefined ? {} : { payloadHash }),
     metadataJson: JSON.stringify(metadata),
   }
+}
+
+function mergeEvidenceMetadata(baseJson: string, additionalJson: string): string {
+  let base: unknown
+  let additional: unknown
+  try {
+    base = JSON.parse(baseJson) as unknown
+    additional = JSON.parse(additionalJson) as unknown
+  } catch {
+    throw new InvalidStateError('Settlement evidence metadata is invalid JSON')
+  }
+  if (!isRecord(base) || !isRecord(additional)) {
+    throw new InvalidStateError('Settlement evidence metadata must be objects')
+  }
+  return JSON.stringify({ ...base, ...additional })
 }
 
 function serializeEncryptedPayload(value: {

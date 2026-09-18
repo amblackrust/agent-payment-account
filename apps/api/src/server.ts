@@ -16,6 +16,9 @@ import { buildApp } from './app.js'
 import { AccountService } from './accounts.js'
 import {
   ConfigurationError,
+  DEFAULT_X402_HTTP_TIMEOUT_MS,
+  DEFAULT_X402_MAX_PAYMENT_ATOMIC,
+  DEFAULT_X402_RESOURCE_URL,
   getRuntimeLimits,
   loadConfig,
   redactConfig,
@@ -43,6 +46,7 @@ import { waitForShutdown } from './lifecycle.js'
 import { buildRuntimeIdentity } from './runtime-identity.js'
 import { createRuntimeOwner } from './runtime-owner.js'
 import { createFundingProvisioner } from './funding-provisioner.js'
+import { X402PaymentService } from './x402-service.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -176,6 +180,14 @@ async function startServer(): Promise<void> {
     routeCapabilityProvider,
     maxPageSize: limits.maxPageSize,
   })
+  const x402PaymentService = new X402PaymentService({
+    paymentService: v2PaymentService,
+    repository: database.v2,
+    resourceUrl: config.x402ResourceUrl ?? DEFAULT_X402_RESOURCE_URL,
+    settlementMint: config.solanaSettlementMint,
+    maxPaymentAtomic: config.x402MaxPaymentAtomic ?? DEFAULT_X402_MAX_PAYMENT_ATOMIC,
+    httpTimeoutMs: config.x402HttpTimeoutMs ?? DEFAULT_X402_HTTP_TIMEOUT_MS,
+  })
   const v2ManagementService = new V2ManagementService({
     repository: database.v2Admin,
     financialRepository: database.v2,
@@ -225,6 +237,7 @@ async function startServer(): Promise<void> {
     v2ReceiveService,
     transactionService,
     v2PaymentService,
+    x402PaymentService,
     v2ManagementService,
     v2OperationsService,
     v2AdminRepository: database.v2Admin,
@@ -370,7 +383,10 @@ async function getLogicalSettledAtomic(
   rail: SolanaRail,
   input: Parameters<V2SettledBalanceProvider['getSettledAtomic']>[0],
 ): Promise<bigint> {
-  const balance = await rail.getSettlementBalance(input.account.account.solanaPublicKey)
+  const balance =
+    rail.getSettlementAtomicBalance === undefined
+      ? await rail.getSettlementBalance(input.account.account.solanaPublicKey)
+      : await rail.getSettlementAtomicBalance(input.account.account.solanaPublicKey)
   if (balance.tokenDecimals !== input.settlementAsset.decimals) {
     throw new ExternalRailError(
       'Settlement token decimals differ from the persisted asset configuration',

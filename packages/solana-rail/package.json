@@ -20,6 +20,8 @@
     "@agent-payment/core": "workspace:*",
     "@solana-program/memo": "0.13.1",
     "@solana-program/token": "0.16.1",
-    "@solana/kit": "8.2.0"
+    "@solana/keys": "8.2.0",
+    "@solana/kit": "8.2.0",
+    "@solana/transactions": "8.2.0"
   }
 }

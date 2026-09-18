@@ -58,6 +58,7 @@ export interface SolanaV2PaymentView {
     readonly correlationId?: string | null
     readonly recipientManagedAccountId: string | null
     readonly externalReference: string | null
+    readonly metadataJson?: string
     readonly amountAtomic: bigint
     readonly amountScale: number | null
     readonly denominationId: string | null

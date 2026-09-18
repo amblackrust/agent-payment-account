@@ -1,11 +1,18 @@
 import { z } from 'zod'
 import type { DomainAlertThresholds } from './observability.js'
+import {
+  X402_ABSOLUTE_MAX_PAYMENT_ATOMIC,
+  X402_RESOURCE_URL as X402_RESOURCE_DEFAULT,
+} from './x402-protocol.js'
 
 const positiveInt = (defaultValue: number, maximum: number) =>
   z.coerce.number().int().min(1).max(maximum).default(defaultValue)
 
 export const DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS = 15 * 60
 const MAX_BACKUP_INTERVAL_SECONDS = 365 * 24 * 60 * 60
+export const DEFAULT_X402_HTTP_TIMEOUT_MS = 15_000
+export const DEFAULT_X402_MAX_PAYMENT_ATOMIC = X402_ABSOLUTE_MAX_PAYMENT_ATOMIC
+export const DEFAULT_X402_RESOURCE_URL = X402_RESOURCE_DEFAULT
 
 export interface RuntimeLimits {
   readonly workerBatchSize: number
@@ -80,6 +87,13 @@ const configSchema = z.object({
   SOLANA_PLATFORM_COST_ASSET_ID: z.string().trim().min(1).optional(),
   SOLANA_FEE_PAYER_SECRET: z.string().min(1).optional(),
   SOLANA_FEE_PAYER_IDENTITY: z.string().trim().min(1).optional(),
+  X402_RESOURCE_URL: z.url().default(DEFAULT_X402_RESOURCE_URL),
+  X402_HTTP_TIMEOUT_MS: positiveInt(DEFAULT_X402_HTTP_TIMEOUT_MS, 120_000),
+  X402_MAX_PAYMENT_ATOMIC: z.coerce
+    .bigint()
+    .positive()
+    .max(DEFAULT_X402_MAX_PAYMENT_ATOMIC)
+    .default(DEFAULT_X402_MAX_PAYMENT_ATOMIC),
   WALLET_MASTER_KEY: z
     .string()
     .regex(
@@ -233,6 +247,9 @@ export type AppConfig = {
   readonly solanaPlatformCostAssetId?: string
   readonly solanaFeePayerSecret: string | undefined
   readonly solanaFeePayerIdentity?: string
+  readonly x402ResourceUrl?: string
+  readonly x402HttpTimeoutMs?: number
+  readonly x402MaxPaymentAtomic?: bigint
   readonly walletMasterKey: string | undefined
   readonly recoveryEnvelopeKey: string | undefined
   readonly webhookSigningKeysJson?: string
@@ -435,6 +452,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     ...(result.data.SOLANA_FEE_PAYER_IDENTITY === undefined
       ? {}
       : { solanaFeePayerIdentity: result.data.SOLANA_FEE_PAYER_IDENTITY }),
+    x402ResourceUrl: result.data.X402_RESOURCE_URL,
+    x402HttpTimeoutMs: result.data.X402_HTTP_TIMEOUT_MS,
+    x402MaxPaymentAtomic: result.data.X402_MAX_PAYMENT_ATOMIC,
     walletMasterKey: result.data.WALLET_MASTER_KEY,
     recoveryEnvelopeKey: result.data.RECOVERY_ENVELOPE_KEY,
     ...(result.data.WEBHOOK_SIGNING_KEYS_JSON === undefined
@@ -507,6 +527,9 @@ export interface RedactedConfig {
   readonly solanaCluster: AppConfig['solanaCluster']
   readonly solanaSettlementMint: string
   readonly solanaPlatformCostAssetId?: string
+  readonly x402ResourceUrl: string
+  readonly x402HttpTimeoutMs: number
+  readonly x402MaxPaymentAtomic: string
   readonly allowMainnet: boolean
   readonly hasAdminApiKey: boolean
   readonly hasSolanaFeePayerSecret: boolean
@@ -537,6 +560,11 @@ export function redactConfig(config: AppConfig): RedactedConfig {
       : { restoreGateEnvironment: config.restoreGateEnvironment }),
     solanaCluster: config.solanaCluster,
     solanaSettlementMint: config.solanaSettlementMint,
+    x402ResourceUrl: config.x402ResourceUrl ?? DEFAULT_X402_RESOURCE_URL,
+    x402HttpTimeoutMs: config.x402HttpTimeoutMs ?? DEFAULT_X402_HTTP_TIMEOUT_MS,
+    x402MaxPaymentAtomic: String(
+      config.x402MaxPaymentAtomic ?? DEFAULT_X402_MAX_PAYMENT_ATOMIC,
+    ),
     ...(config.solanaPlatformCostAssetId === undefined
       ? {}
       : { solanaPlatformCostAssetId: config.solanaPlatformCostAssetId }),

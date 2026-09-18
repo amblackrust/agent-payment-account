@@ -33,6 +33,13 @@ export interface SettlementBalance {
   readonly ataStatus: 'PRESENT' | 'MISSING'
 }
 
+export interface SettlementAtomicBalance {
+  readonly tokenAtomicUnits: bigint
+  readonly tokenDecimals: number
+  readonly ata: string
+  readonly ataStatus: 'PRESENT' | 'MISSING'
+}
+
 export interface ReceiveDestination {
   readonly owner: string
   readonly tokenAccount: string
@@ -41,6 +48,8 @@ export interface ReceiveDestination {
 
 export interface SolanaRail {
   getSettlementBalance(owner: string): Promise<SettlementBalance>
+  /** Reads the exact token balance without forcing a USD two-decimal projection. */
+  getSettlementAtomicBalance?(owner: string): Promise<SettlementAtomicBalance>
   getReceiveDestination(owner: string): Promise<ReceiveDestination>
   checkReadiness?(): Promise<void>
 }
@@ -270,6 +279,43 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
     }
   }
 
+  async function getSettlementAtomicBalance(
+    owner: string,
+  ): Promise<SettlementAtomicBalance> {
+    const metadata = await getSettlementMetadata()
+    const destination = await deriveDestinationWithoutValidation(owner)
+    try {
+      const tokenAccount = await withRpcTimeout((abortSignal) =>
+        fetchMaybeToken(options.rpc, destination.tokenAccount as Address, {
+          abortSignal,
+        }),
+      )
+      if (!tokenAccount.exists) {
+        return {
+          tokenAtomicUnits: 0n,
+          tokenDecimals: metadata.decimals,
+          ata: destination.tokenAccount,
+          ataStatus: 'MISSING',
+        }
+      }
+      if (
+        tokenAccount.programAddress !== TOKEN_PROGRAM_ADDRESS ||
+        tokenAccount.data.mint !== settlementMint ||
+        tokenAccount.data.owner !== destination.owner
+      ) {
+        throw new ExternalRailError('Settlement token account has unexpected ownership')
+      }
+      return {
+        tokenAtomicUnits: tokenAccount.data.amount,
+        tokenDecimals: metadata.decimals,
+        ata: destination.tokenAccount,
+        ataStatus: 'PRESENT',
+      }
+    } catch (error) {
+      throw toExternalRailError(error)
+    }
+  }
+
   return {
     async checkReadiness(): Promise<void> {
       await validateSettlementMetadata()
@@ -280,46 +326,16 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
       return deriveDestinationWithoutValidation(owner)
     },
 
-    async getSettlementBalance(owner): Promise<SettlementBalance> {
-      const metadata = await getSettlementMetadata()
-      const destination = await deriveDestinationWithoutValidation(owner)
-      try {
-        const tokenAccount = await withRpcTimeout((abortSignal) =>
-          fetchMaybeToken(options.rpc, destination.tokenAccount as Address, {
-            abortSignal,
-          }),
-        )
-        if (!tokenAccount.exists) {
-          return {
-            currency: 'USD',
-            settled: moneyFromAtomicUnits(0n),
-            tokenAtomicUnits: 0n,
-            tokenDecimals: metadata.decimals,
-            ata: destination.tokenAccount,
-            ataStatus: 'MISSING',
-          }
-        }
-        if (
-          tokenAccount.programAddress !== TOKEN_PROGRAM_ADDRESS ||
-          tokenAccount.data.mint !== settlementMint ||
-          tokenAccount.data.owner !== destination.owner
-        ) {
-          throw new ExternalRailError(
-            'Settlement token account has unexpected ownership',
-          )
-        }
+    async getSettlementAtomicBalance(owner): Promise<SettlementAtomicBalance> {
+      return getSettlementAtomicBalance(owner)
+    },
 
-        const tokenAtomicUnits = tokenAccount.data.amount
-        return {
-          currency: 'USD',
-          settled: tokenToUsdMoney(tokenAtomicUnits, metadata.decimals),
-          tokenAtomicUnits,
-          tokenDecimals: metadata.decimals,
-          ata: destination.tokenAccount,
-          ataStatus: 'PRESENT',
-        }
-      } catch (error) {
-        throw toExternalRailError(error)
+    async getSettlementBalance(owner): Promise<SettlementBalance> {
+      const balance = await getSettlementAtomicBalance(owner)
+      return {
+        currency: 'USD',
+        settled: tokenToUsdMoney(balance.tokenAtomicUnits, balance.tokenDecimals),
+        ...balance,
       }
     },
   }
