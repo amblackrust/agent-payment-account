@@ -35,6 +35,27 @@ of the repository `format:check`, `lint`, `typecheck`, `build`, full test suite,
 and database-enabled test suite before release tagging. Results belong in the
 release record rather than being inferred from source inspection.
 
+## Known implementation gaps under review
+
+The following items are concrete repository findings, not silently accepted
+scope reductions:
+
+- V2 exposes credential listing, rotation, and revocation, but no delegated
+  credential-creation endpoint. The persistence primitive exists, while the
+  public request, idempotency, and one-time recovery contract remains
+  unspecified by the implementation plan.
+- `packages/contracts` contains canonical Zod contracts, but Fastify response
+  schemas are still maintained separately. Generated schema output and an
+  automated HTTP/SDK/webhook parity check are not yet present.
+- The direct API and worker entrypoints still import `dotenv/config`. Production
+  startup therefore needs an explicit secret-loading boundary before it can
+  satisfy the requirement that production secrets do not come from an
+  unmanaged `.env` file.
+- The production dependency audit currently reports two high-severity and one
+  moderate transitive Prisma/MySQL findings. Remediation needs a deliberate
+  supported Prisma/dependency decision rather than an untested release-candidate
+  upgrade.
+
 ## Gated or external evidence
 
 - Production outgoing execution is gated on the OD-003 custody backend and its
