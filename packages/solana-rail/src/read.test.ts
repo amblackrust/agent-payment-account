@@ -93,7 +93,7 @@ describe('Solana settlement read rail', () => {
     )
   })
 
-  it('treats a missing associated token account as zero balance', async () => {
+  it('reports a missing associated token account for funding readiness without creating it', async () => {
     const rail = createSolanaRailWithRpc({
       rpc: createMockRpc(
         new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(6))]]),
@@ -110,7 +110,7 @@ describe('Solana settlement read rail', () => {
     expect(result.ataStatus).toBe('MISSING')
   })
 
-  it('reads present balances and preserves unusual decimals and bigint precision', async () => {
+  it('reports a present associated token account for funding readiness and preserves balance precision', async () => {
     const destinationRail = createSolanaRailWithRpc({
       rpc: createMockRpc(
         new Map([[mint, encodeAccount(TOKEN_PROGRAM_ADDRESS, mintData(3))]]),

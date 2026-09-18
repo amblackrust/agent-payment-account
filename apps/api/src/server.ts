@@ -41,6 +41,7 @@ import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { createDomainHealthSnapshot, MetricsRegistry } from './observability.js'
 import { waitForShutdown } from './lifecycle.js'
 import { buildRuntimeIdentity } from './runtime-identity.js'
+import { createFundingProvisioner } from './funding-provisioner.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -81,52 +82,12 @@ async function startServer(): Promise<void> {
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
   }
-  const fundingProvisioner = {
-    provision: async (input: {
-      readonly accountId: string
-      readonly owner: string
-    }) => {
-      const routes = await database.v2.listActiveSettlementRoutes()
-      const route = routes[0]
-      if (route === undefined) {
-        throw new DependencyUnavailableError('No active settlement route is configured')
-      }
-      const asset = await database.v2.findSettlementAsset(route.settlementAssetId)
-      if (asset === null) {
-        throw new DependencyUnavailableError(
-          'Settlement asset configuration is unavailable',
-        )
-      }
-      if (
-        route.rail !== 'SOLANA_SPL' ||
-        route.network !== config.solanaCluster ||
-        asset.rail !== route.rail ||
-        asset.network !== route.network ||
-        asset.assetReference !== config.solanaSettlementMint
-      ) {
-        throw new DependencyUnavailableError(
-          'Funding route does not match the configured Solana settlement identity',
-        )
-      }
-      await rail.checkReadiness?.()
-      const destination = await rail.getReceiveDestination(input.owner)
-      await database.v2Admin.upsertFundingDestination({
-        id: `funding_${input.accountId}_${route.id}_${asset.id}`,
-        accountId: input.accountId,
-        routeId: route.id,
-        network: route.network,
-        assetId: asset.id,
-        destination: destination.tokenAccount,
-        readiness: 'READY',
-        senderConstraintsJson: JSON.stringify({
-          rail: route.rail,
-          asset_reference: asset.assetReference,
-          destination_owner: destination.owner,
-        }),
-        lastValidatedAt: new Date(),
-      })
-    },
-  }
+  const fundingProvisioner = createFundingProvisioner({
+    database,
+    rail,
+    solanaCluster: config.solanaCluster,
+    settlementMint: config.solanaSettlementMint,
+  })
   const accountService = new AccountService(
     database,
     walletCipher,
