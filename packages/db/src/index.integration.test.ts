@@ -391,6 +391,84 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('keeps platform cost estimates separate from reconciled actuals', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const costId = `cost_${randomUUID().replaceAll('-', '')}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'platform-cost-integration-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+
+        const input = {
+          id: costId,
+          accountId,
+          assetId: 'asset_sol',
+          estimatedAmount: 7n,
+        }
+        const estimate = await database.v2Operations.createPlatformCostEstimate(input)
+        expect(estimate).toMatchObject({
+          id: costId,
+          estimatedAmount: 7n,
+          actualAmount: null,
+          reconciliationStatus: 'ESTIMATED',
+        })
+        await expect(
+          database.v2Operations.createPlatformCostEstimate(input),
+        ).resolves.toMatchObject({ id: costId, actualAmount: null })
+
+        const observedAt = new Date('2026-09-18T00:00:00.000Z')
+        const reconciled = await database.v2Operations.reconcilePlatformCost({
+          id: costId,
+          actualAmount: 4n,
+          observedAt,
+        })
+        expect(reconciled).toMatchObject({
+          estimatedAmount: 7n,
+          actualAmount: 4n,
+          reconciliationStatus: 'RECONCILED',
+          observedAt,
+        })
+        await expect(
+          database.v2Operations.reconcilePlatformCost({
+            id: costId,
+            actualAmount: 4n,
+            observedAt,
+          }),
+        ).resolves.toMatchObject({ id: costId, actualAmount: 4n })
+        await expect(
+          database.v2Operations.reconcilePlatformCost({
+            id: costId,
+            actualAmount: 5n,
+            observedAt,
+          }),
+        ).rejects.toBeInstanceOf(ConflictError)
+
+        const timeline = await database.v2Operations.listTimeline({
+          accountId,
+          limit: 10,
+        })
+        expect(timeline.map((event) => event.eventType)).toEqual(
+          expect.arrayContaining([
+            'PLATFORM_COST_ESTIMATED',
+            'PLATFORM_COST_RECONCILED',
+          ]),
+        )
+      } finally {
+        await database.disconnect()
+      }
+    })
+
     it('serializes reservations and persists idempotency across concurrent calls', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`
