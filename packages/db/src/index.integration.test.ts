@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { Client } from 'pg'
 
-import { ConflictError, RecipientResolutionError } from '@agent-payment/core'
+import {
+  ConflictError,
+  NotFoundError,
+  RecipientResolutionError,
+} from '@agent-payment/core'
 import { createDatabaseClient } from './index.js'
 
 const databaseUrl = process.env.DATABASE_URL?.trim()
@@ -37,6 +41,66 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await database.markCredentialUsed(credentialId)
         expect(await database.revokeCredential(accountId, credentialId)).toBe(true)
         expect(await database.revokeCredential(accountId, credentialId)).toBe(false)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('allows only one concurrent credential rotation to revoke the active source', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const recoveryIdempotencyKey = `CREDENTIAL_ROTATION:${accountId}:race`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'rotation-race-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+
+        const rotate = (suffix: string) => ({
+          accountId,
+          oldCredentialId: credentialId,
+          newCredentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_${suffix}_hash`,
+          keyPrefix: `apa_${suffix}`,
+          scopes: ['payments:read'],
+          recoveryCiphertext: `ciphertext-${suffix}`,
+          recoveryNonce: 'bm9uY2U=',
+          recoveryAuthTag: 'dGFn',
+          recoveryIdempotencyKey,
+          recoveryExpiresAt: new Date('2026-09-19T00:00:00.000Z'),
+        })
+        const results = await Promise.allSettled([
+          database.v2Admin.rotateCredential(rotate('one')),
+          database.v2Admin.rotateCredential(rotate('two')),
+        ])
+
+        expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(
+          1,
+        )
+        const rejected = results.find((result) => result.status === 'rejected')
+        expect(rejected?.reason).toBeInstanceOf(NotFoundError)
+        const credentials = await database.v2Admin.listCredentials(accountId)
+        expect(credentials.filter((item) => item.status === 'ACTIVE')).toHaveLength(1)
+        expect(
+          credentials.filter((item) => item.rotatedFromId === credentialId),
+        ).toHaveLength(1)
+        const envelope = await database.v2Admin.consumeRecoveryEnvelope(
+          accountId,
+          recoveryIdempotencyKey,
+          new Date('2026-09-18T00:00:00.000Z'),
+        )
+        expect(envelope?.credentialId).toBe(
+          credentials.find((item) => item.status === 'ACTIVE')?.id,
+        )
       } finally {
         await database.disconnect()
       }

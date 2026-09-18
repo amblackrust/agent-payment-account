@@ -634,14 +634,22 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             rotatedFromId: oldCredential.id,
           },
         })
-        await transaction.apiCredential.update({
-          where: { id: oldCredential.id },
+        const revoked = await transaction.apiCredential.updateMany({
+          where: {
+            id: oldCredential.id,
+            accountId: input.accountId,
+            status: 'ACTIVE',
+            revokedAt: null,
+          },
           data: {
             status: 'REVOKED',
             revokedAt: new Date(),
             rowVersion: { increment: 1 },
           },
         })
+        if (revoked.count !== 1) {
+          throw new NotFoundError('Credential was not found or already revoked')
+        }
         await transaction.credentialRecoveryEnvelope.upsert({
           where: { idempotencyKey: input.recoveryIdempotencyKey },
           create: {

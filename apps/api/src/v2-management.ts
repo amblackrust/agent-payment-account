@@ -7,6 +7,7 @@ import {
   DependencyUnavailableError,
   exactMoneyFromAtomicUnits,
   formatExactMoney,
+  IdempotencyConflictError,
   InvalidStateError,
   NotFoundError,
   parseExactMoney,
@@ -22,6 +23,7 @@ import type {
   V2AdminRepository,
   V2AccountRecord,
   V2ApprovalAdminRecord,
+  V2CredentialRecord,
   V2DatabaseRepository,
   V2HistoryRecord,
   V2SpendPolicyAdminRecord,
@@ -117,37 +119,83 @@ export class V2ManagementService {
       throw new DependencyUnavailableError('Credential recovery is unavailable')
     }
     await this.requireAccount(accountId)
+    const recoveryIdempotencyKey = `CREDENTIAL_ROTATION:${accountId}:${idempotencyKey}`
+    const recovered = await this.recoverRotatedCredential(
+      accountId,
+      oldCredentialId,
+      recoveryIdempotencyKey,
+      scopes,
+    )
+    if (recovered !== null) return recovered
     const existingCredential = (
       await this.options.repository.listCredentials(accountId)
     ).find((candidate) => candidate.id === oldCredentialId)
-    if (existingCredential === undefined) {
+    if (existingCredential === undefined || existingCredential.status !== 'ACTIVE') {
       throw new NotFoundError('Credential was not found or already revoked')
     }
     const credential = generateApiCredential()
     const recovery = this.options.recoveryCipher.encrypt(
       new TextEncoder().encode(credential.rawKey),
     )
-    const stored = await this.options.repository.rotateCredential({
-      accountId,
-      oldCredentialId,
-      newCredentialId: createCredentialId(),
-      keyHash: credential.keyHash,
-      keyPrefix: credential.keyPrefix,
-      scopes: scopes ?? existingCredential.scopes,
-      recoveryCiphertext: recovery.ciphertext,
-      recoveryNonce: recovery.nonce,
-      recoveryAuthTag: recovery.authTag,
-      recoveryIdempotencyKey: `CREDENTIAL_ROTATION:${accountId}:${idempotencyKey}`,
-      recoveryExpiresAt: new Date(this.now().getTime() + RECOVERY_TTL_MS),
-    })
-    return {
-      credential_id: stored.id,
-      account_id: stored.accountId,
-      api_key: credential.rawKey,
-      key_prefix: credential.keyPrefix,
-      scopes: [...stored.scopes],
-      expires_at: stored.expiresAt?.toISOString() ?? null,
+    try {
+      const stored = await this.options.repository.rotateCredential({
+        accountId,
+        oldCredentialId,
+        newCredentialId: createCredentialId(),
+        keyHash: credential.keyHash,
+        keyPrefix: credential.keyPrefix,
+        scopes: scopes ?? existingCredential.scopes,
+        recoveryCiphertext: recovery.ciphertext,
+        recoveryNonce: recovery.nonce,
+        recoveryAuthTag: recovery.authTag,
+        recoveryIdempotencyKey,
+        recoveryExpiresAt: new Date(this.now().getTime() + RECOVERY_TTL_MS),
+      })
+      return serializeRotatedCredential(stored, credential.rawKey, credential.keyPrefix)
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error
+      const concurrentRecovery = await this.recoverRotatedCredential(
+        accountId,
+        oldCredentialId,
+        recoveryIdempotencyKey,
+        scopes,
+      )
+      if (concurrentRecovery !== null) return concurrentRecovery
+      throw error
     }
+  }
+
+  private async recoverRotatedCredential(
+    accountId: string,
+    oldCredentialId: string,
+    recoveryIdempotencyKey: string,
+    scopes: readonly string[] | undefined,
+  ) {
+    const envelope = await this.options.repository.consumeRecoveryEnvelope(
+      accountId,
+      recoveryIdempotencyKey,
+      this.now(),
+    )
+    if (envelope === null) return null
+    const recoveredCredential = (
+      await this.options.repository.listCredentials(accountId)
+    ).find((candidate) => candidate.id === envelope.credentialId)
+    if (recoveredCredential === undefined) {
+      throw new InvalidStateError('Recovered credential is unavailable')
+    }
+    if (recoveredCredential.rotatedFromId !== oldCredentialId) {
+      throw new IdempotencyConflictError()
+    }
+    if (scopes !== undefined && !sameScopes(scopes, recoveredCredential.scopes)) {
+      throw new IdempotencyConflictError()
+    }
+    const secret = this.options.recoveryCipher!.decrypt({
+      ciphertext: envelope.ciphertext,
+      nonce: envelope.nonce,
+      authTag: envelope.authTag,
+    })
+    const rawKey = decodeOneTimeSecret(secret)
+    return serializeRotatedCredential(recoveredCredential, rawKey, rawKey.slice(0, 12))
   }
 
   public async revokeCredential(
@@ -519,6 +567,37 @@ export class V2ManagementService {
       )
     }
     return { economicMapping, settlementAsset }
+  }
+}
+
+function serializeRotatedCredential(
+  credential: V2CredentialRecord,
+  rawKey: string,
+  keyPrefix: string,
+) {
+  return {
+    credential_id: credential.id,
+    account_id: credential.accountId,
+    api_key: rawKey,
+    key_prefix: keyPrefix,
+    scopes: [...credential.scopes],
+    expires_at: credential.expiresAt?.toISOString() ?? null,
+  }
+}
+
+function sameScopes(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length && left.every((scope, index) => scope === right[index])
+  )
+}
+
+function decodeOneTimeSecret(secret: Uint8Array): string {
+  try {
+    const value = new TextDecoder().decode(secret)
+    if (value.length === 0) throw new InvalidStateError('Recovered credential is empty')
+    return value
+  } finally {
+    secret.fill(0)
   }
 }
 
