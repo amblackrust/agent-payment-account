@@ -5,11 +5,9 @@ import { enqueueWebhookEvent } from './webhook-events.js'
 function createTransaction(eventExists = false, eventTypes = ['payment.updated']) {
   return {
     webhookEvent: {
-      createMany: vi.fn(
-        async (_input: { data: Record<string, unknown> }) => ({
-          count: eventExists ? 0 : 1,
-        }),
-      ),
+      createMany: vi.fn(async (_input: { data: Record<string, unknown> }) => ({
+        count: eventExists ? 0 : 1,
+      })),
     },
     webhookSubscription: {
       findMany: vi.fn(async () => [
