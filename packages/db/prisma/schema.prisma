@@ -214,6 +214,7 @@ model Payment {
   route                     String?              @db.VarChar(64)
   routeId                   String?              @map("route_id") @db.VarChar(64)
   routeSelectionReason      String?              @map("route_selection_reason") @db.VarChar(64)
+  routeCapabilitySnapshotJson String?            @map("route_capability_snapshot_json") @db.Text
   settlementAssetId         String?              @map("settlement_asset_id") @db.VarChar(64)
   economicMappingId         String?              @map("economic_mapping_id") @db.VarChar(64)
   destinationSnapshotJson   String?              @map("destination_snapshot_json") @db.Text

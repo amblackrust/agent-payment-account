@@ -95,6 +95,7 @@ export interface V2PaymentSnapshot {
   readonly status: string
   readonly routeId: string | null
   readonly routeSelectionReason: string | null
+  readonly routeCapabilitySnapshotJson?: string | null
   readonly settlementAssetId: string | null
   readonly economicMappingId?: string | null
   readonly destinationSnapshotJson: string | null
@@ -179,6 +180,7 @@ export interface V2PaymentCreateInput {
   readonly originalPaymentId?: string
   readonly route: SettlementRoute | null
   readonly routeSelectionReason: string | null
+  readonly routeCapabilitySnapshotJson?: string | null
   readonly destinationSnapshotJson: string
   readonly settlementAssetId: string | null
   readonly economicMappingId: string | null
@@ -1073,6 +1075,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             ...(decision === 'DENY'
               ? {}
               : { routeSelectionReason: input.routeSelectionReason }),
+            ...(input.routeCapabilitySnapshotJson === undefined
+              ? {}
+              : { routeCapabilitySnapshotJson: input.routeCapabilitySnapshotJson }),
             ...(input.settlementAssetId === null
               ? {}
               : { settlementAssetId: input.settlementAssetId }),
@@ -2067,6 +2072,7 @@ function toV2PaymentSnapshot(payment: {
   status: string
   routeId: string | null
   routeSelectionReason: string | null
+  routeCapabilitySnapshotJson?: string | null
   settlementAssetId: string | null
   economicMappingId: string | null
   destinationSnapshotJson: string | null

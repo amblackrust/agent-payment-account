@@ -186,6 +186,10 @@ export class V2PaymentService {
       capabilities,
     )
     const route = routeSelection.route
+    const routeCapabilitySnapshotJson = serializeRouteCapabilitySnapshot(
+      routeSelection,
+      capabilities,
+    )
     const target =
       input.target ??
       (input.recipientId === null
@@ -392,6 +396,10 @@ export class V2PaymentService {
         route: policyDecision.decision === 'DENY' ? null : route,
         routeSelectionReason:
           policyDecision.decision === 'DENY' ? null : routeSelection.reason,
+        ...(policyDecision.decision === 'DENY' ||
+        routeCapabilitySnapshotJson === undefined
+          ? {}
+          : { routeCapabilitySnapshotJson }),
         destinationSnapshotJson: JSON.stringify({
           recipient_id: target.recipientId,
           display_name: target.displayName,
@@ -604,6 +612,23 @@ export class V2PaymentService {
       destination,
     }
   }
+}
+
+function serializeRouteCapabilitySnapshot(
+  routeSelection: ReturnType<typeof selectSettlementRoute>,
+  capabilities: readonly RouteCapability[],
+): string | undefined {
+  const capability = capabilities.find(
+    (candidate) => candidate.routeId === routeSelection.route.id,
+  )
+  if (capability === undefined) return undefined
+  return JSON.stringify({
+    route_id: capability.routeId,
+    eligible: capability.eligible,
+    reason: capability.reason ?? null,
+    observed_at: capability.observedAt.toISOString(),
+    identity_version: capability.identityVersion,
+  })
 }
 
 function parseAmount(value: string, denomination: Denomination): ExactMoney {

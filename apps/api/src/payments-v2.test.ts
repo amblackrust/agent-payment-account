@@ -275,6 +275,41 @@ describe('V2 payment service', () => {
     expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
   })
 
+  it('persists the selected route capability identity and observation time', async () => {
+    const observedAt = new Date('2026-09-17T00:00:01.000Z')
+    const harness = createHarness(true, {
+      getCapabilities: async (routes) =>
+        routes.map((route) => ({
+          routeId: route.id,
+          eligible: true,
+          observedAt,
+          identityVersion: 'solana:localnet:mint:v1',
+        })),
+    })
+
+    await harness.service.createPayment(
+      account,
+      {
+        kind: 'PAY',
+        recipientId: 'recipient_1',
+        amount: '1.25',
+        denominationId: 'denom_usd',
+      },
+      'idem_capability_snapshot',
+      'req_capability_snapshot',
+    )
+
+    expect(harness.getCaptured()?.routeCapabilitySnapshotJson).toBe(
+      JSON.stringify({
+        route_id: 'route_solana',
+        eligible: true,
+        reason: null,
+        observed_at: observedAt.toISOString(),
+        identity_version: 'solana:localnet:mint:v1',
+      }),
+    )
+  })
+
   it('persists policy denial without selecting a durable route or calling balance', async () => {
     const harness = createHarness(false)
     const result = await harness.service.createPayment(
