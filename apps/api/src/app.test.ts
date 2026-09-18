@@ -362,6 +362,12 @@ describe('API foundation', () => {
       'x-admin-api-key': testConfig.adminApiKey,
       'idempotency-key': 'issue-key',
     }
+    const missingIdempotencyKey = await app.inject({
+      method: 'POST',
+      url: '/v2/accounts/acct_1/credentials',
+      headers: { 'x-admin-api-key': testConfig.adminApiKey },
+      payload: { scopes: ['payments:read'] },
+    })
     const first = await app.inject({
       method: 'POST',
       url: '/v2/accounts/acct_1/credentials',
@@ -390,6 +396,7 @@ describe('API foundation', () => {
       headers: { 'idempotency-key': 'issue-key' },
     })
 
+    expect(missingIdempotencyKey.statusCode).toBe(400)
     expect(first.statusCode).toBe(201)
     expect(first.json()).toMatchObject({ api_key: 'apa_issued_secret' })
     expect(replay.statusCode).toBe(200)
@@ -402,6 +409,7 @@ describe('API foundation', () => {
     expect(acknowledgedAgain.statusCode).toBe(200)
     expect(unauthorizedAcknowledgement.statusCode).toBe(401)
     expect(acknowledgeCredentialRecovery).toHaveBeenCalledTimes(2)
+    expect(createCredential).toHaveBeenCalledTimes(2)
     expect(createCredential).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
