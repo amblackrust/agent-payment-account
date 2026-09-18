@@ -44,9 +44,53 @@ release record rather than being inferred from source inspection.
 The following items are concrete repository findings, not silently accepted
 scope reductions:
 
-- `packages/contracts` contains canonical Zod contracts, but Fastify response
-  schemas are still maintained separately. Generated schema output and an
-  automated HTTP/SDK/webhook parity check are not yet present.
+- `packages/contracts/src/v2-http.ts` now generates the Draft-07 HTTP schemas
+  from the canonical Zod contracts, and the API imports those generated
+  documents through `apps/api/src/v2-response-schemas.ts`. The credential and
+  payment contracts have direct contract tests. Some route-local wrappers
+  remain intentionally local because they apply runtime-configured limits
+  such as the maximum page size; those wrappers must not redefine money,
+  status, error, or credential semantics.
+
+## TASK-029..035 and TASK-039 audit
+
+The following evidence is scoped to the Solana rail boundary and the runtime
+operations requested by the implementation plan:
+
+- TASK-029: `packages/solana-rail/src/payment.ts`,
+  `packages/solana-rail/src/v2-outgoing.ts`, `read.ts`, and `incoming.ts`
+  keep cluster/mint validation, bounded RPC calls, exact signed-payload
+  persistence/resend, and authoritative reconciliation inside the rail
+  adapter. Production custody remains an explicit boundary; no provider is
+  selected here.
+- TASK-030: `apps/api/src/observability.ts` and `apps/api/src/app.ts` provide
+  redacted structured request logging, low-cardinality metrics, health/domain
+  alerts, and separate liveness/readiness/domain endpoints. Full correlation
+  propagation into every durable timeline/worker event and a deployable alert
+  rule set remain review findings.
+- TASK-031: `apps/api/src/config.ts`, `server.ts`, and `worker.ts` enforce
+  explicit role, mainnet, secret-source, custody, and authority configuration.
+  The dedicated API now initializes the persisted financial identity without
+  decrypting legacy signer plaintext. The persisted identity still does not
+  include every plan-named runtime fact, notably the fee-payer public identity
+  and route/mapping version, so that remains a high-priority contract finding.
+- TASK-032: the role-specific entrypoints, durable leases, health routes, and
+  shutdown handling are in `apps/api/src/server.ts` and `worker.ts`. No
+  orchestration manifest or CI deployment pipeline is claimed; the repository
+  deliberately remains platform-neutral pending the deployment decision.
+- TASK-033: `packages/db/prisma-preflight.mjs`, migration deploy scripts, and
+  `packages/db/src/legacy-backfill.integration.test.ts` provide duplicate
+  checks, repeatable migration execution, and conservative legacy mapping.
+  Production-sized snapshot/backfill evidence is still an operational gate.
+- TASK-034: `scripts/backup-verify.mjs`, `restore-safety.mjs`, and the
+  maintenance runtime now require an explicit backup cadence and isolated
+  verification material, create missing output directories, compare actual
+  PostgreSQL backend identities, and reject reusing the source/restored runtime
+  authority. A real restore drill and OD-008 RPO/RTO/retention values still
+  require controlled infrastructure.
+- TASK-035/TASK-039: repository regression commands and the exact changed-file
+  evidence are recorded at handoff. Worker-kill, DB-restart, real custody, and
+  paid external proof cannot be represented by unit tests in this workspace.
 
 ## Scoped dependency security remediation
 
