@@ -384,6 +384,11 @@ describe('API foundation', () => {
       url: '/v2/accounts/acct_1/credentials/recovery/acknowledge',
       headers,
     })
+    const unauthorizedAcknowledgement = await app.inject({
+      method: 'POST',
+      url: '/v2/accounts/acct_1/credentials/recovery/acknowledge',
+      headers: { 'idempotency-key': 'issue-key' },
+    })
 
     expect(first.statusCode).toBe(201)
     expect(first.json()).toMatchObject({ api_key: 'apa_issued_secret' })
@@ -395,6 +400,8 @@ describe('API foundation', () => {
     expect(acknowledged.statusCode).toBe(200)
     expect(acknowledged.json()).toEqual({ status: 'ACKNOWLEDGED' })
     expect(acknowledgedAgain.statusCode).toBe(200)
+    expect(unauthorizedAcknowledgement.statusCode).toBe(401)
+    expect(acknowledgeCredentialRecovery).toHaveBeenCalledTimes(2)
     expect(createCredential).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
@@ -404,7 +411,6 @@ describe('API foundation', () => {
         actorId: expect.stringMatching(/^platform-operator:/u),
       }),
     )
-    expect(acknowledgeCredentialRecovery).toHaveBeenCalledTimes(2)
     await app.close()
   })
 })

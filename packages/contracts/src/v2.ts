@@ -1,20 +1,28 @@
 import { z } from 'zod'
+import {
+  AGENT_CREDENTIAL_SCOPES,
+  DOMAIN_ERROR_CODES,
+  V2PaymentStatus as CORE_V2_PAYMENT_STATUS,
+  type AgentCredentialScope,
+  type DomainErrorCode,
+  type V2PaymentStatus as CoreV2PaymentStatus,
+} from '@agent-payment/core'
 
-export const v2PaymentStatusSchema = z.enum([
-  'CREATED',
-  'ROUTING',
-  'AWAITING_APPROVAL',
-  'REJECTED_BY_POLICY',
-  'REJECTED',
-  'SUBMITTED',
-  'RECONCILING',
-  'CONFIRMED',
-  'PROVED_NO_EFFECT',
-  'REVIEW_REQUIRED',
-  'CLOSED_UNRESOLVED',
-  'FAILED',
-  'EXPIRED',
-])
+const paymentStatusValues = Object.values(CORE_V2_PAYMENT_STATUS) as [
+  CoreV2PaymentStatus,
+  ...CoreV2PaymentStatus[],
+]
+const domainErrorCodeValues = Object.values(DOMAIN_ERROR_CODES) as [
+  DomainErrorCode,
+  ...DomainErrorCode[],
+]
+const credentialScopeValues = Object.values(AGENT_CREDENTIAL_SCOPES) as [
+  AgentCredentialScope,
+  ...AgentCredentialScope[],
+]
+
+export const v2PaymentStatusSchema = z.enum(paymentStatusValues)
+export const v2CredentialScopeSchema = z.enum(credentialScopeValues)
 
 export const policyDecisionSchema = z.enum(['ALLOW', 'REQUIRE_APPROVAL', 'DENY'])
 export const approvalStateSchema = z.enum([
@@ -30,25 +38,7 @@ export const exactAmountSchema = z
   .string()
   .regex(/^\d+(?:\.\d+)?$/u, 'amount must be a plain decimal string')
 
-export const v2ErrorCodeSchema = z.enum([
-  'VALIDATION_ERROR',
-  'AUTHENTICATION_ERROR',
-  'AUTHORIZATION_ERROR',
-  'NOT_FOUND',
-  'CONFLICT',
-  'IDEMPOTENCY_CONFLICT',
-  'IDEMPOTENCY_KEY_REUSED',
-  'INSUFFICIENT_FUNDS',
-  'POLICY_DENIED',
-  'APPROVAL_REQUIRED',
-  'REVIEW_REQUIRED',
-  'DEPENDENCY_UNAVAILABLE',
-  'CUSTODY_UNAVAILABLE',
-  'INVALID_STATE',
-  'RATE_LIMITED',
-  'EXTERNAL_RAIL_FAILURE',
-  'INTERNAL_ERROR',
-])
+export const v2ErrorCodeSchema = z.enum(domainErrorCodeValues)
 
 export const v2ErrorEnvelopeSchema = z
   .object({
@@ -65,9 +55,9 @@ export const v2ErrorEnvelopeSchema = z
 export const v2PaymentCreateRequestSchema = z
   .object({
     kind: z.enum(['PAY', 'SEND']).default('PAY'),
-    recipient_id: z.string().min(1),
-    amount: exactAmountSchema,
-    denomination_id: z.string().min(1),
+    recipient_id: z.string().min(1).max(64),
+    amount: exactAmountSchema.max(256),
+    denomination_id: z.string().min(1).max(64),
     description: z.string().min(1).max(500).optional(),
     external_reference: z.string().min(1).max(255).optional(),
     route_preference: z.string().min(1).max(64).optional(),
@@ -82,7 +72,7 @@ export const v2PaymentResponseSchema = z
     recipient_id: z.string().nullable(),
     description: z.string().nullable(),
     external_reference: z.string().nullable(),
-    metadata: z.record(z.string(), z.unknown()).optional(),
+    metadata: z.record(z.string(), z.unknown()),
     amount: exactAmountSchema,
     denomination_id: z.string().min(1),
     denomination_symbol: z.string().min(1),
@@ -148,7 +138,7 @@ export const v2CredentialResponseSchema = z
     id: z.string().min(1),
     account_id: z.string().min(1),
     status: z.enum(['ACTIVE', 'EXPIRED', 'REVOKED', 'ROTATING']),
-    scopes: z.array(z.string()),
+    scopes: z.array(v2CredentialScopeSchema).min(1),
     expires_at: z.string().nullable(),
     rotated_from_id: z.string().nullable(),
     row_version: z.number().int().positive(),
@@ -159,7 +149,7 @@ export const v2CredentialResponseSchema = z
 
 export const v2CredentialIssuanceRequestSchema = z
   .object({
-    scopes: z.array(z.string().min(1)).min(1),
+    scopes: z.array(v2CredentialScopeSchema).min(1),
     expires_at: z.string().min(1).optional(),
   })
   .strict()
@@ -170,21 +160,10 @@ export const v2CredentialIssuanceResponseSchema = z
     account_id: z.string().min(1),
     api_key: z.string().min(1).nullable(),
     key_prefix: z.string().min(1),
-    scopes: z.array(z.string().min(1)),
+    scopes: z.array(v2CredentialScopeSchema).min(1),
     expires_at: z.string().min(1).nullable(),
   })
   .strict()
-
-/** Draft-07 output consumed by Fastify/Ajv; the Zod schemas remain canonical. */
-export const v2CredentialIssuanceRequestJsonSchema = z.toJSONSchema(
-  v2CredentialIssuanceRequestSchema,
-  { target: 'draft-07' },
-)
-
-export const v2CredentialIssuanceResponseJsonSchema = z.toJSONSchema(
-  v2CredentialIssuanceResponseSchema,
-  { target: 'draft-07' },
-)
 
 export const v2PolicyResponseSchema = z
   .object({
@@ -242,7 +221,7 @@ export const v2HistoryItemSchema = z
     direction: z.enum(['INCOMING', 'OUTGOING']),
     kind: z.string().min(1),
     status: z.string().min(1),
-    amount: z.string().min(1),
+    amount: exactAmountSchema,
     denomination_id: z.string().nullable(),
     currency: z.string().min(1),
     recipient_id: z.string().nullable(),

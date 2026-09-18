@@ -182,10 +182,9 @@ export {
   v2AccountResponseSchema,
   v2ApprovalResponseSchema,
   v2CredentialResponseSchema,
+  v2CredentialScopeSchema,
   v2CredentialIssuanceRequestSchema,
   v2CredentialIssuanceResponseSchema,
-  v2CredentialIssuanceRequestJsonSchema,
-  v2CredentialIssuanceResponseJsonSchema,
   v2FundingDestinationResponseSchema,
   v2HistoryItemSchema,
   v2HistoryResponseSchema,
@@ -223,3 +222,5 @@ export type {
   V2ReceiveResponse,
   V2ReceiveListResponse,
 } from './v2.js'
+
+export * from './v2-http.js'

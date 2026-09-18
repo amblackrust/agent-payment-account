@@ -360,6 +360,7 @@ export type SdkErrorCode =
   | 'AUTHORIZATION_ERROR'
   | 'NOT_FOUND'
   | 'IDEMPOTENCY_CONFLICT'
+  | 'IDEMPOTENCY_KEY_REUSED'
   | 'POLICY_DENIED'
   | 'APPROVAL_REQUIRED'
   | 'REVIEW_REQUIRED'
@@ -480,6 +481,13 @@ export class IdempotencyConflictError extends SdkError {
   public constructor(message = 'Idempotency key was already used for another request') {
     super('IDEMPOTENCY_CONFLICT', message, 409)
     this.name = 'IdempotencyConflictError'
+  }
+}
+
+export class IdempotencyKeyReusedError extends SdkError {
+  public constructor(message = 'Idempotency key was already used for another request') {
+    super('IDEMPOTENCY_KEY_REUSED', message, 409)
+    this.name = 'IdempotencyKeyReusedError'
   }
 }
 
@@ -1490,6 +1498,16 @@ function mapHttpError(
         return new NotFoundError(body.message)
       case 'IDEMPOTENCY_CONFLICT':
         return new IdempotencyConflictError(body.message)
+      case 'IDEMPOTENCY_KEY_REUSED':
+        return new IdempotencyKeyReusedError(body.message)
+      case 'UNSUPPORTED_CURRENCY':
+        return new ValidationError(body.message, statusCode)
+      case 'RECIPIENT_RESOLUTION_FAILURE':
+        return new RecipientError(body.message)
+      case 'UNSUPPORTED_RAIL':
+        return new UnsupportedRailError(body.message)
+      case 'REFUND_NOT_SUPPORTED':
+        return new RefundNotSupportedError(body.message)
       case 'POLICY_DENIED':
         return new PolicyDeniedError(body.message, paymentId, {
           ...(body.payment_status === undefined

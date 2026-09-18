@@ -339,6 +339,48 @@ describe('V2ManagementService credential issuance', () => {
     })
   })
 
+  it('rejects a reused idempotency key when the request fingerprint changes', async () => {
+    let storedFingerprint: string | undefined
+    const createCredential = vi.fn(async (input: { readonly fingerprint: string }) => {
+      storedFingerprint = input.fingerprint
+      return { credential: issuedCredential, created: true }
+    })
+    const repository = {
+      findAccount: async () => account,
+      findCredentialIdempotency: async () =>
+        storedFingerprint === undefined
+          ? null
+          : {
+              requestHash: storedFingerprint,
+              fingerprint: storedFingerprint,
+              credential: issuedCredential,
+            },
+      createCredential,
+    } as unknown as V2AdminRepository
+    const service = new V2ManagementService({
+      repository,
+      financialRepository: {} as never,
+      recoveryCipher: new RecoveryEnvelopeCipher(recoveryKey),
+    })
+
+    await service.createCredential({
+      accountId: account.id,
+      scopes: ['payments:read'],
+      idempotencyKey: 'issue-key',
+      actorId: 'operator-1',
+    })
+
+    await expect(
+      service.createCredential({
+        accountId: account.id,
+        scopes: ['history:read'],
+        idempotencyKey: 'issue-key',
+        actorId: 'operator-1',
+      }),
+    ).rejects.toMatchObject({ code: 'IDEMPOTENCY_KEY_REUSED' })
+    expect(createCredential).toHaveBeenCalledOnce()
+  })
+
   it('acknowledges recovery more than once without changing the result', async () => {
     const acknowledgeRecoveryEnvelope = vi.fn(async () => undefined)
     const repository = {

@@ -46,9 +46,13 @@ import {
   v2CredentialListResponseSchema,
   v2CredentialIssuanceResponseSchema,
   v2CredentialIssuanceRequestSchema,
+  v2ErrorResponseSchema,
   v2FundingDestinationResponseSchema,
   v2HistoryResponseSchema,
   v2LifecycleResponseSchema,
+  v2PaymentCreateRequestSchema,
+  v2PaymentListResponseSchema,
+  v2PaymentResponseSchema,
   v2PolicyListResponseSchema,
   v2PolicyResponseSchema,
   v2ReceiveListResponseSchema,
@@ -986,21 +990,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     if (options.v2PaymentService !== undefined) {
       const { v2PaymentService } = options
       const v2PaymentSchema = {
-        body: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            kind: { type: 'string', enum: ['PAY', 'SEND'], default: 'PAY' },
-            recipient_id: { type: 'string', minLength: 1, maxLength: 64 },
-            amount: { type: 'string', minLength: 1, maxLength: 256 },
-            denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
-            description: { type: 'string', minLength: 1, maxLength: 500 },
-            external_reference: { type: 'string', minLength: 1, maxLength: 255 },
-            route_preference: { type: 'string', minLength: 1, maxLength: 64 },
-            metadata: { type: 'object', additionalProperties: true },
-          },
-          required: ['recipient_id', 'amount', 'denomination_id'],
-        },
+        body: v2PaymentCreateRequestSchema,
         headers: {
           type: 'object',
           properties: {
@@ -1008,116 +998,6 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
           required: ['idempotency-key'],
         },
-      } as const
-      const v2PaymentResponseSchema = {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string', minLength: 1 },
-          kind: { type: 'string', enum: ['PAY', 'SEND', 'REFUND'] },
-          recipient_id: { type: ['string', 'null'] },
-          description: { type: ['string', 'null'] },
-          external_reference: { type: ['string', 'null'] },
-          metadata: { type: 'object', additionalProperties: true },
-          amount: { type: 'string', pattern: '^\\d+(?:\\.\\d+)?$' },
-          denomination_id: { type: 'string', minLength: 1 },
-          denomination_symbol: { type: 'string', minLength: 1 },
-          status: {
-            type: 'string',
-            enum: [
-              'CREATED',
-              'ROUTING',
-              'AWAITING_APPROVAL',
-              'REJECTED_BY_POLICY',
-              'REJECTED',
-              'SUBMITTED',
-              'RECONCILING',
-              'CONFIRMED',
-              'PROVED_NO_EFFECT',
-              'REVIEW_REQUIRED',
-              'CLOSED_UNRESOLVED',
-              'FAILED',
-              'EXPIRED',
-            ],
-          },
-          policy_decision: {
-            type: 'string',
-            enum: ['ALLOW', 'REQUIRE_APPROVAL', 'DENY'],
-          },
-          policy_reason_codes: { type: 'array', items: { type: 'string' } },
-          approval_state: {
-            type: 'string',
-            enum: ['NOT_REQUIRED', 'PENDING', 'APPROVED', 'REJECTED', 'EXPIRED'],
-          },
-          attempt_count: { type: 'integer', minimum: 0 },
-          reservation_status: {
-            type: 'string',
-            enum: ['NONE', 'HELD', 'RELEASED', 'CONSUMED'],
-          },
-          route_id: { type: ['string', 'null'] },
-          route_selection_reason: { type: ['string', 'null'] },
-          settlement_asset_id: { type: ['string', 'null'] },
-          execution_state: { type: 'string', minLength: 1 },
-          settlement_state: { type: 'string', minLength: 1 },
-          outcome_state: { type: 'string', minLength: 1 },
-          created_at: { type: 'string', minLength: 1 },
-          updated_at: { type: 'string', minLength: 1 },
-          confirmed_at: { type: ['string', 'null'] },
-          failure_code: { type: ['string', 'null'] },
-          failure_message: { type: ['string', 'null'] },
-          original_payment_id: { type: ['string', 'null'] },
-        },
-        required: [
-          'id',
-          'kind',
-          'recipient_id',
-          'description',
-          'external_reference',
-          'metadata',
-          'amount',
-          'denomination_id',
-          'denomination_symbol',
-          'status',
-          'policy_decision',
-          'policy_reason_codes',
-          'approval_state',
-          'attempt_count',
-          'reservation_status',
-          'route_id',
-          'route_selection_reason',
-          'settlement_asset_id',
-          'execution_state',
-          'settlement_state',
-          'outcome_state',
-          'created_at',
-          'updated_at',
-          'confirmed_at',
-          'failure_code',
-          'failure_message',
-          'original_payment_id',
-        ],
-      } as const
-      const v2PaymentListResponseSchema = {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          payments: { type: 'array', items: v2PaymentResponseSchema },
-          next_cursor: { type: ['string', 'null'] },
-        },
-        required: ['payments', 'next_cursor'],
-      } as const
-      const v2ErrorResponseSchema = {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          code: { type: 'string', minLength: 1 },
-          message: { type: 'string', minLength: 1 },
-          request_id: { type: 'string', minLength: 1 },
-          payment_id: { type: 'string', minLength: 1 },
-          payment_status: { type: 'string', minLength: 1 },
-          reason_codes: { type: 'array', items: { type: 'string' } },
-        },
-        required: ['code', 'message'],
       } as const
 
       app.post<{
@@ -1693,6 +1573,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
         },
         async (request) => {
+          assertAdminApiKey(request, options.config.adminApiKey)
           await management.acknowledgeCredentialRecovery(
             request.params.accountId,
             getIdempotencyKey(request),

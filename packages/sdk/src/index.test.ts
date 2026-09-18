@@ -549,6 +549,30 @@ describe('AgentPaymentAccount SDK', () => {
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',
         apiKey: 'key',
+        fetch: async () =>
+          jsonResponse(
+            {
+              code: 'IDEMPOTENCY_KEY_REUSED',
+              message: 'Idempotency key was already used for another request',
+            },
+            409,
+          ),
+      }).createPaymentV2(
+        {
+          recipientId: 'rcpt_test',
+          amount: '1.20',
+          denominationId: 'usd',
+        },
+        { idempotencyKey: 'reused-key' },
+      ),
+    ).rejects.toMatchObject({
+      code: 'IDEMPOTENCY_KEY_REUSED',
+      statusCode: 409,
+    })
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'key',
         fetch: response('INTERNAL_ERROR', 500),
       }).getBalance(),
     ).rejects.toBeInstanceOf(ExternalServiceError)
