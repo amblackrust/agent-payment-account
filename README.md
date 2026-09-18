@@ -171,6 +171,11 @@ See [`.env.example`](.env.example) for safe manual defaults and accepted secret 
 | `WALLET_MASTER_KEY`             | 32-byte key used to encrypt managed signer secrets            |
 | `ALLOW_MAINNET`                 | Additional explicit mainnet opt-in; defaults to `false`       |
 
+Request abuse protection is durable and shared across API replicas. The
+`REQUEST_RATE_LIMIT_*` variables control the per-client rolling window and
+short burst bucket; payment and receive mutation limits remain separate from
+these HTTP limits.
+
 For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supply a mint and funded fee payer belonging to that cluster. Do not use `local:setup` to prepare a custom network. Mainnet is never part of Quick Start and requires both `SOLANA_CLUSTER=mainnet-beta` and `ALLOW_MAINNET=true`.
 
 ## Documentation

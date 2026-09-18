@@ -234,6 +234,10 @@ export const v2RecipientDestinationSchema = z
     rail: z.string().min(1),
     type: z.string().min(1),
     wallet_address: z.string().min(1),
+    network: z.string().nullable(),
+    asset_reference: z.string().nullable(),
+    status: z.enum(['ACTIVE', 'REVOKED']),
+    version: z.number().int().positive(),
   })
   .strict()
 

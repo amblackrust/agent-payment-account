@@ -24,6 +24,9 @@ describe('configuration', () => {
     expect(config.restoreGateRequired).toBe(false)
     expect(config.allowMainnet).toBe(false)
     expect(config.limits?.workerBatchSize).toBe(10)
+    expect(config.limits?.requestRateLimitPerWindow).toBe(600)
+    expect(config.limits?.requestBurstWindowSeconds).toBe(1)
+    expect(config.limits?.requestBurstLimit).toBe(30)
     expect(config.limits?.receiveRateLimitPerWindow).toBe(120)
   })
 
@@ -34,6 +37,9 @@ describe('configuration', () => {
       SOLANA_FEE_PAYER_SECRET: undefined,
       WORKER_INTERVAL_MS: '7000',
       SHUTDOWN_TIMEOUT_MS: '45000',
+      REQUEST_RATE_LIMIT_PER_WINDOW: '17',
+      REQUEST_BURST_WINDOW_SECONDS: '2',
+      REQUEST_BURST_LIMIT: '5',
       PAYMENT_RATE_LIMIT_PER_WINDOW: '7',
       RECEIVE_RATE_LIMIT_PER_WINDOW: '9',
       CAPACITY_WINDOW_SECONDS: '2',
@@ -48,6 +54,9 @@ describe('configuration', () => {
     expect(config.limits).toMatchObject({
       workerIntervalMs: 7000,
       shutdownTimeoutMs: 45000,
+      requestRateLimitPerWindow: 17,
+      requestBurstWindowSeconds: 2,
+      requestBurstLimit: 5,
       paymentRateLimitPerWindow: 7,
       receiveRateLimitPerWindow: 9,
       capacityWindowSeconds: 2,

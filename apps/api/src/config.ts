@@ -10,6 +10,9 @@ export interface RuntimeLimits {
   readonly shutdownTimeoutMs: number
   readonly incomingAccountConcurrency: number
   readonly requestRateLimitWindowSeconds: number
+  readonly requestRateLimitPerWindow: number
+  readonly requestBurstWindowSeconds: number
+  readonly requestBurstLimit: number
   readonly paymentRateLimitPerWindow: number
   readonly receiveRateLimitPerWindow: number
   readonly capacityWindowSeconds: number
@@ -32,6 +35,9 @@ export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = {
   shutdownTimeoutMs: 30_000,
   incomingAccountConcurrency: 8,
   requestRateLimitWindowSeconds: 60,
+  requestRateLimitPerWindow: 600,
+  requestBurstWindowSeconds: 1,
+  requestBurstLimit: 30,
   paymentRateLimitPerWindow: 60,
   receiveRateLimitPerWindow: 120,
   capacityWindowSeconds: 1,
@@ -103,6 +109,15 @@ const configSchema = z.object({
     DEFAULT_RUNTIME_LIMITS.requestRateLimitWindowSeconds,
     86_400,
   ),
+  REQUEST_RATE_LIMIT_PER_WINDOW: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.requestRateLimitPerWindow,
+    1_000_000,
+  ),
+  REQUEST_BURST_WINDOW_SECONDS: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.requestBurstWindowSeconds,
+    60,
+  ),
+  REQUEST_BURST_LIMIT: positiveInt(DEFAULT_RUNTIME_LIMITS.requestBurstLimit, 100_000),
   PAYMENT_RATE_LIMIT_PER_WINDOW: positiveInt(
     DEFAULT_RUNTIME_LIMITS.paymentRateLimitPerWindow,
     1_000_000,
@@ -365,6 +380,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       shutdownTimeoutMs: result.data.SHUTDOWN_TIMEOUT_MS,
       incomingAccountConcurrency: result.data.INCOMING_ACCOUNT_CONCURRENCY,
       requestRateLimitWindowSeconds: result.data.REQUEST_RATE_LIMIT_WINDOW_SECONDS,
+      requestRateLimitPerWindow: result.data.REQUEST_RATE_LIMIT_PER_WINDOW,
+      requestBurstWindowSeconds: result.data.REQUEST_BURST_WINDOW_SECONDS,
+      requestBurstLimit: result.data.REQUEST_BURST_LIMIT,
       paymentRateLimitPerWindow: result.data.PAYMENT_RATE_LIMIT_PER_WINDOW,
       receiveRateLimitPerWindow: result.data.RECEIVE_RATE_LIMIT_PER_WINDOW,
       capacityWindowSeconds: result.data.CAPACITY_WINDOW_SECONDS,

@@ -17,9 +17,11 @@ import { getRuntimeLimits, type AppConfig } from './config.js'
 import { serializeAccountCreation, serializeReceiveDestination } from './accounts.js'
 import type { AccountService } from './accounts.js'
 import {
+  ADMIN_API_KEY_HEADER,
   assertAdminApiKey,
   authenticateAgentWithScope,
   getAdminOperatorId,
+  hashApiKey,
 } from './auth.js'
 import type { authenticateAgent } from './auth.js'
 import { serializePayment } from './payments.js'
@@ -33,6 +35,27 @@ import { type V2CreatePaymentInput, type V2PaymentService } from './payments-v2.
 import type { V2ManagementService } from './v2-management.js'
 import { registerV2OperationsRoutes } from './v2-operations-routes.js'
 import type { V2OperationsService } from './v2-operations.js'
+import {
+  v2AccountCreationResponseSchema,
+  v2AccountResponseSchema,
+  v2ApprovalListResponseSchema,
+  v2ApprovalResponseSchema,
+  v2ApprovedDestinationListResponseSchema,
+  v2ApprovedDestinationResponseSchema,
+  v2BalanceResponseSchema,
+  v2CredentialListResponseSchema,
+  v2FundingDestinationResponseSchema,
+  v2HistoryResponseSchema,
+  v2LifecycleResponseSchema,
+  v2PolicyListResponseSchema,
+  v2PolicyResponseSchema,
+  v2ReceiveListResponseSchema,
+  v2ReceiveResponseSchema,
+  v2RecipientListResponseSchema,
+  v2RecipientResponseSchema,
+  v2RotatedCredentialResponseSchema,
+  v2StatusResponseSchema,
+} from './v2-response-schemas.js'
 import {
   CORRELATION_ID_HEADER,
   MetricsRegistry,
@@ -81,6 +104,9 @@ const healthResponseSchema = {
   },
   required: ['status'],
 } as const
+
+const REQUEST_RATE_LIMIT_BUCKET = 'request'
+const REQUEST_BURST_LIMIT_BUCKET = 'request-burst'
 
 function getErrorStatusCode(error: ErrorWithCode): number {
   if (error.validation !== undefined) {
@@ -173,6 +199,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       request.id,
     )
     request.log = request.log.child({ correlationId })
+    if (options.v2AdminRepository !== undefined && request.url.startsWith('/v2/')) {
+      await enforceRequestRateLimits(options.v2AdminRepository, request, runtimeLimits)
+    }
   })
 
   app.addHook('onResponse', async (request, reply) => {
@@ -336,6 +365,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             },
             required: ['idempotency-key'],
           },
+          response: { 201: v2AccountCreationResponseSchema },
         },
       },
       async (request, reply) => {
@@ -1360,6 +1390,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             preHandler: async (request) =>
               authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
             schema: {
+              response: { 201: v2RecipientResponseSchema },
               body: {
                 type: 'object',
                 additionalProperties: false,
@@ -1403,6 +1434,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             preHandler: async (request) =>
               authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
             schema: {
+              response: { 200: v2RecipientListResponseSchema },
               querystring: {
                 type: 'object',
                 additionalProperties: false,
@@ -1434,7 +1466,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           {
             preHandler: async (request) =>
               authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
-            schema: { params: recipientParams },
+            schema: {
+              params: recipientParams,
+              response: { 200: v2RecipientResponseSchema },
+            },
           },
           async (request) =>
             serializeRecipient(
@@ -1459,6 +1494,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             preHandler: async (request) =>
               authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
             schema: {
+              response: { 200: v2RecipientResponseSchema },
               params: recipientParams,
               body: {
                 type: 'object',
@@ -1519,6 +1555,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             preHandler: async (request) =>
               authenticateAgentWithScope(request, accountRepository, 'contacts:manage'),
             schema: {
+              response: { 200: v2StatusResponseSchema },
               params: recipientParams,
               body: {
                 type: 'object',
@@ -1570,7 +1607,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         {
           preHandler: async (request) =>
             authenticateAgentWithScope(request, accountRepository, 'balance:read'),
-          schema: { params: accountParams },
+          schema: {
+            params: accountParams,
+            response: { 200: v2AccountResponseSchema },
+          },
         },
         async (request) => {
           const account = requireAgentAccount(request)
@@ -1583,7 +1623,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
       app.get<{ Params: { accountId: string } }>(
         '/v2/accounts/:accountId/credentials',
-        { schema: { params: accountParams } },
+        {
+          schema: {
+            params: accountParams,
+            response: { 200: v2CredentialListResponseSchema },
+          },
+        },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
           return {
@@ -1616,6 +1661,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['current_status', 'next_status', 'row_version'],
             },
+            response: { 200: v2LifecycleResponseSchema },
           },
         },
         async (request) => {
@@ -1647,6 +1693,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['accountId', 'credentialId'],
             },
+            response: { 200: v2StatusResponseSchema },
           },
         },
         async (request) => {
@@ -1680,6 +1727,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['idempotency-key'],
             },
+            response: { 200: v2RotatedCredentialResponseSchema },
           },
         },
         async (request) => {
@@ -1694,7 +1742,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
       app.get<{ Params: { accountId: string } }>(
         '/v2/accounts/:accountId/policies',
-        { schema: { params: accountParams } },
+        {
+          schema: {
+            params: accountParams,
+            response: { 200: v2PolicyListResponseSchema },
+          },
+        },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
           return { policies: await management.listPolicies(request.params.accountId) }
@@ -1702,7 +1755,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       )
       app.get<{ Params: { accountId: string } }>(
         '/v2/accounts/:accountId/policy',
-        { schema: { params: accountParams } },
+        {
+          schema: {
+            params: accountParams,
+            response: { 200: v2PolicyResponseSchema },
+          },
+        },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
           return management.getPolicy(request.params.accountId)
@@ -1723,7 +1781,13 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         }
       }>(
         '/v2/accounts/:accountId/policy',
-        { schema: { params: accountParams, body: policyBody } },
+        {
+          schema: {
+            params: accountParams,
+            body: policyBody,
+            response: { 200: v2PolicyResponseSchema },
+          },
+        },
         async (request) => {
           const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           return management.replacePolicy({
@@ -1776,7 +1840,13 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         }
       }>(
         '/v2/accounts/:accountId/policies',
-        { schema: { params: accountParams, body: policyBody } },
+        {
+          schema: {
+            params: accountParams,
+            body: policyBody,
+            response: { 201: v2PolicyResponseSchema },
+          },
+        },
         async (request, reply) => {
           assertAdminApiKey(request, options.config.adminApiKey)
           const policy = await management.createPolicy({
@@ -1832,6 +1902,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['account_id'],
             },
+            response: { 200: v2PolicyResponseSchema },
           },
         },
         async (request) => {
@@ -1847,7 +1918,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
       app.get<{ Params: { accountId: string } }>(
         '/v2/accounts/:accountId/approvals',
-        { schema: { params: accountParams } },
+        {
+          schema: {
+            params: accountParams,
+            response: { 200: v2ApprovalListResponseSchema },
+          },
+        },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
           return { approvals: await management.listApprovals(request.params.accountId) }
@@ -1884,6 +1960,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['action', 'row_version'],
             },
+            response: { 200: v2ApprovalResponseSchema },
           },
         },
         async (request) => {
@@ -1903,7 +1980,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
       app.get<{ Params: { accountId: string } }>(
         '/v2/accounts/:accountId/approved-destinations',
-        { schema: { params: accountParams } },
+        {
+          schema: {
+            params: accountParams,
+            response: { 200: v2ApprovedDestinationListResponseSchema },
+          },
+        },
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
           return {
@@ -1929,6 +2011,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         {
           schema: {
             params: accountParams,
+            response: { 201: v2ApprovedDestinationResponseSchema },
             body: {
               type: 'object',
               additionalProperties: false,
@@ -1983,6 +2066,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['accountId', 'destinationId'],
             },
+            response: { 200: v2StatusResponseSchema },
             body: {
               type: 'object',
               additionalProperties: false,
@@ -2013,6 +2097,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
           schema: {
             params: accountParams,
+            response: { 200: v2FundingDestinationResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2041,6 +2126,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             authenticateAgentWithScope(request, accountRepository, 'balance:read'),
           schema: {
             params: accountParams,
+            response: { 200: v2BalanceResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2067,6 +2153,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           preHandler: async (request) =>
             authenticateAgentWithScope(request, accountRepository, 'balance:read'),
           schema: {
+            response: { 200: v2BalanceResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2091,6 +2178,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           preHandler: async (request) =>
             authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
           schema: {
+            response: { 200: v2FundingDestinationResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2112,6 +2200,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           preHandler: async (request) =>
             authenticateAgentWithScope(request, accountRepository, 'history:read'),
           schema: {
+            response: { 200: v2HistoryResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2144,6 +2233,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             authenticateAgentWithScope(request, accountRepository, 'history:read'),
           schema: {
             params: accountParams,
+            response: { 200: v2HistoryResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2202,6 +2292,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             )
           },
           schema: {
+            response: { 201: v2ReceiveResponseSchema },
             params: receiveParams,
             headers: {
               type: 'object',
@@ -2272,6 +2363,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             )
           },
           schema: {
+            response: { 201: v2ReceiveResponseSchema },
             headers: {
               type: 'object',
               properties: {
@@ -2324,6 +2416,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
           schema: {
             params: receiveParams,
+            response: { 200: v2ReceiveListResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2364,6 +2457,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['accountId', 'receiveId'],
             },
+            response: { 200: v2ReceiveResponseSchema },
           },
         },
         async (request) => {
@@ -2391,6 +2485,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['accountId', 'receiveId'],
             },
+            response: { 200: v2ReceiveResponseSchema },
           },
         },
         async (request) => {
@@ -2410,6 +2505,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           preHandler: async (request) =>
             authenticateAgentWithScope(request, accountRepository, 'receive:manage'),
           schema: {
+            response: { 200: v2ReceiveListResponseSchema },
             querystring: {
               type: 'object',
               additionalProperties: false,
@@ -2448,6 +2544,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['receiveId'],
             },
+            response: { 200: v2ReceiveResponseSchema },
           },
         },
         async (request) => {
@@ -2473,6 +2570,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['receiveId'],
             },
+            response: { 200: v2ReceiveResponseSchema },
           },
         },
         async (request) => {
@@ -2613,6 +2711,47 @@ async function enforceRateLimit(
     limit,
   })
   if (!result.allowed) throw new RateLimitedError()
+}
+
+async function enforceRequestRateLimits(
+  repository: Pick<V2AdminRepository, 'consumeRateLimit'>,
+  request: Parameters<typeof authenticateAgent>[0],
+  limits: ReturnType<typeof getRuntimeLimits>,
+): Promise<void> {
+  const subjectId = getRequestRateLimitSubject(request)
+  const requestLimit = await repository.consumeRateLimit({
+    subjectType: 'HTTP_CLIENT',
+    subjectId,
+    bucket: REQUEST_RATE_LIMIT_BUCKET,
+    windowSeconds: limits.requestRateLimitWindowSeconds,
+    limit: limits.requestRateLimitPerWindow,
+  })
+  if (!requestLimit.allowed) throw new RateLimitedError()
+
+  const burstLimit = await repository.consumeRateLimit({
+    subjectType: 'HTTP_CLIENT',
+    subjectId,
+    bucket: REQUEST_BURST_LIMIT_BUCKET,
+    windowSeconds: limits.requestBurstWindowSeconds,
+    limit: limits.requestBurstLimit,
+  })
+  if (!burstLimit.allowed) throw new RateLimitedError()
+}
+
+function getRequestRateLimitSubject(
+  request: Parameters<typeof authenticateAgent>[0],
+): string {
+  const authorization = request.headers.authorization
+  if (typeof authorization === 'string' && authorization.startsWith('Bearer ')) {
+    const apiKey = authorization.slice('Bearer '.length).trim()
+    if (apiKey.length > 0) return `credential:${hashApiKey(apiKey)}`
+  }
+  const adminApiKey = request.headers[ADMIN_API_KEY_HEADER]
+  const adminValue = Array.isArray(adminApiKey) ? adminApiKey[0] : adminApiKey
+  if (typeof adminValue === 'string' && adminValue.length > 0) {
+    return `admin:${hashApiKey(adminValue)}`
+  }
+  return `ip:${request.ip}`
 }
 
 function toPaymentRequest(body: PaymentBody) {

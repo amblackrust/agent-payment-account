@@ -4,6 +4,14 @@ import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 import { getRuntimeLimits, type AppConfig } from './config.js'
 import { authenticateAgentWithScope, getAdminOperatorId } from './auth.js'
 import type { V2OperationsService } from './v2-operations.js'
+import {
+  v2ExceptionListResponseSchema,
+  v2ExceptionResponseSchema,
+  v2StatusResponseSchema,
+  v2TimelineResponseSchema,
+  v2WebhookSubscriptionListResponseSchema,
+  v2WebhookSubscriptionResponseSchema,
+} from './v2-response-schemas.js'
 
 const exceptionParams = {
   type: 'object',
@@ -51,6 +59,19 @@ export function registerV2OperationsRoutes(
     {
       preHandler: async (request) =>
         authenticateAgentWithScope(request, options.accountRepository, 'history:read'),
+      schema: {
+        querystring: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            limit: { type: 'integer', minimum: 1, maximum: maxPageSize },
+            cursor: { type: 'string', minLength: 1 },
+            resource_type: { type: 'string', minLength: 1, maxLength: 64 },
+            resource_id: { type: 'string', minLength: 1, maxLength: 64 },
+          },
+        },
+        response: { 200: v2TimelineResponseSchema },
+      },
     },
     async (request) => {
       const account = requireAccount(request)
@@ -76,6 +97,7 @@ export function registerV2OperationsRoutes(
           options.accountRepository,
           'webhooks:manage',
         ),
+      schema: { response: { 200: v2WebhookSubscriptionListResponseSchema } },
     },
     async (request) => ({
       subscriptions: await options.service.listWebhooks(
@@ -101,6 +123,7 @@ export function registerV2OperationsRoutes(
           'webhooks:manage',
         ),
       schema: {
+        response: { 201: v2WebhookSubscriptionResponseSchema },
         body: {
           type: 'object',
           additionalProperties: false,
@@ -145,6 +168,15 @@ export function registerV2OperationsRoutes(
           options.accountRepository,
           'webhooks:manage',
         ),
+      schema: {
+        params: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { webhookId: { type: 'string', minLength: 1, maxLength: 64 } },
+          required: ['webhookId'],
+        },
+        response: { 200: v2StatusResponseSchema },
+      },
     },
     async (request) => {
       await options.service.archiveWebhook(
@@ -159,6 +191,7 @@ export function registerV2OperationsRoutes(
     '/v2/operator/exceptions',
     {
       schema: {
+        response: { 200: v2ExceptionListResponseSchema },
         querystring: {
           type: 'object',
           additionalProperties: false,
@@ -185,7 +218,10 @@ export function registerV2OperationsRoutes(
   app.get<{ Params: { exceptionId: string } }>(
     '/v2/operator/exceptions/:exceptionId',
     {
-      schema: { params: exceptionParams },
+      schema: {
+        params: exceptionParams,
+        response: { 200: v2ExceptionResponseSchema },
+      },
     },
     async (request) => {
       getAdminOperatorId(request, options.config.adminApiKey)
@@ -199,7 +235,11 @@ export function registerV2OperationsRoutes(
   }>(
     '/v2/operator/exceptions/:exceptionId/acknowledge',
     {
-      schema: { params: exceptionParams, body: operatorActionBody },
+      schema: {
+        params: exceptionParams,
+        body: operatorActionBody,
+        response: { 200: v2ExceptionResponseSchema },
+      },
     },
     async (request) => {
       const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
@@ -217,7 +257,11 @@ export function registerV2OperationsRoutes(
   }>(
     '/v2/operator/exceptions/:exceptionId/resolve-confirmed',
     {
-      schema: { params: exceptionParams, body: operatorResolutionBody },
+      schema: {
+        params: exceptionParams,
+        body: operatorResolutionBody,
+        response: { 200: v2ExceptionResponseSchema },
+      },
     },
     async (request) => {
       const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
@@ -238,7 +282,11 @@ export function registerV2OperationsRoutes(
   }>(
     '/v2/operator/exceptions/:exceptionId/resolve-proved-no-effect',
     {
-      schema: { params: exceptionParams, body: operatorResolutionBody },
+      schema: {
+        params: exceptionParams,
+        body: operatorResolutionBody,
+        response: { 200: v2ExceptionResponseSchema },
+      },
     },
     async (request) => {
       const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
@@ -259,7 +307,11 @@ export function registerV2OperationsRoutes(
   }>(
     '/v2/operator/exceptions/:exceptionId/close-unresolved',
     {
-      schema: { params: exceptionParams, body: operatorActionBody },
+      schema: {
+        params: exceptionParams,
+        body: operatorActionBody,
+        response: { 200: v2ExceptionResponseSchema },
+      },
     },
     async (request) => {
       const operatorId = getAdminOperatorId(request, options.config.adminApiKey)

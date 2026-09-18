@@ -253,6 +253,10 @@ export interface V2RecipientDestination {
   readonly rail: string
   readonly type: string
   readonly walletAddress: string
+  readonly network: string | null
+  readonly assetReference: string | null
+  readonly status: 'ACTIVE' | 'REVOKED'
+  readonly version: number
 }
 
 export interface V2Recipient {
@@ -821,6 +825,10 @@ function parseV2Recipient(value: unknown): V2Recipient {
       rail: destination.rail,
       type: destination.type,
       walletAddress: destination.wallet_address,
+      network: destination.network,
+      assetReference: destination.asset_reference,
+      status: destination.status,
+      version: destination.version,
     })),
     createdAt: response.created_at,
     updatedAt: response.updated_at,

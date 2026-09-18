@@ -23,6 +23,7 @@ import type {
   V2AdminRepository,
   V2AccountRecord,
   V2ApprovalAdminRecord,
+  V2AdminApprovedDestinationRecord,
   V2CredentialRecord,
   V2DatabaseRepository,
   V2HistoryRecord,
@@ -366,7 +367,9 @@ export class V2ManagementService {
 
   public async listApprovedDestinations(accountId: string) {
     await this.requireAccount(accountId)
-    return this.options.repository.listApprovedDestinations(accountId)
+    return (await this.options.repository.listApprovedDestinations(accountId)).map(
+      serializeApprovedDestination,
+    )
   }
 
   public async createApprovedDestination(input: {
@@ -380,10 +383,12 @@ export class V2ManagementService {
     readonly reason?: string
   }) {
     await this.requireAccount(input.accountId)
-    return this.options.repository.createApprovedDestination({
-      id: createId('approved'),
-      ...input,
-    })
+    return serializeApprovedDestination(
+      await this.options.repository.createApprovedDestination({
+        id: createId('approved'),
+        ...input,
+      }),
+    )
   }
 
   public async revokeApprovedDestination(input: {
@@ -688,6 +693,23 @@ function serializeApproval(approval: V2ApprovalAdminRecord) {
     row_version: approval.rowVersion,
     created_at: approval.createdAt.toISOString(),
     decided_at: approval.decidedAt?.toISOString() ?? null,
+  }
+}
+
+function serializeApprovedDestination(destination: V2AdminApprovedDestinationRecord) {
+  return {
+    id: destination.id,
+    account_id: destination.accountId,
+    fingerprint: destination.fingerprint,
+    rail: destination.rail,
+    network: destination.network,
+    asset_reference: destination.assetReference,
+    destination: destination.destination,
+    status: destination.status,
+    actor_id: destination.actorId,
+    reason: destination.reason,
+    created_at: destination.createdAt.toISOString(),
+    revoked_at: destination.revokedAt?.toISOString() ?? null,
   }
 }
 

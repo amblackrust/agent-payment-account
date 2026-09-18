@@ -28,6 +28,12 @@ budgets, runtime identity, and restore-gate state. A second replica therefore
 adds availability and throughput within the same durable limits; it does not
 implicitly multiply a dependency budget.
 
+The API applies a durable per-client request window and an independent burst
+window before V2 route authentication. Configure both with
+`REQUEST_RATE_LIMIT_PER_WINDOW`, `REQUEST_RATE_LIMIT_WINDOW_SECONDS`,
+`REQUEST_BURST_LIMIT`, and `REQUEST_BURST_WINDOW_SECONDS`. Payment and receive
+mutation buckets remain separate policy-independent controls.
+
 ## Perimeter and secret boundaries
 
 - Terminate TLS at the selected ingress and forward only authenticated traffic

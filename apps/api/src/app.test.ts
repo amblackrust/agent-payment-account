@@ -190,14 +190,99 @@ describe('API foundation', () => {
     expect(response.json()).toEqual(serializedPayment)
     expect(getPayment).toHaveBeenCalledWith('acct_1', 'pay_1')
     expect(serialize).toHaveBeenCalledOnce()
-    expect(consumeRateLimit).not.toHaveBeenCalled()
+    expect(consumeRateLimit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subjectType: 'HTTP_CLIENT',
+        bucket: 'request',
+      }),
+    )
+    expect(consumeRateLimit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subjectType: 'HTTP_CLIENT',
+        bucket: 'request-burst',
+      }),
+    )
     expect(response.headers['x-correlation-id']).toBe('trace-v2')
     await app.close()
   })
 
+  it('rejects an HTTP burst independently of payment policy and authentication scope', async () => {
+    const getPayment = vi.fn(async () => ({}) as never)
+    const serialize = vi.fn(async () => ({}) as never)
+    const consumeRateLimit = vi.fn(async (input: { bucket: string }) => ({
+      allowed: input.bucket !== 'request-burst',
+      count: 31,
+      retryAt: new Date('2026-09-18T00:01:00.000Z'),
+    }))
+    const app = buildApp({
+      config: testConfig,
+      readinessDependency: { checkReadiness: async () => undefined },
+      accountRepository: {
+        findAccountByCredentialHash: async () => authenticatedAccount,
+        markCredentialUsed: async () => undefined,
+      } as never,
+      accountService: {} as never,
+      solanaRail: {} as never,
+      v2PaymentService: { getPayment, serialize } as never,
+      v2AdminRepository: { consumeRateLimit },
+    })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v2/payments/pay_1',
+      headers: { authorization: 'Bearer test-agent-key' },
+    })
+
+    expect(response.statusCode).toBe(429)
+    expect(response.json()).toMatchObject({ code: 'RATE_LIMITED' })
+    expect(getPayment).not.toHaveBeenCalled()
+    expect(serialize).not.toHaveBeenCalled()
+    await app.close()
+  })
+
+  it('registers strict V2 operations response contracts', async () => {
+    const listExceptions = vi.fn(async () => [])
+    const app = buildApp({
+      config: testConfig,
+      readinessDependency: { checkReadiness: async () => undefined },
+      accountRepository: {} as never,
+      accountService: {} as never,
+      solanaRail: {} as never,
+      v2OperationsService: { listExceptions } as never,
+    })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v2/operator/exceptions',
+      headers: { 'x-admin-api-key': testConfig.adminApiKey },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toEqual({ exceptions: [] })
+    expect(listExceptions).toHaveBeenCalledWith({})
+    await app.close()
+  })
+
   it('exposes atomic versioned policy replacement through the admin contract', async () => {
-    const getPolicy = vi.fn(async () => ({ id: 'policy_1', status: 'ACTIVE' }))
-    const replacePolicy = vi.fn(async (input: unknown) => input)
+    const serializedPolicy = {
+      id: 'policy_1',
+      account_id: 'acct_1',
+      version: 1,
+      status: 'ACTIVE',
+      denomination_id: 'usd',
+      max_per_payment: '1.25',
+      rolling_budget: null,
+      rolling_window_seconds: null,
+      transaction_count_cap: null,
+      approval_threshold: null,
+      rolling_budget_escalatable: false,
+      transaction_count_escalatable: false,
+      created_at: '2026-09-18T00:00:00.000Z',
+      activated_at: '2026-09-18T00:00:00.000Z',
+      retired_at: null,
+    }
+    const getPolicy = vi.fn(async () => serializedPolicy)
+    const replacePolicy = vi.fn(async (_input: unknown) => serializedPolicy)
     const app = buildApp({
       config: testConfig,
       readinessDependency: { checkReadiness: async () => undefined },
@@ -225,7 +310,7 @@ describe('API foundation', () => {
     })
 
     expect(current.statusCode).toBe(200)
-    expect(current.json()).toEqual({ id: 'policy_1', status: 'ACTIVE' })
+    expect(current.json()).toEqual(serializedPolicy)
     expect(replacement.statusCode).toBe(200)
     expect(replacePolicy).toHaveBeenCalledWith(
       expect.objectContaining({
