@@ -12,7 +12,7 @@ import type {
   V2PaymentView,
   V2WorkItemClaim,
 } from '@agent-payment/db'
-import type { V2AdminRepository } from '@agent-payment/db'
+import type { V2AdminRepository, V2OperationsRepository } from '@agent-payment/db'
 import type {
   ConstrainedEffectSigningRequest,
   ConstrainedSignedEffect,
@@ -24,12 +24,18 @@ import { retryAtAfter } from './capacity.js'
 const DEFAULT_LEASE_SECONDS = 30
 const DEFAULT_BATCH_SIZE = 10
 
+export interface V2PlatformCostObservation {
+  readonly assetId: string
+  readonly amountAtomic: bigint
+}
+
 export interface V2PreparedEffect extends ConstrainedEffectSigningRequest {
   readonly paymentId: string
   readonly attemptId: string
   readonly routeId: string
   readonly payloadHash: string
   readonly preparedPayload: string
+  readonly platformCostEstimate?: V2PlatformCostObservation
   readonly validityExpiresAt?: Date
   readonly validitySlot?: bigint
 }
@@ -48,6 +54,7 @@ export interface V2OutgoingExecutor {
     readonly externalId?: string
     readonly failureCode?: string
     readonly failureMessageSafe?: string
+    readonly platformCostActual?: V2PlatformCostObservation
   }>
   reconcile?(input: {
     readonly view: V2PaymentView
@@ -55,6 +62,7 @@ export interface V2OutgoingExecutor {
   }): Promise<{
     readonly status: 'CONFIRMED' | 'PROVED_NO_EFFECT' | 'UNKNOWN'
     readonly externalId?: string
+    readonly platformCostActual?: V2PlatformCostObservation
   }>
 }
 
@@ -71,6 +79,10 @@ export interface V2OutgoingWorkerOptions {
     | 'createSigningRequest'
     | 'completeSigningRequest'
   >
+  readonly platformCosts?: Pick<
+    V2OperationsRepository,
+    'createPlatformCostEstimate' | 'reconcilePlatformCost'
+  >
   readonly signedPayloadCipher?: WalletSecretCipher
   readonly serviceIdentity?: string
   readonly capacity?: {
@@ -83,6 +95,7 @@ export interface V2OutgoingWorkerOptions {
   readonly now?: () => Date
   readonly logger?: {
     info(data: Readonly<Record<string, unknown>>, message: string): void
+    error?(data: Readonly<Record<string, unknown>>, message: string): void
   }
 }
 
@@ -172,6 +185,13 @@ export class V2OutgoingWorker {
         return
       }
       const attempt = view.attempts.at(-1)
+      if (
+        claim.resourceType === 'PAYMENT_ATTEMPT' &&
+        (attempt === undefined || attempt.id !== claim.resourceId)
+      ) {
+        await this.options.repository.completeWorkItem(claim.id, this.options.owner)
+        return
+      }
       if (attempt === undefined) {
         if (this.options.mode === 'reconcile') {
           await this.requeueForOutgoing(claim)
@@ -232,6 +252,7 @@ export class V2OutgoingWorker {
                 : { validitySlot: prepared.validitySlot }),
             })
           : attempt
+      await this.persistPlatformCostEstimate(prepared)
       const activeKey = await this.options.custody.findActiveCustodyKeyVersion(
         prepared.accountId,
       )
@@ -425,6 +446,7 @@ export class V2OutgoingWorker {
         evidenceOutcome: 'CONFIRMED',
         source: 'V2_OUTGOING_WORKER',
       })
+      await this.reconcilePlatformCost(prepared, result.platformCostActual)
       await this.options.repository.completeWorkItem(claim.id, this.options.owner)
       return
     }
@@ -560,10 +582,12 @@ export class V2OutgoingWorker {
         evidenceOutcome: 'CONFIRMED',
         source: 'V2_RECONCILIATION_WORKER',
       })
+      await this.reconcilePlatformCostFromAttempt(attempt, result.platformCostActual)
       await this.options.repository.completeWorkItem(claim.id, this.options.owner)
       return
     }
     if (result.status === 'PROVED_NO_EFFECT') {
+      const replacement = await this.findReplacementAttempt(view)
       await this.options.repository.finalizeV2Payment({
         paymentId: view.payment.id,
         attemptId: attempt.id,
@@ -572,13 +596,14 @@ export class V2OutgoingWorker {
         currentOutcome: attempt.outcome,
         nextOutcome: 'PROVED_NO_EFFECT',
         attemptStatus: 'FAILED',
-        paymentStatus: 'PROVED_NO_EFFECT',
+        paymentStatus: replacement === undefined ? 'PROVED_NO_EFFECT' : 'ROUTING',
         settlementState: 'NOT_SUBMITTED',
-        outcomeState: 'PROVED_NO_EFFECT',
+        outcomeState: replacement === undefined ? 'PROVED_NO_EFFECT' : 'NONE',
         ...evidenceFields(attempt),
-        reservation: 'RELEASE',
+        reservation: replacement === undefined ? 'RELEASE' : 'NONE',
         evidenceOutcome: 'PROVED_NO_EFFECT',
         source: 'V2_RECONCILIATION_WORKER',
+        ...(replacement === undefined ? {} : { replacement }),
       })
       await this.options.repository.completeWorkItem(claim.id, this.options.owner)
       return
@@ -599,6 +624,76 @@ export class V2OutgoingWorker {
       errorSafe: 'Settlement outcome remains unknown',
       ...this.reconciliationKindInput(claim),
     })
+  }
+
+  private async findReplacementAttempt(view: V2PaymentView): Promise<
+    | {
+        readonly attemptId: string
+        readonly workItemId: string
+        readonly route: Awaited<
+          ReturnType<V2DatabaseRepository['listActiveSettlementRoutes']>
+        >[number]
+        readonly economicMappingId: string
+        readonly destinationSnapshotJson: string
+      }
+    | undefined
+  > {
+    const attemptedRouteIds = new Set(
+      view.attempts.flatMap((attempt) =>
+        attempt.routeId === null ? [] : [attempt.routeId],
+      ),
+    )
+    const routes = [...(await this.options.repository.listActiveSettlementRoutes())]
+      .filter((route) => !attemptedRouteIds.has(route.id))
+      .sort(
+        (left, right) =>
+          left.priority - right.priority || left.id.localeCompare(right.id),
+      )
+    const route = routes[0]
+    if (route === undefined) return undefined
+    const asset = await this.options.repository.findSettlementAsset(
+      route.settlementAssetId,
+    )
+    const mapping = await this.options.repository.findEconomicMapping(
+      route.economicMappingId,
+    )
+    if (
+      asset === null ||
+      asset.status !== 'ACTIVE' ||
+      asset.rail !== route.rail ||
+      asset.network !== route.network ||
+      mapping === null ||
+      mapping.status !== 'ACTIVE' ||
+      mapping.denominationId !== view.payment.denominationId ||
+      mapping.settlementAssetId !== asset.id
+    ) {
+      throw new InvalidStateError('Replacement settlement asset is unavailable')
+    }
+    let destination: unknown
+    try {
+      destination = JSON.parse(view.payment.destinationSnapshotJson ?? '') as unknown
+    } catch {
+      throw new InvalidStateError('Payment destination snapshot is invalid JSON')
+    }
+    if (
+      !isRecord(destination) ||
+      typeof destination.wallet_address !== 'string' ||
+      destination.wallet_address.length === 0
+    ) {
+      throw new InvalidStateError('Payment destination snapshot is incomplete')
+    }
+    return {
+      attemptId: `attempt_${randomUUID()}`,
+      workItemId: `work_${randomUUID()}`,
+      route,
+      economicMappingId: mapping.id,
+      destinationSnapshotJson: JSON.stringify({
+        ...destination,
+        rail: route.rail,
+        network: route.network,
+        asset_reference: asset.assetReference,
+      }),
+    }
   }
 
   private async handleFailure(claim: V2WorkItemClaim, error: unknown): Promise<void> {
@@ -799,6 +894,77 @@ export class V2OutgoingWorker {
       ...(input.metadataJson === undefined ? {} : { metadataJson: input.metadataJson }),
     })
   }
+
+  private async persistPlatformCostEstimate(prepared: V2PreparedEffect): Promise<void> {
+    const estimate = prepared.platformCostEstimate
+    if (estimate === undefined) return
+    if (this.options.platformCosts === undefined) {
+      throw new InvalidStateError(
+        'Platform cost persistence is unavailable for a prepared effect',
+      )
+    }
+    await this.options.platformCosts.createPlatformCostEstimate({
+      id: platformCostRecordId(prepared.attemptId, prepared.effectHash),
+      accountId: prepared.accountId,
+      paymentId: prepared.paymentId,
+      attemptId: prepared.attemptId,
+      assetId: estimate.assetId,
+      estimatedAmount: estimate.amountAtomic,
+    })
+  }
+
+  private async reconcilePlatformCostFromAttempt(
+    attempt: V2PaymentAttemptSnapshot,
+    actual: V2PlatformCostObservation | undefined,
+  ): Promise<void> {
+    if (actual === undefined || attempt.preparedEffectJson === null) return
+    const prepared = restorePreparedEffect(attempt)
+    if (prepared === undefined) return
+    await this.reconcilePlatformCost(prepared, actual)
+  }
+
+  private async reconcilePlatformCost(
+    prepared: V2PreparedEffect,
+    actual: V2PlatformCostObservation | undefined,
+  ): Promise<void> {
+    const estimate = prepared.platformCostEstimate
+    if (estimate === undefined || actual === undefined) return
+    if (actual.assetId !== estimate.assetId || actual.amountAtomic < 0n) {
+      this.options.logger?.error?.(
+        {
+          attemptId: prepared.attemptId,
+          errorCode: 'PLATFORM_COST_IDENTITY_MISMATCH',
+        },
+        'Observed platform cost did not match the prepared cost asset',
+      )
+      return
+    }
+    if (this.options.platformCosts === undefined) {
+      this.options.logger?.error?.(
+        {
+          attemptId: prepared.attemptId,
+          errorCode: 'PLATFORM_COST_PERSISTENCE_UNAVAILABLE',
+        },
+        'Observed platform cost could not be persisted',
+      )
+      return
+    }
+    try {
+      await this.options.platformCosts.reconcilePlatformCost({
+        id: platformCostRecordId(prepared.attemptId, prepared.effectHash),
+        actualAmount: actual.amountAtomic,
+        observedAt: this.now(),
+      })
+    } catch (error) {
+      this.options.logger?.error?.(
+        {
+          attemptId: prepared.attemptId,
+          errorCode: error instanceof Error ? error.name : 'UNKNOWN',
+        },
+        'Observed platform cost reconciliation failed',
+      )
+    }
+  }
 }
 
 function hashBytes(value: Uint8Array): string {
@@ -849,6 +1015,14 @@ function serializePreparedEffect(prepared: V2PreparedEffect): string {
   return JSON.stringify({
     ...prepared,
     amountAtomic: prepared.amountAtomic.toString(),
+    ...(prepared.platformCostEstimate === undefined
+      ? {}
+      : {
+          platformCostEstimate: {
+            assetId: prepared.platformCostEstimate.assetId,
+            amountAtomic: prepared.platformCostEstimate.amountAtomic.toString(),
+          },
+        }),
     ...(prepared.validityExpiresAt === undefined
       ? {}
       : { validityExpiresAt: prepared.validityExpiresAt.toISOString() }),
@@ -897,6 +1071,7 @@ function restorePreparedEffect(
   }
   const validityExpiresAt = parseOptionalDate(parsed.validityExpiresAt)
   const validitySlot = parseOptionalBigInt(parsed.validitySlot)
+  const platformCostEstimate = parseOptionalPlatformCost(parsed.platformCostEstimate)
   return {
     accountId,
     paymentId,
@@ -911,9 +1086,25 @@ function restorePreparedEffect(
     preparedPayload,
     routeId,
     payloadHash,
+    ...(platformCostEstimate === undefined ? {} : { platformCostEstimate }),
     ...(validityExpiresAt === undefined ? {} : { validityExpiresAt }),
     ...(validitySlot === undefined ? {} : { validitySlot }),
   }
+}
+
+function parseOptionalPlatformCost(
+  value: unknown,
+): V2PlatformCostObservation | undefined {
+  if (value === undefined) return undefined
+  if (!isRecord(value)) {
+    throw new InvalidStateError('Durable platform cost estimate is invalid')
+  }
+  const assetId = readRequiredString(value, 'assetId')
+  const amountAtomic = readRequiredString(value, 'amountAtomic')
+  if (!/^\d+$/u.test(amountAtomic)) {
+    throw new InvalidStateError('Durable platform cost estimate is invalid')
+  }
+  return { assetId, amountAtomic: BigInt(amountAtomic) }
 }
 
 function readRequiredString(value: Record<string, unknown>, field: string): string {
@@ -1010,4 +1201,11 @@ function paymentIdFromClaim(claim: V2WorkItemClaim): string {
     throw new InvalidStateError('Outgoing work item payload has no payment id')
   }
   return payload.payment_id
+}
+
+function platformCostRecordId(attemptId: string, effectHash: string): string {
+  return `cost_${createHash('sha256')
+    .update(`${attemptId}:${effectHash}`, 'utf8')
+    .digest('hex')
+    .slice(0, 59)}`
 }

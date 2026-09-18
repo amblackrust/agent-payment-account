@@ -122,6 +122,8 @@ describe('V2 outgoing worker', () => {
     let completed = false
     let finalized = false
     let finalizedInput: Record<string, unknown> | undefined
+    const costEstimates: unknown[] = []
+    const reconciledCosts: unknown[] = []
     const baseView = view()
     const signingRequest: V2SigningRequestRecord = {
       id: 'signing_attempt_1',
@@ -207,6 +209,7 @@ describe('V2 outgoing worker', () => {
           keyVersion: 1,
           payloadHash: 'a'.repeat(64),
           preparedPayload: '{}',
+          platformCostEstimate: { assetId: 'sol', amountAtomic: 5n },
         }),
         sign: async () => {
           signCount += 1
@@ -220,7 +223,18 @@ describe('V2 outgoing worker', () => {
         submit: async () => ({
           status: 'CONFIRMED' as const,
           externalId: 'external-1',
+          platformCostActual: { assetId: 'sol', amountAtomic: 4n },
         }),
+      },
+      platformCosts: {
+        createPlatformCostEstimate: async (input) => {
+          costEstimates.push(input)
+          return {} as never
+        },
+        reconcilePlatformCost: async (input) => {
+          reconciledCosts.push(input)
+          return {} as never
+        },
       },
       owner: 'worker-1',
     })
@@ -232,6 +246,9 @@ describe('V2 outgoing worker', () => {
     expect(finalizedInput?.expectedExternalId).toBe('external-1')
     expect(finalizedInput?.payloadHash).toBe('a'.repeat(64))
     expect(finalizedInput?.metadataJson).toContain('prepared_payload_hash')
+    expect(costEstimates).toHaveLength(1)
+    expect(reconciledCosts).toHaveLength(1)
+    expect((reconciledCosts[0] as { actualAmount: bigint }).actualAmount).toBe(4n)
     expect(completed).toBe(true)
   })
 
@@ -281,5 +298,102 @@ describe('V2 outgoing worker', () => {
       'RECONCILE_PAYMENT_ATTEMPT',
     ])
     expect(retryInput?.nextKind).toBe('OUTGOING_PAYMENT_ATTEMPT')
+  })
+
+  it('keeps the reservation held while atomically creating a safe fallback attempt', async () => {
+    let claimCount = 0
+    let finalizedInput: Record<string, unknown> | undefined
+    const repository = {
+      claimWorkItem: async () => {
+        if (claimCount++ > 0) return null
+        return {
+          id: 'reconcile_work_1',
+          kind: 'RECONCILE_PAYMENT_ATTEMPT',
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: 'attempt_1',
+          attemptCount: 1,
+          payloadJson: JSON.stringify({ payment_id: 'pay_1', attempt_id: 'attempt_1' }),
+          accountId: 'acct_1',
+        }
+      },
+      findPaymentView: async () => ({
+        ...view(),
+        attempts: [
+          { ...view().attempts[0], outcome: 'UNKNOWN', status: 'RECONCILING' },
+        ],
+      }),
+      listActiveSettlementRoutes: async () => [
+        {
+          id: 'route_1',
+          rail: 'SOLANA_SPL',
+          railVersion: '1',
+          network: 'localnet',
+          settlementAssetId: 'asset_1',
+          economicMappingId: 'mapping_1',
+          status: 'ACTIVE' as const,
+          priority: 1,
+          configVersion: 'test',
+        },
+        {
+          id: 'route_2',
+          rail: 'SOLANA_SPL',
+          railVersion: '1',
+          network: 'fallbacknet',
+          settlementAssetId: 'asset_2',
+          economicMappingId: 'mapping_2',
+          status: 'ACTIVE' as const,
+          priority: 2,
+          configVersion: 'test',
+        },
+      ],
+      findSettlementAsset: async () => ({
+        id: 'asset_2',
+        rail: 'SOLANA_SPL',
+        network: 'fallbacknet',
+        assetReference: 'asset_2',
+        decimals: 6,
+        status: 'ACTIVE',
+        version: 1,
+      }),
+      findEconomicMapping: async () => ({
+        id: 'mapping_2',
+        denominationId: 'denom_usd',
+        settlementAssetId: 'asset_2',
+        numerator: 1n,
+        denominator: 1n,
+        status: 'ACTIVE',
+        version: 1,
+      }),
+      finalizeV2Payment: async (input: Record<string, unknown>) => {
+        finalizedInput = input
+        return view()
+      },
+      completeWorkItem: async () => undefined,
+    }
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'ACTIVE' },
+      executor: {
+        prepare: async () => {
+          throw new Error('reconciliation must not prepare')
+        },
+        sign: async () => {
+          throw new Error('reconciliation must not sign')
+        },
+        submit: async () => ({ status: 'UNKNOWN' as const }),
+        reconcile: async () => ({ status: 'PROVED_NO_EFFECT' as const }),
+      },
+      mode: 'reconcile',
+      owner: 'reconcile-1',
+    })
+
+    await worker.runOnce()
+
+    expect(finalizedInput?.reservation).toBe('NONE')
+    expect(finalizedInput?.paymentStatus).toBe('ROUTING')
+    expect(finalizedInput?.replacement).toMatchObject({
+      workItemId: expect.any(String),
+      route: { id: 'route_2' },
+    })
   })
 })

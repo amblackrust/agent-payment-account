@@ -169,6 +169,10 @@ model RecipientDestination {
   rail          String    @db.VarChar(64)
   type          String    @db.VarChar(64)
   walletAddress String    @map("wallet_address") @db.VarChar(128)
+  network       String?   @db.VarChar(64)
+  assetReference String?  @map("asset_reference") @db.VarChar(255)
+  status        String    @default("ACTIVE") @db.VarChar(16)
+  version       Int       @default(1)
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
   recipient     Recipient @relation(fields: [recipientId], references: [id], onDelete: Restrict)
@@ -194,7 +198,9 @@ model Payment {
   routeId                   String?              @map("route_id") @db.VarChar(64)
   routeSelectionReason      String?              @map("route_selection_reason") @db.VarChar(64)
   settlementAssetId         String?              @map("settlement_asset_id") @db.VarChar(64)
+  economicMappingId         String?              @map("economic_mapping_id") @db.VarChar(64)
   destinationSnapshotJson   String?              @map("destination_snapshot_json") @db.Text
+  intentFingerprint         String?              @map("intent_fingerprint") @db.Char(64)
   policyDecisionId          String?              @map("policy_decision_id") @db.VarChar(64)
   approvalId                String?              @map("approval_id") @db.VarChar(64)
   executionState            String               @default("NOT_STARTED") @map("execution_state") @db.VarChar(32)
@@ -289,11 +295,14 @@ model IndexerCheckpoint {
   rail            String       @db.VarChar(64)
   address         String       @db.VarChar(128)
   cursorSignature String?      @map("cursor_signature") @db.VarChar(128)
+  leaseOwner      String?      @map("lease_owner") @db.VarChar(128)
+  leaseExpiresAt  DateTime?    @map("lease_expires_at")
   createdAt       DateTime     @default(now()) @map("created_at")
   updatedAt       DateTime     @updatedAt @map("updated_at")
   account         AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
   @@unique([accountId, rail, address])
+  @@index([leaseExpiresAt])
   @@map("indexer_checkpoints")
 }
 

@@ -8,7 +8,7 @@ import {
   NotFoundError,
   type AgentAccountLifecycleStatus,
 } from '@agent-payment/core'
-import type { PrismaClient } from './generated/client/client.js'
+import type { Prisma, PrismaClient } from './generated/client/client.js'
 
 export interface V2AccountRecord {
   readonly id: string
@@ -207,6 +207,7 @@ export interface V2AdminRepository {
     readonly nextStatus: AgentAccountLifecycleStatus
     readonly rowVersion: number
     readonly reason?: string
+    readonly actorId?: string
   }): Promise<V2AccountRecord>
   rotateCredential(input: {
     readonly accountId: string
@@ -237,10 +238,26 @@ export interface V2AdminRepository {
     readonly transactionCountEscalatable: boolean
     readonly rulesJson: string
   }): Promise<V2SpendPolicyAdminRecord>
+  replaceSpendPolicy(input: {
+    readonly id: string
+    readonly accountId: string
+    readonly denominationId: string
+    readonly maxPerPaymentAtomic: bigint | null
+    readonly rollingBudgetAtomic: bigint | null
+    readonly rollingWindowSeconds: number | null
+    readonly transactionCountCap: number | null
+    readonly approvalThresholdAtomic: bigint | null
+    readonly rollingBudgetEscalatable: boolean
+    readonly transactionCountEscalatable: boolean
+    readonly rulesJson: string
+    readonly expectedVersion?: number
+    readonly actorId: string
+  }): Promise<V2SpendPolicyAdminRecord>
   activateSpendPolicy(
     accountId: string,
     policyId: string,
     rowVersion?: number,
+    actorId?: string,
   ): Promise<V2SpendPolicyAdminRecord>
   listApprovals(accountId: string): Promise<readonly V2ApprovalAdminRecord[]>
   decideApproval(input: {
@@ -555,13 +572,20 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     async transitionAccount(input) {
       assertAgentAccountTransition(input.currentStatus, input.nextStatus)
       const result = await prisma.$transaction(async (transaction) => {
-        const current = await transaction.agentAccount.findUnique({
-          where: { id: input.accountId },
-        })
-        if (current === null) throw new NotFoundError('Agent account was not found')
+        const currentRows = await transaction.$queryRaw<
+          Array<{ status: string; row_version: number }>
+        >`
+          SELECT status, row_version
+          FROM "agent_accounts"
+          WHERE id = ${input.accountId}
+          FOR UPDATE
+        `
+        const current = currentRows[0]
+        if (current === undefined)
+          throw new NotFoundError('Agent account was not found')
         if (
           current.status !== input.currentStatus ||
-          current.rowVersion !== input.rowVersion
+          current.row_version !== input.rowVersion
         ) {
           throw new ConflictError('Account lifecycle changed concurrently')
         }
@@ -598,7 +622,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             resourceId: input.accountId,
             eventType: `ACCOUNT_${input.nextStatus}`,
             actorType: 'OPERATOR',
-            actorId: input.accountId,
+            actorId: input.actorId ?? input.accountId,
             source: 'V2_ACCOUNT_LIFECYCLE',
             occurredAt: new Date(),
             oldStateJson: JSON.stringify({ status: input.currentStatus }),
@@ -689,32 +713,103 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     },
 
     async createSpendPolicy(input) {
-      const latest = await prisma.spendPolicy.findFirst({
-        where: { accountId: input.accountId },
-        orderBy: { version: 'desc' },
-        select: { version: true },
-      })
-      const policy = await prisma.spendPolicy.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          version: (latest?.version ?? 0) + 1,
-          denominationId: input.denominationId,
-          maxPerPaymentAtomic: input.maxPerPaymentAtomic,
-          rollingBudgetAtomic: input.rollingBudgetAtomic,
-          rollingWindowSeconds: input.rollingWindowSeconds,
-          transactionCountCap: input.transactionCountCap,
-          approvalThresholdAtomic: input.approvalThresholdAtomic,
-          rollingBudgetEscalatable: input.rollingBudgetEscalatable,
-          transactionCountEscalatable: input.transactionCountEscalatable,
-          rulesJson: input.rulesJson,
-        },
+      const policy = await prisma.$transaction(async (transaction) => {
+        await lockAgentAccount(transaction, input.accountId)
+        const latest = await transaction.spendPolicy.findFirst({
+          where: { accountId: input.accountId },
+          orderBy: { version: 'desc' },
+          select: { version: true },
+        })
+        return transaction.spendPolicy.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            version: (latest?.version ?? 0) + 1,
+            denominationId: input.denominationId,
+            maxPerPaymentAtomic: input.maxPerPaymentAtomic,
+            rollingBudgetAtomic: input.rollingBudgetAtomic,
+            rollingWindowSeconds: input.rollingWindowSeconds,
+            transactionCountCap: input.transactionCountCap,
+            approvalThresholdAtomic: input.approvalThresholdAtomic,
+            rollingBudgetEscalatable: input.rollingBudgetEscalatable,
+            transactionCountEscalatable: input.transactionCountEscalatable,
+            rulesJson: input.rulesJson,
+          },
+        })
       })
       return toSpendPolicyAdminRecord(policy)
     },
 
-    async activateSpendPolicy(accountId, policyId, rowVersion) {
+    async replaceSpendPolicy(input) {
+      const now = new Date()
+      const policy = await prisma.$transaction(async (transaction) => {
+        await lockAgentAccount(transaction, input.accountId)
+        const active = await transaction.spendPolicy.findFirst({
+          where: { accountId: input.accountId, status: 'ACTIVE' },
+          orderBy: { version: 'desc' },
+          select: { id: true, version: true },
+        })
+        if (active !== null && input.expectedVersion === undefined) {
+          throw new ConflictError('Spend policy version is required for replacement')
+        }
+        if (
+          input.expectedVersion !== undefined &&
+          (active?.version ?? 0) !== input.expectedVersion
+        ) {
+          throw new ConflictError('Spend policy version changed concurrently')
+        }
+        const latest = await transaction.spendPolicy.findFirst({
+          where: { accountId: input.accountId },
+          orderBy: { version: 'desc' },
+          select: { version: true },
+        })
+        await transaction.spendPolicy.updateMany({
+          where: { accountId: input.accountId, status: 'ACTIVE' },
+          data: { status: 'RETIRED', retiredAt: now },
+        })
+        const created = await transaction.spendPolicy.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            version: (latest?.version ?? 0) + 1,
+            status: 'ACTIVE',
+            denominationId: input.denominationId,
+            maxPerPaymentAtomic: input.maxPerPaymentAtomic,
+            rollingBudgetAtomic: input.rollingBudgetAtomic,
+            rollingWindowSeconds: input.rollingWindowSeconds,
+            transactionCountCap: input.transactionCountCap,
+            approvalThresholdAtomic: input.approvalThresholdAtomic,
+            rollingBudgetEscalatable: input.rollingBudgetEscalatable,
+            transactionCountEscalatable: input.transactionCountEscalatable,
+            rulesJson: input.rulesJson,
+            activatedAt: now,
+          },
+        })
+        await transaction.operationTimelineEvent.create({
+          data: {
+            id: createId('timeline'),
+            accountId: input.accountId,
+            resourceType: 'SPEND_POLICY',
+            resourceId: created.id,
+            eventType: 'SPEND_POLICY_REPLACED',
+            actorType: 'OPERATOR',
+            actorId: input.actorId,
+            source: 'V2_POLICY_ADMIN',
+            occurredAt: now,
+            newStateJson: JSON.stringify({
+              version: created.version,
+              previous_version: active?.version ?? null,
+            }),
+          },
+        })
+        return created
+      })
+      return toSpendPolicyAdminRecord(policy)
+    },
+
+    async activateSpendPolicy(accountId, policyId, rowVersion, actorId) {
       return prisma.$transaction(async (transaction) => {
+        await lockAgentAccount(transaction, accountId)
         const policy = await transaction.spendPolicy.findFirst({
           where: { id: policyId, accountId },
         })
@@ -740,7 +835,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             resourceId: policyId,
             eventType: 'SPEND_POLICY_ACTIVATED',
             actorType: 'OPERATOR',
-            actorId: accountId,
+            actorId: actorId ?? accountId,
             source: 'V2_POLICY_ADMIN',
             occurredAt: new Date(),
             newStateJson: JSON.stringify({ version: activated.version }),
@@ -760,6 +855,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
 
     async decideApproval(input) {
       return prisma.$transaction(async (transaction) => {
+        await lockAgentAccount(transaction, input.accountId)
         const approval = await transaction.approval.findFirst({
           where: { id: input.approvalId, accountId: input.accountId },
         })
@@ -786,6 +882,12 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           if (payment.status !== 'AWAITING_APPROVAL') {
             throw new ConflictError('Payment is no longer awaiting approval')
           }
+          if (
+            payment.intentFingerprint === null ||
+            approval.fingerprint !== payment.intentFingerprint
+          ) {
+            throw new ConflictError('Approval intent no longer matches the payment')
+          }
           const account = await transaction.agentAccount.findUniqueOrThrow({
             where: { id: input.accountId },
             select: { status: true },
@@ -797,6 +899,9 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
               ownerAccountId: input.accountId,
               status: 'ACTIVE',
               lifecycleState: 'HELD',
+              ...(payment.denominationId === null
+                ? { currency: payment.currency }
+                : { payment: { denominationId: payment.denominationId } }),
             },
             _sum: { amountAtomic: true },
           })
@@ -893,26 +998,32 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     },
 
     async createApprovedDestination(input) {
-      const destination = await prisma.approvedDestination.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          fingerprint: input.fingerprint,
-          rail: input.rail,
-          network: input.network,
-          assetReference: input.assetReference,
-          destination: input.destination,
-          actorId: input.actorId,
-          ...(input.reason === undefined ? {} : { reason: input.reason }),
-        },
+      const destination = await prisma.$transaction(async (transaction) => {
+        await lockAgentAccount(transaction, input.accountId)
+        return transaction.approvedDestination.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            fingerprint: input.fingerprint,
+            rail: input.rail,
+            network: input.network,
+            assetReference: input.assetReference,
+            destination: input.destination,
+            actorId: input.actorId,
+            ...(input.reason === undefined ? {} : { reason: input.reason }),
+          },
+        })
       })
       return toApprovedDestinationRecord(destination)
     },
 
     async revokeApprovedDestination(input) {
-      const result = await prisma.approvedDestination.updateMany({
-        where: { id: input.id, accountId: input.accountId, status: 'ACTIVE' },
-        data: { status: 'REVOKED', revokedAt: new Date(), reason: input.reason },
+      const result = await prisma.$transaction(async (transaction) => {
+        await lockAgentAccount(transaction, input.accountId)
+        return transaction.approvedDestination.updateMany({
+          where: { id: input.id, accountId: input.accountId, status: 'ACTIVE' },
+          data: { status: 'REVOKED', revokedAt: new Date(), reason: input.reason },
+        })
       })
       if (result.count !== 1)
         throw new NotFoundError('Approved destination was not found')
@@ -976,12 +1087,12 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
               ? {}
               : {
                   OR: [
-                    { updatedAt: { lt: input.cursor.occurredAt } },
-                    { updatedAt: input.cursor.occurredAt, id: { lt: input.cursor.id } },
+                    { createdAt: { lt: input.cursor.occurredAt } },
+                    { createdAt: input.cursor.occurredAt, id: { lt: input.cursor.id } },
                   ],
                 }),
           },
-          orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           take: input.limit,
         }),
         prisma.incomingPayment.findMany({
@@ -1014,7 +1125,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           currency: payment.currency,
           recipientId: payment.recipientId,
           externalId: null,
-          occurredAt: payment.updatedAt,
+          occurredAt: payment.createdAt,
         })),
         ...incoming.map((payment) => ({
           id: payment.id,
@@ -1142,6 +1253,19 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
       }
     },
   }
+}
+
+async function lockAgentAccount(
+  transaction: Prisma.TransactionClient,
+  accountId: string,
+): Promise<void> {
+  const rows = await transaction.$queryRaw<Array<{ id: string }>>`
+    SELECT id
+    FROM "agent_accounts"
+    WHERE id = ${accountId}
+    FOR UPDATE
+  `
+  if (rows[0] === undefined) throw new NotFoundError('Agent account was not found')
 }
 
 function createId(prefix: string): string {

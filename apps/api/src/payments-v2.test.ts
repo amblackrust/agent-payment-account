@@ -3,6 +3,7 @@ import { V2PaymentService } from './payments-v2.js'
 import type {
   AuthenticatedAccount,
   V2DatabaseRepository,
+  V2IdempotencyRecord,
   V2PaymentCreateInput,
   V2PaymentView,
 } from '@agent-payment/db'
@@ -30,7 +31,9 @@ const account: AuthenticatedAccount = {
 function createHarness(destinationApproved: boolean) {
   let captured: V2PaymentCreateInput | undefined
   let latestView: V2PaymentView | undefined
+  let existingIdempotency: V2IdempotencyRecord | null = null
   const getSettledAtomic = vi.fn(async () => 1_000n)
+  const findV2Idempotency = vi.fn(async () => existingIdempotency)
   const repository = {
     findDenomination: async () => ({
       id: 'denom_usd',
@@ -102,6 +105,7 @@ function createHarness(destinationApproved: boolean) {
       rollingBudgetEscalatable: false,
       transactionCountEscalatable: false,
     }),
+    findV2Idempotency,
     createV2Payment: async (input: V2PaymentCreateInput) => {
       captured = input
       const now = new Date('2026-09-17T00:00:00.000Z')
@@ -202,7 +206,14 @@ function createHarness(destinationApproved: boolean) {
     settledBalanceProvider: { getSettledAtomic },
     now: () => new Date('2026-09-17T00:00:00.000Z'),
   })
-  return { service, getSettledAtomic, getCaptured: () => captured }
+  return {
+    service,
+    getSettledAtomic,
+    getCaptured: () => captured,
+    setExistingIdempotency: (record: V2IdempotencyRecord | null) => {
+      existingIdempotency = record
+    },
+  }
 }
 
 describe('V2 payment service', () => {
@@ -249,5 +260,39 @@ describe('V2 payment service', () => {
     expect(harness.getCaptured()?.route).toBeNull()
     expect(harness.getCaptured()?.settlementAssetId).toBeNull()
     expect(harness.getSettledAtomic).not.toHaveBeenCalled()
+  })
+
+  it('replays an idempotent payment before downstream route and balance reads', async () => {
+    const harness = createHarness(true)
+    const input = {
+      kind: 'PAY' as const,
+      recipientId: 'recipient_1',
+      amount: '1.25',
+      denominationId: 'denom_usd',
+    }
+    const first = await harness.service.createPayment(
+      account,
+      input,
+      'idem_replay',
+      'req_1',
+    )
+    const captured = harness.getCaptured()
+    if (captured === undefined) throw new Error('Payment input was not captured')
+    harness.setExistingIdempotency({
+      requestHash: captured.requestHash,
+      fingerprint: captured.fingerprint,
+      resourceId: first.view.payment.id,
+    })
+
+    const second = await harness.service.createPayment(
+      account,
+      input,
+      'idem_replay',
+      'req_2',
+    )
+
+    expect(second.created).toBe(false)
+    expect(second.view.payment.id).toBe(first.view.payment.id)
+    expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
   })
 })

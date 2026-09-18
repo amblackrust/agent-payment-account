@@ -62,6 +62,7 @@ export interface SolanaV2PaymentView {
     readonly denominationId: string | null
     readonly routeId: string | null
     readonly settlementAssetId: string | null
+    readonly economicMappingId?: string | null
     readonly destinationSnapshotJson: string | null
   }
 }
@@ -71,6 +72,7 @@ export interface SolanaV2AttemptSnapshot {
   readonly paymentId: string
   readonly attemptNumber: number
   readonly routeId: string | null
+  readonly preparedEffectJson?: string | null
 }
 
 export interface SolanaV2SigningRequest {
@@ -102,6 +104,7 @@ export interface SolanaV2OutgoingExecutorOptions {
   readonly feePayerSecret?: string | Uint8Array
   readonly rpcTimeoutMs?: number
   readonly minimumFeePayerBalanceLamports?: bigint
+  readonly platformCostAssetId?: string
   getPayerPublicKey(accountId: string): Promise<string | null>
   getDenomination(denominationId: string): Promise<{
     readonly id: string
@@ -144,7 +147,16 @@ export interface SolanaV2PreparedEffect extends SolanaV2SigningRequest {
   readonly routeId: string
   readonly payloadHash: string
   readonly preparedPayload: string
+  readonly platformCostEstimate?: {
+    readonly assetId: string
+    readonly amountAtomic: bigint
+  }
   readonly validitySlot?: bigint
+}
+
+interface SolanaV2PlatformCostObservation {
+  readonly assetId: string
+  readonly amountAtomic: bigint
 }
 
 interface SolanaV2PreparedPayload {
@@ -188,6 +200,7 @@ export function createSolanaV2OutgoingExecutor(
     readonly externalId?: string
     readonly failureCode?: string
     readonly failureMessageSafe?: string
+    readonly platformCostActual?: SolanaV2PlatformCostObservation
   }>
   reconcile(input: {
     readonly view: SolanaV2PaymentView
@@ -195,6 +208,7 @@ export function createSolanaV2OutgoingExecutor(
   }): Promise<{
     readonly status: 'CONFIRMED' | 'PROVED_NO_EFFECT' | 'UNKNOWN'
     readonly externalId?: string
+    readonly platformCostActual?: SolanaV2PlatformCostObservation
   }>
   checkReadiness(): Promise<void>
 } {
@@ -210,6 +224,12 @@ export function createSolanaV2OutgoingExecutor(
   if (minimumFeePayerBalanceLamports <= 0n) {
     throw new SolanaRailConfigurationError(
       'Minimum fee payer balance must be a positive lamport amount',
+    )
+  }
+  const platformCostAssetId = options.platformCostAssetId?.trim()
+  if (options.platformCostAssetId !== undefined && platformCostAssetId === '') {
+    throw new SolanaRailConfigurationError(
+      'Platform cost asset identity must not be empty',
     )
   }
   let feePayerSignerPromise: Promise<KeyPairSigner> | undefined
@@ -298,11 +318,12 @@ export function createSolanaV2OutgoingExecutor(
     const route = await options.getSettlementRoute(payment.routeId)
     if (route === null)
       throw new CoreExternalRailError('Settlement route is unavailable')
+    const economicMappingId = payment.economicMappingId ?? route.economicMappingId
     const [denominationRecord, assetRecord, mappingRecord, payerPublicKey, keyVersion] =
       await Promise.all([
         options.getDenomination(payment.denominationId),
         options.getSettlementAsset(payment.settlementAssetId),
-        options.getEconomicMapping(route.economicMappingId),
+        options.getEconomicMapping(economicMappingId),
         options.getPayerPublicKey(payment.payerAccountId),
         options.getActiveKeyVersion(payment.payerAccountId),
       ])
@@ -582,6 +603,14 @@ export function createSolanaV2OutgoingExecutor(
       preparedPayload: serializedPayload,
       routeId: route.id,
       payloadHash,
+      ...(platformCostAssetId === undefined
+        ? {}
+        : {
+            platformCostEstimate: {
+              assetId: platformCostAssetId,
+              amountAtomic: platformCost,
+            },
+          }),
       validitySlot: latestBlockhash.value.lastValidBlockHeight,
     }
   }
@@ -620,7 +649,15 @@ export function createSolanaV2OutgoingExecutor(
     parsePreparedPayload(input.prepared.preparedPayload)
     const initial = await observeSignature(input.signed.externalId)
     if (initial.status === 'CONFIRMED') {
-      return { status: 'CONFIRMED', externalId: input.signed.externalId }
+      const platformCostActual = await readActualPlatformCost(
+        input.signed.externalId,
+        input.prepared.preparedPayload,
+      )
+      return {
+        status: 'CONFIRMED',
+        externalId: input.signed.externalId,
+        ...(platformCostActual === undefined ? {} : { platformCostActual }),
+      }
     }
     if (initial.status === 'FAILED') {
       return {
@@ -693,7 +730,15 @@ export function createSolanaV2OutgoingExecutor(
     }
     const observed = await observeSignature(currentAttempt.expectedExternalId)
     if (observed.status === 'CONFIRMED') {
-      return { status: 'CONFIRMED', externalId: currentAttempt.expectedExternalId }
+      const platformCostActual = await readActualPlatformCost(
+        currentAttempt.expectedExternalId,
+        preparedPayloadFromAttempt(currentAttempt),
+      )
+      return {
+        status: 'CONFIRMED',
+        externalId: currentAttempt.expectedExternalId,
+        ...(platformCostActual === undefined ? {} : { platformCostActual }),
+      }
     }
     if (observed.status === 'FAILED') {
       return {
@@ -780,7 +825,75 @@ export function createSolanaV2OutgoingExecutor(
     }
   }
 
+  async function readActualPlatformCost(
+    transactionId: string,
+    preparedPayload: string | undefined,
+  ): Promise<SolanaV2PlatformCostObservation | undefined> {
+    if (platformCostAssetId === undefined) return undefined
+    try {
+      const rpc = options.rpc as unknown as {
+        getTransaction(
+          signature: string,
+          config: Readonly<Record<string, unknown>>,
+        ): {
+          send(options?: { readonly abortSignal?: AbortSignal }): Promise<{
+            readonly meta: { readonly fee?: number | bigint | null } | null
+          } | null>
+        }
+      }
+      const response = await withRpcTimeout((abortSignal) =>
+        rpc
+          .getTransaction(transactionId, {
+            encoding: 'jsonParsed',
+            commitment: CONFIRMATION_COMMITMENT,
+            maxSupportedTransactionVersion: 0,
+          })
+          .send({ abortSignal }),
+      )
+      const fee = response?.meta?.fee
+      if (fee === undefined || fee === null) return undefined
+      let recipientAtaRent = 0n
+      if (preparedPayload !== undefined) {
+        const payload = parsePreparedPayload(preparedPayload)
+        if (payload.createsRecipientAta) {
+          recipientAtaRent = await withRpcTimeout((abortSignal) =>
+            options.rpc.getMinimumBalanceForRentExemption(165n).send({ abortSignal }),
+          )
+        }
+      }
+      return {
+        assetId: platformCostAssetId,
+        amountAtomic: BigInt(fee) + recipientAtaRent,
+      }
+    } catch {
+      return undefined
+    }
+  }
+
   return { prepare, sign, submit, reconcile, checkReadiness }
+}
+
+function preparedPayloadFromAttempt(
+  attempt: SolanaV2AttemptSnapshot,
+): string | undefined {
+  if (attempt.preparedEffectJson === undefined || attempt.preparedEffectJson === null) {
+    return undefined
+  }
+  try {
+    const parsed = JSON.parse(attempt.preparedEffectJson) as unknown
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      'preparedPayload' in parsed &&
+      typeof parsed.preparedPayload === 'string'
+    ) {
+      return parsed.preparedPayload
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
 }
 
 export async function signSolanaV2PreparedEffect(input: {

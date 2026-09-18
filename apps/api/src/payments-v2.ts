@@ -10,6 +10,7 @@ import {
   evaluateSpendPolicy,
   exactMoneyFromAtomicUnits,
   formatExactMoney,
+  IdempotencyConflictError,
   InvalidStateError,
   NotFoundError,
   parseExactMoney,
@@ -21,6 +22,7 @@ import {
   type EconomicMapping,
   type ExactMoney,
   type SettlementAsset,
+  type SettlementRoute,
   type SpendPolicy,
 } from '@agent-payment/core'
 import type {
@@ -111,15 +113,38 @@ export class V2PaymentService {
     if (amount.atomicUnits <= 0n) {
       throw new ValidationError('Payment amount must be positive')
     }
-    const target =
-      input.target ??
-      (input.recipientId === null
-        ? (() => {
-            throw new ValidationError('Recipient is required for a payment')
-          })()
-        : await this.loadPaymentTarget(account.account.id, input.recipientId))
-    const destination = target.destination
-
+    const fingerprint = hashJson({
+      kind: input.kind,
+      recipient_id: input.recipientId,
+      amount: amount.amount,
+      denomination_id: denomination.id,
+      description: input.description ?? null,
+      external_reference: input.externalReference ?? null,
+      route_preference: input.routePreference ?? null,
+      original_payment_id: input.originalPaymentId ?? null,
+    })
+    const existingIdempotency = await this.options.repository.findV2Idempotency(
+      account.account.id,
+      idempotencyKey,
+    )
+    if (existingIdempotency !== null) {
+      if (
+        existingIdempotency.requestHash !== fingerprint ||
+        existingIdempotency.fingerprint !== fingerprint
+      ) {
+        throw new IdempotencyConflictError()
+      }
+      const existingView = await this.options.repository.findPaymentView(
+        account.account.id,
+        existingIdempotency.resourceId,
+      )
+      if (existingView === null) {
+        throw new InvalidStateError(
+          'Idempotency record points to an unreadable payment projection',
+        )
+      }
+      return { view: existingView, created: false }
+    }
     const routes = await this.options.repository.listActiveSettlementRoutes()
     const routeSelection = selectSettlementRoute(
       {
@@ -133,6 +158,19 @@ export class V2PaymentService {
       routes,
     )
     const route = routeSelection.route
+    const target =
+      input.target ??
+      (input.recipientId === null
+        ? (() => {
+            throw new ValidationError('Recipient is required for a payment')
+          })()
+        : await this.loadPaymentTarget(account.account.id, input.recipientId, route))
+    const destination = target.destination
+    if (destination.rail !== route.rail) {
+      throw new ValidationError(
+        'Recipient destination is incompatible with the settlement route',
+      )
+    }
     const settlementAsset = await this.options.repository.findSettlementAsset(
       route.settlementAssetId,
     )
@@ -229,17 +267,56 @@ export class V2PaymentService {
     if (settledAtomic < 0n) {
       throw new InvalidStateError('Settlement balance cannot be negative')
     }
-
-    const fingerprint = hashJson({
-      kind: input.kind,
-      recipient_id: target.recipientId,
-      amount: amount.amount,
+    const intentFingerprint = hashJson({
+      request_fingerprint: fingerprint,
+      amount_atomic: amount.atomicUnits.toString(),
+      amount_scale: amount.scale,
       denomination_id: denomination.id,
-      description: input.description ?? null,
-      external_reference: input.externalReference ?? null,
-      route_preference: input.routePreference ?? null,
-      original_payment_id: input.originalPaymentId ?? null,
+      destination: {
+        id: destination.id,
+        rail: destination.rail,
+        type: destination.type,
+        wallet_address: destination.walletAddress,
+        recipient_id: target.recipientId,
+        managed_account_id: target.managedAccountId,
+      },
+      route:
+        policyDecision.decision === 'DENY'
+          ? null
+          : {
+              id: route.id,
+              rail: route.rail,
+              rail_version: route.railVersion,
+              network: route.network,
+              settlement_asset_id: route.settlementAssetId,
+              economic_mapping_id: route.economicMappingId,
+              priority: route.priority,
+              config_version: route.configVersion,
+            },
+      settlement_asset:
+        policyDecision.decision === 'DENY'
+          ? null
+          : {
+              id: settlementAsset.id,
+              rail: settlementAsset.rail,
+              network: settlementAsset.network,
+              asset_reference: settlementAsset.assetReference,
+              decimals: settlementAsset.decimals,
+              version: settlementAsset.version,
+            },
+      economic_mapping:
+        policyDecision.decision === 'DENY'
+          ? null
+          : {
+              id: mappingRecord.id,
+              denomination_id: mappingRecord.denominationId,
+              settlement_asset_id: mappingRecord.settlementAssetId,
+              numerator: mappingRecord.numerator.toString(),
+              denominator: mappingRecord.denominator.toString(),
+              version: mappingRecord.version,
+            },
     })
+
     const paymentId = createPaymentId()
     const decisionInput = {
       id: createId('pdec'),
@@ -299,6 +376,9 @@ export class V2PaymentService {
         }),
         settlementAssetId:
           policyDecision.decision === 'DENY' ? null : settlementAsset.id,
+        economicMappingId: policyDecision.decision === 'DENY' ? null : mappingRecord.id,
+        destinationFingerprint,
+        intentFingerprint,
         policyDecision: decisionInput,
         ...(policyDecision.decision === 'REQUIRE_APPROVAL'
           ? {
@@ -463,6 +543,7 @@ export class V2PaymentService {
   private async loadPaymentTarget(
     accountId: string,
     recipientId: string,
+    route: SettlementRoute,
   ): Promise<V2PaymentTarget> {
     const recipient = await this.options.recipientRepository.findRecipientForOwner(
       accountId,
@@ -472,7 +553,15 @@ export class V2PaymentService {
     if (recipient.archivedAt !== undefined && recipient.archivedAt !== null) {
       throw new InvalidStateError('Recipient is archived')
     }
-    const destination = recipient.destinations[0]
+    const destination = recipient.destinations.find(
+      (candidate) =>
+        candidate.status !== 'REVOKED' &&
+        candidate.status !== 'DISABLED' &&
+        candidate.rail === route.rail &&
+        (candidate.network === undefined ||
+          candidate.network === null ||
+          candidate.network === route.network),
+    )
     if (destination === undefined) {
       throw new InvalidStateError('Recipient has no active destination')
     }

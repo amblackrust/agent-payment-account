@@ -1,12 +1,18 @@
 import { randomBytes } from 'node:crypto'
 import {
   ConflictError,
+  createDenomination,
+  evaluateSpendPolicy,
+  exactMoneyFromAtomicUnits,
   IdempotencyConflictError,
   InsufficientFundsError,
   InvalidStateError,
   NotFoundError,
   assertAttemptProgression,
+  projectPaymentStatus,
+  type AttemptOutcome,
   type PaymentPolicyDecision,
+  type SpendPolicy,
   type SettlementRoute,
 } from '@agent-payment/core'
 import type { Prisma, PrismaClient } from './generated/client/client.js'
@@ -87,6 +93,7 @@ export interface V2PaymentSnapshot {
   readonly routeId: string | null
   readonly routeSelectionReason: string | null
   readonly settlementAssetId: string | null
+  readonly economicMappingId?: string | null
   readonly destinationSnapshotJson: string | null
   readonly policyDecisionId: string | null
   readonly approvalId: string | null
@@ -169,7 +176,10 @@ export interface V2PaymentCreateInput {
   readonly routeSelectionReason: string | null
   readonly destinationSnapshotJson: string
   readonly settlementAssetId: string | null
+  readonly economicMappingId: string | null
+  readonly destinationFingerprint: string
   readonly policyDecision: V2PolicyDecisionInput
+  readonly intentFingerprint?: string
   readonly approval?: {
     readonly id: string
     readonly expiresAt: Date
@@ -180,6 +190,12 @@ export interface V2PaymentCreateInput {
 export interface V2PaymentCreateResult {
   readonly payment: V2PaymentSnapshot
   readonly created: boolean
+}
+
+export interface V2IdempotencyRecord {
+  readonly requestHash: string
+  readonly fingerprint: string | null
+  readonly resourceId: string
 }
 
 export interface V2WorkItemClaim {
@@ -278,6 +294,10 @@ export interface V2DatabaseRepository {
     readonly actorId: string
     readonly reason: string
   }): Promise<void>
+  findV2Idempotency(
+    accountId: string,
+    idempotencyKey: string,
+  ): Promise<V2IdempotencyRecord | null>
   createV2Payment(input: V2PaymentCreateInput): Promise<V2PaymentCreateResult>
   findPayment(accountId: string, paymentId: string): Promise<V2PaymentSnapshot | null>
   findPaymentView(accountId: string, paymentId: string): Promise<V2PaymentView | null>
@@ -362,6 +382,13 @@ export interface V2DatabaseRepository {
     readonly reservation: 'CONSUME' | 'RELEASE' | 'NONE'
     readonly evidenceOutcome: string
     readonly source: string
+    readonly replacement?: {
+      readonly attemptId: string
+      readonly workItemId: string
+      readonly route: SettlementRoute
+      readonly economicMappingId: string
+      readonly destinationSnapshotJson: string
+    }
   }): Promise<V2PaymentView>
   claimWorkItem(input: {
     readonly kind: string
@@ -496,7 +523,12 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           : new Date(now.getTime() - rollingWindowSeconds * 1000)
       const [confirmed, held, unresolved, transactionCount] = await Promise.all([
         prisma.payment.aggregate({
-          where: { payerAccountId: accountId, denominationId, status: 'CONFIRMED' },
+          where: {
+            payerAccountId: accountId,
+            denominationId,
+            status: 'CONFIRMED',
+            createdAt: { gte: windowStart },
+          },
           _sum: { amountAtomic: true },
         }),
         prisma.outgoingReservation.aggregate({
@@ -504,6 +536,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             ownerAccountId: accountId,
             status: 'ACTIVE',
             lifecycleState: 'HELD',
+            payment: { denominationId },
           },
           _sum: { amountAtomic: true },
         }),
@@ -512,6 +545,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             payerAccountId: accountId,
             denominationId,
             status: { in: ['REVIEW_REQUIRED', 'CLOSED_UNRESOLVED'] },
+            createdAt: { gte: windowStart },
           },
           _sum: { amountAtomic: true },
         }),
@@ -716,6 +750,19 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         throw new NotFoundError('Approved destination was not found')
     },
 
+    async findV2Idempotency(accountId, idempotencyKey) {
+      return prisma.idempotencyRecord.findUnique({
+        where: {
+          ownerAccountId_operation_key: {
+            ownerAccountId: accountId,
+            operation: 'V2_PAYMENT',
+            key: idempotencyKey,
+          },
+        },
+        select: { requestHash: true, fingerprint: true, resourceId: true },
+      })
+    },
+
     async createV2Payment(input) {
       return prisma.$transaction(async (transaction) => {
         const accountRows = await transaction.$queryRaw<
@@ -753,6 +800,149 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             ),
             created: false,
           }
+        }
+
+        const currentPolicy = await transaction.spendPolicy.findUnique({
+          where: { id: input.policyDecision.policyId },
+        })
+        const currentDenomination = await transaction.denomination.findUnique({
+          where: { id: input.denominationId },
+        })
+        if (
+          currentPolicy === null ||
+          currentPolicy.accountId !== input.accountId ||
+          currentPolicy.denominationId !== input.denominationId ||
+          currentPolicy.status !== 'ACTIVE' ||
+          currentPolicy.version !== input.policyDecision.policyVersion ||
+          currentDenomination === null
+        ) {
+          throw new ConflictError('Spend policy changed while creating the payment')
+        }
+        const denomination = createDenomination({
+          id: currentDenomination.id,
+          symbol: currentDenomination.symbol,
+          maxScale: currentDenomination.maxScale,
+          status: currentDenomination.status as 'ACTIVE' | 'RETIRED',
+          version: currentDenomination.version,
+        })
+        const policy: SpendPolicy = {
+          id: currentPolicy.id,
+          accountId: currentPolicy.accountId,
+          version: currentPolicy.version,
+          status: currentPolicy.status as SpendPolicy['status'],
+          maxPerPayment:
+            currentPolicy.maxPerPaymentAtomic === null
+              ? null
+              : exactMoneyFromAtomicUnits(
+                  currentPolicy.maxPerPaymentAtomic,
+                  denomination,
+                ),
+          rollingBudget:
+            currentPolicy.rollingBudgetAtomic === null
+              ? null
+              : exactMoneyFromAtomicUnits(
+                  currentPolicy.rollingBudgetAtomic,
+                  denomination,
+                ),
+          rollingWindowSeconds: currentPolicy.rollingWindowSeconds,
+          transactionCountCap: currentPolicy.transactionCountCap,
+          approvalThreshold:
+            currentPolicy.approvalThresholdAtomic === null
+              ? null
+              : exactMoneyFromAtomicUnits(
+                  currentPolicy.approvalThresholdAtomic,
+                  denomination,
+                ),
+          rollingBudgetEscalatable: currentPolicy.rollingBudgetEscalatable,
+          transactionCountEscalatable: currentPolicy.transactionCountEscalatable,
+        }
+        const windowStart =
+          currentPolicy.rollingWindowSeconds === null
+            ? new Date(0)
+            : new Date(Date.now() - currentPolicy.rollingWindowSeconds * 1_000)
+        const [confirmed, held, unresolved, transactionCount, approvedDestination] =
+          await Promise.all([
+            transaction.payment.aggregate({
+              where: {
+                payerAccountId: input.accountId,
+                denominationId: input.denominationId,
+                status: 'CONFIRMED',
+                createdAt: { gte: windowStart },
+              },
+              _sum: { amountAtomic: true },
+            }),
+            transaction.outgoingReservation.aggregate({
+              where: {
+                ownerAccountId: input.accountId,
+                status: 'ACTIVE',
+                lifecycleState: 'HELD',
+                payment: { denominationId: input.denominationId },
+              },
+              _sum: { amountAtomic: true },
+            }),
+            transaction.payment.aggregate({
+              where: {
+                payerAccountId: input.accountId,
+                denominationId: input.denominationId,
+                status: { in: ['REVIEW_REQUIRED', 'CLOSED_UNRESOLVED'] },
+                createdAt: { gte: windowStart },
+              },
+              _sum: { amountAtomic: true },
+            }),
+            transaction.payment.count({
+              where: {
+                payerAccountId: input.accountId,
+                denominationId: input.denominationId,
+                createdAt: { gte: windowStart },
+                status: {
+                  notIn: ['REJECTED_BY_POLICY', 'REJECTED', 'FAILED', 'EXPIRED'],
+                },
+              },
+            }),
+            transaction.approvedDestination.findFirst({
+              where: {
+                accountId: input.accountId,
+                fingerprint: input.destinationFingerprint,
+                status: 'ACTIVE',
+              },
+            }),
+          ])
+        const currentDecision = evaluateSpendPolicy({
+          policy,
+          amount: exactMoneyFromAtomicUnits(input.amountAtomic, denomination),
+          destinationApproved: approvedDestination !== null,
+          confirmedSpend: exactMoneyFromAtomicUnits(
+            confirmed._sum.amountAtomic ?? 0n,
+            denomination,
+          ),
+          heldReservations: exactMoneyFromAtomicUnits(
+            held._sum.amountAtomic ?? 0n,
+            denomination,
+          ),
+          unresolvedSpend: exactMoneyFromAtomicUnits(
+            unresolved._sum.amountAtomic ?? 0n,
+            denomination,
+          ),
+          transactionCount,
+        })
+        const currentContextJson = JSON.stringify({
+          confirmed_spend_atomic:
+            currentDecision.context.confirmedSpend.atomicUnits.toString(),
+          held_reservation_atomic:
+            currentDecision.context.heldReservations.atomicUnits.toString(),
+          unresolved_spend_atomic:
+            currentDecision.context.unresolvedSpend.atomicUnits.toString(),
+          transaction_count: currentDecision.context.transactionCount,
+        })
+        if (
+          currentDecision.decision !== input.policyDecision.decision ||
+          JSON.stringify(currentDecision.reasonCodes) !==
+            JSON.stringify(input.policyDecision.reasonCodes) ||
+          currentContextJson !== input.policyDecision.contextJson
+        ) {
+          throw new ConflictError(
+            'Spend policy decision changed while creating the payment',
+          )
         }
 
         if (input.operation === 'REFUND' && input.originalPaymentId === undefined) {
@@ -821,6 +1011,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               ownerAccountId: input.accountId,
               status: 'ACTIVE',
               lifecycleState: 'HELD',
+              payment: { denominationId: input.denominationId },
             },
             _sum: { amountAtomic: true },
           })
@@ -859,7 +1050,13 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             ...(input.settlementAssetId === null
               ? {}
               : { settlementAssetId: input.settlementAssetId }),
+            ...(input.economicMappingId === null
+              ? {}
+              : { economicMappingId: input.economicMappingId }),
             destinationSnapshotJson: input.destinationSnapshotJson,
+            ...(input.intentFingerprint === undefined
+              ? {}
+              : { intentFingerprint: input.intentFingerprint }),
             policyDecisionId: input.policyDecision.id,
             ...(input.approval === undefined ? {} : { approvalId: input.approval.id }),
             executionState: decision === 'ALLOW' ? 'QUEUED' : 'NOT_STARTED',
@@ -895,7 +1092,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               id: input.approval.id,
               paymentId: payment.id,
               accountId: input.accountId,
-              fingerprint: input.fingerprint,
+              fingerprint: input.intentFingerprint ?? input.fingerprint,
               policyDecisionId: input.policyDecision.id,
               expiresAt: input.approval.expiresAt,
             },
@@ -1096,11 +1293,55 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     },
 
     async updatePaymentExecution(input) {
+      if (
+        input.executionState !== 'RECONCILING' ||
+        (input.settlementState !== 'SUBMITTED' && input.settlementState !== 'UNKNOWN')
+      ) {
+        throw new InvalidStateError(
+          'Payment execution updates must represent a submitted or unknown settlement',
+        )
+      }
+      if (
+        input.settlementState === 'UNKNOWN' &&
+        input.outcomeState !== 'UNDETERMINED'
+      ) {
+        throw new InvalidStateError(
+          'An unknown settlement must have an undetermined outcome',
+        )
+      }
+      const payment = await prisma.payment.findUnique({
+        where: { id: input.paymentId },
+      })
+      if (payment === null) throw new NotFoundError('Payment was not found')
+      const [policyDecision, approval, attempts] = await Promise.all([
+        prisma.policyDecision.findUnique({ where: { paymentId: payment.id } }),
+        prisma.approval.findUnique({ where: { paymentId: payment.id } }),
+        prisma.paymentAttempt.findMany({
+          where: { paymentId: payment.id },
+          orderBy: { attemptNumber: 'asc' },
+          select: { outcome: true },
+        }),
+      ])
+      const projectedStatus = projectPaymentStatus({
+        policyDecision:
+          policyDecision === null
+            ? legacyPolicyDecision(payment.status)
+            : parsePolicyDecision(policyDecision.decision),
+        approvalState: projectApprovalState(approval),
+        attemptOutcomes: attempts.map((attempt) => asAttemptOutcome(attempt.outcome)),
+        planExhausted: false,
+        executionStarted: true,
+      })
+      if (input.status !== undefined && projectedStatus !== input.status) {
+        throw new InvalidStateError(
+          'Payment status does not match the durable execution projection',
+        )
+      }
       const result = await prisma.payment.updateMany({
         where: { id: input.paymentId, rowVersion: input.currentRowVersion },
         data: {
           rowVersion: { increment: 1 },
-          ...(input.status === undefined ? {} : { status: input.status as never }),
+          status: projectedStatus,
           ...(input.executionState === undefined
             ? {}
             : { executionState: input.executionState }),
@@ -1310,6 +1551,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         const attempt = await transaction.paymentAttempt.findUniqueOrThrow({
           where: { id: input.attemptId },
         })
+        if (attempt.paymentId !== payment.id) {
+          throw new ConflictError('Payment attempt does not belong to the payment')
+        }
         if (
           payment.rowVersion !== input.paymentRowVersion ||
           attempt.rowVersion !== input.attemptRowVersion ||
@@ -1317,6 +1561,65 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         ) {
           throw new ConflictError('Payment terminalization changed concurrently')
         }
+        if (
+          input.replacement !== undefined &&
+          (input.nextOutcome !== 'PROVED_NO_EFFECT' || input.reservation !== 'NONE')
+        ) {
+          throw new InvalidStateError(
+            'A replacement attempt requires proved no-effect evidence while its reservation remains held',
+          )
+        }
+        if (input.replacement !== undefined) {
+          const route = await transaction.settlementRoute.findUnique({
+            where: { id: input.replacement.route.id },
+          })
+          const asset = await transaction.settlementAsset.findUnique({
+            where: { id: input.replacement.route.settlementAssetId },
+          })
+          const mapping = await transaction.economicMapping.findUnique({
+            where: { id: input.replacement.economicMappingId },
+          })
+          if (
+            route === null ||
+            route.status !== 'ACTIVE' ||
+            route.rail !== input.replacement.route.rail ||
+            route.network !== input.replacement.route.network ||
+            route.settlementAssetId !== input.replacement.route.settlementAssetId ||
+            route.economicMappingId !== input.replacement.economicMappingId ||
+            asset === null ||
+            asset.status !== 'ACTIVE' ||
+            mapping === null ||
+            mapping.status !== 'ACTIVE' ||
+            mapping.denominationId !== payment.denominationId ||
+            mapping.settlementAssetId !== asset.id
+          ) {
+            throw new ConflictError('Replacement settlement route is no longer active')
+          }
+        }
+        const derivedPaymentStatus =
+          input.replacement !== undefined
+            ? 'ROUTING'
+            : input.nextOutcome === 'CONFIRMED'
+              ? 'CONFIRMED'
+              : input.nextOutcome === 'PROVED_NO_EFFECT'
+                ? 'PROVED_NO_EFFECT'
+                : input.nextOutcome === 'FAILED'
+                  ? 'FAILED'
+                  : null
+        if (
+          derivedPaymentStatus === null ||
+          input.paymentStatus !== derivedPaymentStatus
+        ) {
+          throw new InvalidStateError(
+            'Payment status does not match the durable attempt outcome',
+          )
+        }
+        assertTerminalDimensionConsistency({
+          nextOutcome: input.nextOutcome,
+          replacement: input.replacement !== undefined,
+          settlementState: input.settlementState,
+          outcomeState: input.outcomeState,
+        })
         assertAttemptProgression(
           input.currentOutcome as Parameters<typeof assertAttemptProgression>[0],
           input.nextOutcome as Parameters<typeof assertAttemptProgression>[1],
@@ -1334,24 +1637,39 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         })
         await transaction.payment.update({
           where: { id: input.paymentId },
-          data: {
-            status: input.paymentStatus as never,
-            executionState: 'TERMINAL',
-            settlementState: input.settlementState,
-            outcomeState: input.outcomeState,
-            rowVersion: { increment: 1 },
-            ...(input.externalId === undefined ? {} : { failureCode: null }),
-            ...(input.confirmedAt === undefined
-              ? {}
-              : { confirmedAt: input.confirmedAt }),
-            ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
-            ...(input.failureCode === undefined
-              ? {}
-              : { failureCode: input.failureCode }),
-            ...(input.failureMessageSafe === undefined
-              ? {}
-              : { failureMessageSafe: input.failureMessageSafe }),
-          },
+          data:
+            input.replacement === undefined
+              ? {
+                  status: derivedPaymentStatus as never,
+                  executionState: 'TERMINAL',
+                  settlementState: input.settlementState,
+                  outcomeState: input.outcomeState,
+                  rowVersion: { increment: 1 },
+                  ...(input.externalId === undefined ? {} : { failureCode: null }),
+                  ...(input.confirmedAt === undefined
+                    ? {}
+                    : { confirmedAt: input.confirmedAt }),
+                  ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
+                  ...(input.failureCode === undefined
+                    ? {}
+                    : { failureCode: input.failureCode }),
+                  ...(input.failureMessageSafe === undefined
+                    ? {}
+                    : { failureMessageSafe: input.failureMessageSafe }),
+                }
+              : {
+                  status: 'ROUTING',
+                  executionState: 'QUEUED',
+                  settlementState: 'NOT_SUBMITTED',
+                  outcomeState: 'NONE',
+                  route: input.replacement.route.rail,
+                  routeId: input.replacement.route.id,
+                  routeSelectionReason: 'FALLBACK_AFTER_PROVED_NO_EFFECT',
+                  settlementAssetId: input.replacement.route.settlementAssetId,
+                  economicMappingId: input.replacement.economicMappingId,
+                  destinationSnapshotJson: input.replacement.destinationSnapshotJson,
+                  rowVersion: { increment: 1 },
+                },
         })
         if (input.reservation !== 'NONE') {
           await transaction.outgoingReservation.updateMany({
@@ -1390,6 +1708,57 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               ? {}
               : { payloadHash: input.payloadHash }),
             metadataJson: input.metadataJson ?? '{}',
+          },
+        })
+        if (input.replacement !== undefined) {
+          const replacementAttempt = await transaction.paymentAttempt.create({
+            data: {
+              id: input.replacement.attemptId,
+              paymentId: input.paymentId,
+              attemptNumber: attempt.attemptNumber + 1,
+              rail: input.replacement.route.rail,
+              routeId: input.replacement.route.id,
+              status: 'CREATED',
+              outcome: 'NOT_STARTED',
+            },
+          })
+          await transaction.durableWorkItem.create({
+            data: {
+              id: input.replacement.workItemId,
+              kind: 'OUTGOING_PAYMENT_ATTEMPT',
+              resourceType: 'PAYMENT_ATTEMPT',
+              resourceId: replacementAttempt.id,
+              payloadJson: JSON.stringify({
+                payment_id: input.paymentId,
+                attempt_id: replacementAttempt.id,
+              }),
+            },
+          })
+        }
+        await transaction.operationTimelineEvent.create({
+          data: {
+            id: `timeline_${randomId()}`,
+            accountId: payment.payerAccountId,
+            resourceType: 'PAYMENT',
+            resourceId: payment.id,
+            eventType:
+              input.replacement === undefined
+                ? 'PAYMENT_TERMINALIZED'
+                : 'PAYMENT_FALLBACK_PLANNED',
+            actorType: 'SYSTEM',
+            source: input.source,
+            occurredAt: new Date(),
+            oldStateJson: JSON.stringify({
+              payment_status: payment.status,
+              attempt_outcome: input.currentOutcome,
+            }),
+            newStateJson: JSON.stringify({
+              payment_status: derivedPaymentStatus,
+              attempt_outcome: input.nextOutcome,
+              ...(input.replacement === undefined
+                ? {}
+                : { replacement_attempt_id: input.replacement.attemptId }),
+            }),
           },
         })
         const updated = await transaction.payment.findUniqueOrThrow({
@@ -1641,6 +2010,7 @@ function toV2PaymentSnapshot(payment: {
   routeId: string | null
   routeSelectionReason: string | null
   settlementAssetId: string | null
+  economicMappingId: string | null
   destinationSnapshotJson: string | null
   policyDecisionId: string | null
   approvalId: string | null
@@ -1759,6 +2129,45 @@ function legacyPolicyDecision(status: string): PaymentPolicyDecision {
   if (status === 'REJECTED_BY_POLICY') return 'DENY'
   if (status === 'AWAITING_APPROVAL') return 'REQUIRE_APPROVAL'
   return 'ALLOW'
+}
+
+function asAttemptOutcome(value: string): AttemptOutcome {
+  if (
+    value === 'NOT_STARTED' ||
+    value === 'PRE_EFFECT_ABORTED' ||
+    value === 'PROVED_NO_EFFECT' ||
+    value === 'SUBMITTED' ||
+    value === 'CONFIRMED' ||
+    value === 'UNKNOWN' ||
+    value === 'FAILED'
+  ) {
+    return value
+  }
+  throw new InvalidStateError('Payment has an unknown attempt outcome')
+}
+
+function assertTerminalDimensionConsistency(input: {
+  readonly nextOutcome: string
+  readonly replacement: boolean
+  readonly settlementState: string
+  readonly outcomeState: string
+}): void {
+  const expected = input.replacement
+    ? { settlementState: 'NOT_SUBMITTED', outcomeState: 'NONE' }
+    : input.nextOutcome === 'CONFIRMED'
+      ? { settlementState: 'CONFIRMED', outcomeState: 'CONFIRMED' }
+      : input.nextOutcome === 'PROVED_NO_EFFECT' || input.nextOutcome === 'FAILED'
+        ? { settlementState: 'NOT_SUBMITTED', outcomeState: 'PROVED_NO_EFFECT' }
+        : undefined
+  if (
+    expected === undefined ||
+    input.settlementState !== expected.settlementState ||
+    input.outcomeState !== expected.outcomeState
+  ) {
+    throw new InvalidStateError(
+      'Payment settlement and outcome dimensions do not match the durable attempt outcome',
+    )
+  }
 }
 
 function projectApprovalState(
