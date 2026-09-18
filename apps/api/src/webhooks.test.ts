@@ -50,6 +50,22 @@ function repository(
 }
 
 describe('webhook delivery worker', () => {
+  it('passes the retry bound to the durable claim operation', async () => {
+    const claimWebhookDeliveries = vi.fn(async () => [])
+    const worker = new WebhookDeliveryWorker({
+      repository: repository(claim({ id: 'delivery_1' }), { claimWebhookDeliveries }),
+      signingKeys: { getKey: async () => new TextEncoder().encode('webhook-secret') },
+      owner: 'webhook-worker-1',
+      maxAttempts: 3,
+    })
+
+    await worker.runOnce()
+
+    expect(claimWebhookDeliveries).toHaveBeenCalledWith(
+      expect.objectContaining({ maxAttempts: 3 }),
+    )
+  })
+
   it('signs the exact durable body and acknowledges a successful delivery', async () => {
     const delivered: { id: string; owner: string; status: number }[] = []
     const key = new TextEncoder().encode('webhook-secret')

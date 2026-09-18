@@ -202,6 +202,7 @@ export interface V2OperationsRepository {
     readonly limit: number
     readonly owner: string
     readonly leaseSeconds: number
+    readonly maxAttempts: number
     readonly now?: Date
   }): Promise<readonly V2WebhookDeliveryClaim[]>
   renewWebhookDeliveryLease(input: {
@@ -738,6 +739,9 @@ export function createV2OperationsRepository(
       if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
         throw new InvalidStateError('Webhook delivery lease must be positive')
       }
+      if (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1) {
+        throw new ValidationError('Webhook maximum attempts must be positive')
+      }
       if (input.owner.trim().length === 0) {
         throw new ValidationError('Webhook delivery owner is required')
       }
@@ -771,6 +775,7 @@ export function createV2OperationsRepository(
           WHERE delivery.available_at <= ${now}
             AND (delivery.status IN ('AVAILABLE', 'RETRY_WAIT')
               OR (delivery.status = 'CLAIMED' AND delivery.lease_expires_at <= ${now}))
+            AND delivery.attempt_count < ${input.maxAttempts}
             AND subscription.status = 'ACTIVE'
           ORDER BY delivery.available_at ASC, delivery.id ASC
           LIMIT ${input.limit}

@@ -156,6 +156,7 @@ export class WebhookDeliveryWorker {
       limit: this.options.batchSize ?? DEFAULT_BATCH_SIZE,
       owner: this.options.owner,
       leaseSeconds: this.options.leaseSeconds ?? DEFAULT_LEASE_SECONDS,
+      maxAttempts: this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
       now: this.now(),
     })
     await Promise.all(claims.map((claim) => this.deliver(claim)))
