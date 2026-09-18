@@ -34,6 +34,7 @@ import type { V2OutgoingWorker } from './outgoing-v2.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { waitForShutdown } from './lifecycle.js'
 import { buildRuntimeIdentity } from './runtime-identity.js'
+import { createRuntimeOwner } from './runtime-owner.js'
 import { buildBackupChildEnvironment } from './worker-environment.js'
 
 const execFileAsync = promisify(execFile)
@@ -440,7 +441,7 @@ function createWorker(input: {
       input.logger,
       {
         accountConcurrency: input.limits.incomingAccountConcurrency,
-        owner: `incoming-${process.pid}`,
+        owner: createRuntimeOwner('incoming'),
         capacity: input.capacity,
       },
     )
@@ -458,7 +459,7 @@ function createWorker(input: {
     return new WebhookDeliveryWorker({
       repository: input.database.v2Operations,
       signingKeys: input.webhookSigningKeys,
-      owner: `webhook-${process.pid}`,
+      owner: createRuntimeOwner('webhook'),
       batchSize: input.limits.webhookBatchSize,
       leaseSeconds: input.limits.webhookLeaseSeconds,
       maxAttempts: input.limits.webhookMaxAttempts,

@@ -93,7 +93,10 @@ operations requested by the implementation plan:
   authority, fee-payer, route, asset, and economic-mapping configuration. The
   dedicated API initializes the persisted financial identity without decrypting
   legacy signer plaintext; workers fail closed when their structured identity
-  differs from the durable record.
+  differs from the durable record. `packages/db/prisma.config.ts` only loads a
+  local `.env` outside production and rejects a dotenv file declaring
+  production, so direct Prisma CLI use cannot silently replace the production
+  secret backend.
 - TASK-032: the role-specific entrypoints, durable leases, health routes, and
   shutdown handling are in `apps/api/src/server.ts` and `worker.ts`. No
   orchestration manifest or CI deployment pipeline is claimed; the repository

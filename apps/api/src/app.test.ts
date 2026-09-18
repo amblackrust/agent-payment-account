@@ -207,6 +207,56 @@ describe('API foundation', () => {
     await app.close()
   })
 
+  it('rejects non-canonical V2 payment filters and receive amounts at the HTTP boundary', async () => {
+    const listPayments = vi.fn(async () => ({ payments: [] }))
+    const createReceiveRequest = vi.fn(async () => ({}) as never)
+    const consumeRateLimit = vi.fn(async () => ({
+      allowed: true,
+      count: 1,
+      retryAt: new Date('2026-09-18T00:01:00.000Z'),
+    }))
+    const app = buildApp({
+      config: testConfig,
+      readinessDependency: { checkReadiness: async () => undefined },
+      accountRepository: {
+        findAccountByCredentialHash: async () => ({
+          ...authenticatedAccount,
+          credential: {
+            ...authenticatedAccount.credential,
+            scopes: ['payments:read', 'receive:manage'],
+          },
+        }),
+        markCredentialUsed: async () => undefined,
+      } as never,
+      accountService: {} as never,
+      solanaRail: {} as never,
+      v2PaymentService: { listPayments } as never,
+      v2ReceiveService: { createReceiveRequest } as never,
+      v2AdminRepository: { consumeRateLimit },
+    })
+
+    const invalidStatus = await app.inject({
+      method: 'GET',
+      url: '/v2/payments?status=NOT_A_V2_STATUS',
+      headers: { authorization: 'Bearer test-agent-key' },
+    })
+    const invalidAmount = await app.inject({
+      method: 'POST',
+      url: '/v2/receive-requests',
+      headers: {
+        authorization: 'Bearer test-agent-key',
+        'idempotency-key': 'receive-contract-test',
+      },
+      payload: { amount: '1e-2', denomination_id: 'usd' },
+    })
+
+    expect(invalidStatus.statusCode).toBe(400)
+    expect(invalidAmount.statusCode).toBe(400)
+    expect(listPayments).not.toHaveBeenCalled()
+    expect(createReceiveRequest).not.toHaveBeenCalled()
+    await app.close()
+  })
+
   it('rejects an HTTP burst independently of payment policy and authentication scope', async () => {
     const getPayment = vi.fn(async () => ({}) as never)
     const serialize = vi.fn(async () => ({}) as never)

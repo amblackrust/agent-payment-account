@@ -5,6 +5,20 @@ export class DatabaseConfigurationError extends Error {
   }
 }
 
+export function shouldLoadLocalDotenv(
+  environment: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return environment.NODE_ENV?.trim() !== 'production'
+}
+
+export function assertDotenvIsNotProduction(environment: NodeJS.ProcessEnv): void {
+  if (environment.NODE_ENV?.trim() === 'production') {
+    throw new DatabaseConfigurationError(
+      'The Prisma .env loader is for local development only; production must use its secret backend',
+    )
+  }
+}
+
 export function requireDatabaseUrl(
   environment: NodeJS.ProcessEnv = process.env,
 ): string {

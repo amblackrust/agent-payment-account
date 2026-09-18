@@ -16,10 +16,12 @@ import {
   v2HistoryResponseJsonSchema,
   v2LifecycleResponseJsonSchema,
   v2PaymentCreateRequestJsonSchema,
+  v2PaymentListQueryJsonSchema,
   v2PaymentListResponseJsonSchema,
   v2PaymentResponseJsonSchema,
   v2PolicyListResponseJsonSchema,
   v2PolicyResponseJsonSchema,
+  v2ReceiveCreateRequestJsonSchema,
   v2ReceiveListResponseJsonSchema,
   v2ReceiveResponseJsonSchema,
   v2RecipientListResponseJsonSchema,
@@ -66,6 +68,8 @@ export const v2RecipientListResponseSchema = v2RecipientListResponseJsonSchema
 export const v2RecipientResponseSchema = v2RecipientResponseJsonSchema
 export const v2ReceiveListResponseSchema = v2ReceiveListResponseJsonSchema
 export const v2ReceiveResponseSchema = v2ReceiveResponseJsonSchema
+export const v2ReceiveCreateRequestSchema = v2ReceiveCreateRequestJsonSchema
 export const v2PaymentCreateRequestSchema = v2PaymentCreateRequestJsonSchema
+export const v2PaymentListQuerySchema = v2PaymentListQueryJsonSchema
 export const v2PaymentListResponseSchema = v2PaymentListResponseJsonSchema
 export const v2PaymentResponseSchema = v2PaymentResponseJsonSchema

@@ -49,11 +49,13 @@ import {
   v2HistoryResponseSchema,
   v2LifecycleResponseSchema,
   v2PaymentCreateRequestSchema,
+  v2PaymentListQuerySchema,
   v2PaymentListResponseSchema,
   v2PaymentResponseSchema,
   v2PolicyListResponseSchema,
   v2PolicyResponseSchema,
   v2ReceiveListResponseSchema,
+  v2ReceiveCreateRequestSchema,
   v2ReceiveResponseSchema,
   v2RecipientListResponseSchema,
   v2RecipientResponseSchema,
@@ -112,6 +114,26 @@ const healthResponseSchema = {
 
 const REQUEST_RATE_LIMIT_BUCKET = 'request'
 const REQUEST_BURST_LIMIT_BUCKET = 'request-burst'
+
+function withRuntimePageSize(
+  schema: Record<string, unknown>,
+  maxPageSize: number,
+): Record<string, unknown> {
+  const properties = schema.properties
+  if (typeof properties !== 'object' || properties === null) return schema
+  const limit = (properties as Record<string, unknown>).limit
+  if (typeof limit !== 'object' || limit === null) return schema
+  return {
+    ...schema,
+    properties: {
+      ...(properties as Record<string, unknown>),
+      limit: {
+        ...(limit as Record<string, unknown>),
+        maximum: maxPageSize,
+      },
+    },
+  }
+}
 
 function getErrorStatusCode(error: ErrorWithCode): number {
   if (error.validation !== undefined) {
@@ -1133,23 +1155,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           preHandler: async (request) =>
             authenticateAgentWithScope(request, accountRepository, 'payments:read'),
           schema: {
-            querystring: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                limit: {
-                  type: 'integer',
-                  minimum: 1,
-                  maximum: runtimeLimits.maxPageSize,
-                  default: 50,
-                },
-                cursor: { type: 'string', minLength: 1 },
-                status: { type: 'string', minLength: 1, maxLength: 32 },
-                outcome_state: { type: 'string', minLength: 1, maxLength: 32 },
-                recipient_id: { type: 'string', minLength: 1, maxLength: 64 },
-                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
-              },
-            },
+            querystring: withRuntimePageSize(
+              v2PaymentListQuerySchema,
+              runtimeLimits.maxPageSize,
+            ),
             response: { 200: v2PaymentListResponseSchema },
           },
         },
@@ -2265,17 +2274,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['idempotency-key'],
             },
-            body: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                amount: { type: 'string', minLength: 1, maxLength: 256 },
-                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
-                reference: { type: 'string', minLength: 1, maxLength: 255 },
-                expires_at: { type: 'string', minLength: 1 },
-              },
-              required: ['denomination_id'],
-            },
+            body: v2ReceiveCreateRequestSchema,
           },
         },
         async (request, reply) => {
@@ -2335,17 +2334,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               },
               required: ['idempotency-key'],
             },
-            body: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                amount: { type: 'string', minLength: 1, maxLength: 256 },
-                denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
-                reference: { type: 'string', minLength: 1, maxLength: 255 },
-                expires_at: { type: 'string', minLength: 1 },
-              },
-              required: ['denomination_id'],
-            },
+            body: v2ReceiveCreateRequestSchema,
           },
         },
         async (request, reply) => {

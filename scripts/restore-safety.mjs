@@ -1,5 +1,13 @@
 export function assertDistinctDatabaseIdentity(sourceIdentity, targetIdentity) {
-  if (sourceIdentity === targetIdentity) {
+  const sourceParts = sourceIdentity.split('\t')
+  const targetParts = targetIdentity.split('\t')
+  const samePostgresBackend =
+    sourceParts.length === 3 &&
+    targetParts.length === 3 &&
+    sourceParts[1] === targetParts[1] &&
+    sourceParts[2] === targetParts[2]
+
+  if (sourceIdentity === targetIdentity || samePostgresBackend) {
     throw new Error(
       'Backup verification target must be isolated from the source database',
     )

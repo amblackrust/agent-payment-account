@@ -13,6 +13,10 @@ describe('backup restore safety fences', () => {
 
     expect(() =>
       assertDistinctDatabaseIdentity('db\t127.0.0.1\t5432', 'restore\t127.0.0.1\t5432'),
+    ).toThrow('isolated from the source database')
+
+    expect(() =>
+      assertDistinctDatabaseIdentity('db\t127.0.0.1\t5432', 'restore\t127.0.0.2\t5432'),
     ).not.toThrow()
   })
 

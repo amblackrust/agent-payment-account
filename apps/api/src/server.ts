@@ -41,6 +41,7 @@ import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { createDomainHealthSnapshot, MetricsRegistry } from './observability.js'
 import { waitForShutdown } from './lifecycle.js'
 import { buildRuntimeIdentity } from './runtime-identity.js'
+import { createRuntimeOwner } from './runtime-owner.js'
 import { createFundingProvisioner } from './funding-provisioner.js'
 
 async function startServer(): Promise<void> {
@@ -263,7 +264,7 @@ async function startServer(): Promise<void> {
         },
         {
           accountConcurrency: limits.incomingAccountConcurrency,
-          owner: `incoming-api-${process.pid}`,
+          owner: createRuntimeOwner('incoming-api'),
           capacity,
         },
       )
