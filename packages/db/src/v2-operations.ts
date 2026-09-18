@@ -8,6 +8,7 @@ import {
   assertAttemptProgression,
 } from '@agent-payment/core'
 import type { Prisma, PrismaClient } from './generated/client/client.js'
+import { createTimelineEvent } from './timeline.js'
 
 export interface V2TimelineRecord {
   readonly id: string
@@ -487,7 +488,7 @@ export function createV2OperationsRepository(
           }
           return existing
         }
-        return transaction.platformCostRecord.create({
+        const created = await transaction.platformCostRecord.create({
           data: {
             id: input.id,
             accountId: input.accountId,
@@ -497,6 +498,24 @@ export function createV2OperationsRepository(
             estimatedAmount: input.estimatedAmount,
           },
         })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: created.accountId,
+          resourceType: 'PLATFORM_COST',
+          resourceId: created.id,
+          eventType: 'PLATFORM_COST_ESTIMATED',
+          actorType: 'SYSTEM',
+          source: 'V2_COST_RECONCILIATION',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            payment_id: created.paymentId,
+            attempt_id: created.attemptId,
+            asset_id: created.assetId,
+            estimated_amount: created.estimatedAmount.toString(),
+            reconciliation_status: created.reconciliationStatus,
+          }),
+        })
+        return created
       })
       return toCostRecord(cost)
     },
@@ -524,9 +543,28 @@ export function createV2OperationsRepository(
           },
         })
         if (updated.count === 1) {
-          return transaction.platformCostRecord.findUniqueOrThrow({
+          const reconciled = await transaction.platformCostRecord.findUniqueOrThrow({
             where: { id: existing.id },
           })
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: reconciled.accountId,
+            resourceType: 'PLATFORM_COST',
+            resourceId: reconciled.id,
+            eventType: 'PLATFORM_COST_RECONCILED',
+            actorType: 'SYSTEM',
+            source: 'V2_COST_RECONCILIATION',
+            occurredAt: reconciled.observedAt ?? input.observedAt,
+            newStateJson: JSON.stringify({
+              payment_id: reconciled.paymentId,
+              attempt_id: reconciled.attemptId,
+              asset_id: reconciled.assetId,
+              estimated_amount: reconciled.estimatedAmount.toString(),
+              actual_amount: reconciled.actualAmount?.toString() ?? null,
+              reconciliation_status: reconciled.reconciliationStatus,
+            }),
+          })
+          return reconciled
         }
         const concurrentlyReconciled =
           await transaction.platformCostRecord.findUniqueOrThrow({
@@ -558,15 +596,34 @@ export function createV2OperationsRepository(
       if (!Number.isInteger(input.signingKeyVersion) || input.signingKeyVersion < 1) {
         throw new ValidationError('Webhook signing key version must be positive')
       }
-      const subscription = await prisma.webhookSubscription.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          endpoint: input.endpoint,
-          eventTypesJson: JSON.stringify(eventTypes),
-          signingKeyRef: input.signingKeyRef,
-          signingKeyVersion: input.signingKeyVersion,
-        },
+      const subscription = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.webhookSubscription.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            endpoint: input.endpoint,
+            eventTypesJson: JSON.stringify(eventTypes),
+            signingKeyRef: input.signingKeyRef,
+            signingKeyVersion: input.signingKeyVersion,
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: created.accountId,
+          resourceType: 'WEBHOOK_SUBSCRIPTION',
+          resourceId: created.id,
+          eventType: 'WEBHOOK_SUBSCRIPTION_CREATED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: created.accountId,
+          source: 'V2_WEBHOOK_CONTROL_PLANE',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            status: created.status,
+            event_types: eventTypes,
+            signing_key_version: created.signingKeyVersion,
+          }),
+        })
+        return created
       })
       return toSubscriptionRecord(subscription)
     },
@@ -580,12 +637,30 @@ export function createV2OperationsRepository(
     },
 
     async archiveWebhookSubscription(accountId, id) {
-      const result = await prisma.webhookSubscription.updateMany({
-        where: { id, accountId, status: 'ACTIVE' },
-        data: { status: 'ARCHIVED', archivedAt: new Date() },
+      await prisma.$transaction(async (transaction) => {
+        const result = await transaction.webhookSubscription.updateMany({
+          where: { id, accountId, status: 'ACTIVE' },
+          data: { status: 'ARCHIVED', archivedAt: new Date() },
+        })
+        if (result.count !== 1)
+          throw new NotFoundError('Webhook subscription was not found')
+        const subscription = await transaction.webhookSubscription.findUniqueOrThrow({
+          where: { id },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId,
+          resourceType: 'WEBHOOK_SUBSCRIPTION',
+          resourceId: id,
+          eventType: 'WEBHOOK_SUBSCRIPTION_ARCHIVED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: accountId,
+          source: 'V2_WEBHOOK_CONTROL_PLANE',
+          occurredAt: subscription.archivedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'ACTIVE' }),
+          newStateJson: JSON.stringify({ status: subscription.status }),
+        })
       })
-      if (result.count !== 1)
-        throw new NotFoundError('Webhook subscription was not found')
     },
 
     async createWebhookEvent(input) {
@@ -608,6 +683,25 @@ export function createV2OperationsRepository(
               : { correlationId: input.correlationId }),
             rawBody: input.rawBody,
           },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: input.accountId,
+          resourceType: 'WEBHOOK_EVENT',
+          resourceId: event.resourceId,
+          eventType: 'WEBHOOK_EVENT_ENQUEUED',
+          actorType: 'SYSTEM',
+          correlationId: input.correlationId,
+          source: 'V2_WEBHOOK_CONTROL_PLANE',
+          occurredAt: event.createdAt,
+          newStateJson: JSON.stringify({
+            event_id: event.eventId,
+            resource_type: event.resourceType,
+            resource_id: event.resourceId,
+            resource_version: event.resourceVersion,
+            event_type: event.eventType,
+            event_version: event.eventVersion,
+          }),
         })
         const subscriptions = await transaction.webhookSubscription.findMany({
           where: { accountId: input.accountId, status: 'ACTIVE' },
@@ -798,36 +892,91 @@ export function createV2OperationsRepository(
               detailsJson: JSON.stringify({ error: input.errorSafe }),
             },
           })
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            ...(subscription === null ? {} : { accountId: subscription.accountId }),
+            resourceType: 'WEBHOOK_DELIVERY',
+            resourceId: input.id,
+            eventType: 'WEBHOOK_DELIVERY_EXHAUSTED',
+            actorType: 'SYSTEM',
+            source: 'V2_WEBHOOK_WORKER',
+            occurredAt: new Date(),
+            newStateJson: JSON.stringify({
+              status: 'EXHAUSTED',
+              attempt_count: delivery.attemptCount,
+              error: input.errorSafe,
+            }),
+          })
         }
       })
     },
 
     async createBackupVerification(input) {
-      const verification = await prisma.backupRestoreVerification.create({
-        data: {
-          id: input.id,
-          backupReference: input.backupReference,
-          environment: input.environment,
-          schemaVersion: input.schemaVersion,
-          ...(input.custodyIdentity === undefined
-            ? {}
-            : { custodyIdentity: input.custodyIdentity }),
-        },
+      const verification = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.backupRestoreVerification.create({
+          data: {
+            id: input.id,
+            backupReference: input.backupReference,
+            environment: input.environment,
+            schemaVersion: input.schemaVersion,
+            ...(input.custodyIdentity === undefined
+              ? {}
+              : { custodyIdentity: input.custodyIdentity }),
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          resourceType: 'RESTORE_VERIFICATION',
+          resourceId: created.id,
+          eventType: 'RESTORE_VERIFICATION_STARTED',
+          actorType: 'SYSTEM',
+          source: 'V2_BACKUP_CONTROL_PLANE',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            backup_reference: created.backupReference,
+            environment: created.environment,
+            schema_version: created.schemaVersion,
+            custody_identity_present: created.custodyIdentity !== null,
+          }),
+        })
+        return created
       })
       return toBackupRecord(verification)
     },
 
     async finishBackupVerification(input) {
-      const verification = await prisma.backupRestoreVerification.update({
-        where: { id: input.id },
-        data: {
-          status: input.status,
-          invariantSummaryJson: input.invariantSummaryJson,
-          ...(input.failureSafe === undefined
-            ? {}
-            : { failureSafe: input.failureSafe }),
-          ...(input.verifiedAt === undefined ? {} : { verifiedAt: input.verifiedAt }),
-        },
+      const verification = await prisma.$transaction(async (transaction) => {
+        const updated = await transaction.backupRestoreVerification.update({
+          where: { id: input.id },
+          data: {
+            status: input.status,
+            invariantSummaryJson: input.invariantSummaryJson,
+            ...(input.failureSafe === undefined
+              ? {}
+              : { failureSafe: input.failureSafe }),
+            ...(input.verifiedAt === undefined ? {} : { verifiedAt: input.verifiedAt }),
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          resourceType: 'RESTORE_VERIFICATION',
+          resourceId: updated.id,
+          eventType:
+            updated.status === 'VERIFIED'
+              ? 'RESTORE_VERIFICATION_PASSED'
+              : 'RESTORE_VERIFICATION_FAILED',
+          actorType: 'SYSTEM',
+          source: 'V2_BACKUP_CONTROL_PLANE',
+          occurredAt: updated.verifiedAt ?? new Date(),
+          newStateJson: JSON.stringify({
+            status: updated.status,
+            backup_reference: updated.backupReference,
+            environment: updated.environment,
+            invariant_summary_present: updated.invariantSummaryJson.length > 0,
+            failure_present: updated.failureSafe !== null,
+          }),
+        })
+        return updated
       })
       return toBackupRecord(verification)
     },

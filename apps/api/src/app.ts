@@ -1658,10 +1658,11 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
         },
         async (request) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           await management.revokeCredential(
             request.params.accountId,
             request.params.credentialId,
+            operatorId,
           )
           return { status: 'REVOKED' }
         },
@@ -1692,11 +1693,13 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
         },
         async (request) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           return management.rotateCredential(
             request.params.accountId,
             request.params.credentialId,
             getIdempotencyKey(request),
+            undefined,
+            operatorId,
           )
         },
       )
@@ -1809,7 +1812,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
         },
         async (request, reply) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           const policy = await management.createPolicy({
             accountId: request.params.accountId,
             denominationId: request.body.denomination_id,
@@ -1837,6 +1840,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                   transactionCountEscalatable:
                     request.body.transaction_count_escalatable,
                 }),
+            actorId: operatorId,
           })
           return reply.code(201).send(policy)
         },

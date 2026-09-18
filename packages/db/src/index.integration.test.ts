@@ -276,6 +276,105 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('records append-only timeline events without storing recovery ciphertext', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const recipientId = `rcpt_${randomUUID().replaceAll('-', '')}`
+      const delegatedCredentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const recoveryKey = `CREDENTIAL_CREATE:${accountId}:timeline`
+      let sqlConnected = false
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'timeline-integration-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.createRecipient({
+          id: recipientId,
+          ownerAccountId: accountId,
+          displayName: 'Timeline recipient',
+          type: 'BUSINESS',
+          destination: {
+            id: `dest_${randomUUID().replaceAll('-', '')}`,
+            rail: 'SOLANA_SPL',
+            type: 'SOLANA_SPL',
+            walletAddress: 'timeline-recipient-wallet',
+          },
+        })
+        await database.v2Admin.createCredential({
+          accountId,
+          idempotencyKey: 'timeline-credential-key',
+          requestHash: 'c'.repeat(64),
+          fingerprint: 'c'.repeat(64),
+          credentialId: delegatedCredentialId,
+          keyHash: `${accountId}_delegated_hash`,
+          keyPrefix: 'apa_delegated',
+          scopes: ['history:read'],
+          recoveryCiphertext: 'timeline-recovery-ciphertext',
+          recoveryNonce: 'bm9uY2U=',
+          recoveryAuthTag: 'dGFn',
+          recoveryIdempotencyKey: recoveryKey,
+          recoveryExpiresAt: new Date('2026-09-19T00:00:00.000Z'),
+          actorId: 'platform-operator:integration',
+        })
+        await database.v2Admin.acknowledgeRecoveryEnvelope(accountId, recoveryKey)
+        await database.v2Admin.acknowledgeRecoveryEnvelope(accountId, recoveryKey)
+        await database.v2Operations.createWebhookSubscription({
+          id: `sub_${randomUUID().replaceAll('-', '')}`,
+          accountId,
+          endpoint: 'https://merchant.example.test/timeline',
+          eventTypes: ['recipient.created'],
+          signingKeyRef: 'secret/webhook/timeline',
+          signingKeyVersion: 1,
+        })
+
+        await sql.connect()
+        sqlConnected = true
+        const result = await sql.query<{
+          event_type: string
+          new_state_json: string | null
+          event_count: string
+        }>(
+          `SELECT event_type, new_state_json,
+                  COUNT(*) OVER (PARTITION BY event_type) AS event_count
+             FROM operation_timeline_events
+            WHERE account_id = $1
+            ORDER BY created_at, id`,
+          [accountId],
+        )
+
+        expect(result.rows.map((row) => row.event_type)).toEqual(
+          expect.arrayContaining([
+            'ACCOUNT_CREATED',
+            'CREDENTIAL_CREATED',
+            'RECIPIENT_CREATED',
+            'CREDENTIAL_RECOVERY_ACKNOWLEDGED',
+            'WEBHOOK_SUBSCRIPTION_CREATED',
+          ]),
+        )
+        expect(
+          result.rows.find(
+            (row) => row.event_type === 'CREDENTIAL_RECOVERY_ACKNOWLEDGED',
+          )?.event_count,
+        ).toBe('1')
+        expect(
+          result.rows.map((row) => row.new_state_json ?? '').join('\n'),
+        ).not.toContain('timeline-recovery-ciphertext')
+      } finally {
+        if (sqlConnected) await sql.end()
+        await database.disconnect()
+      }
+    })
+
     it('serializes reservations and persists idempotency across concurrent calls', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`

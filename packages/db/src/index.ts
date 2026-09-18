@@ -17,6 +17,7 @@ import {
   createV2OperationsRepository,
   type V2OperationsRepository,
 } from './v2-operations.js'
+import { createTimelineEvent } from './timeline.js'
 import { enqueueWebhookEvent } from './webhook-events.js'
 
 const MAX_INCOMING_ISSUE_RETRIES = 8
@@ -889,7 +890,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             encryptionAuthTag: input.encryptionAuthTag,
           },
         })
-        await transaction.apiCredential.create({
+        const credential = await transaction.apiCredential.create({
           data: {
             id: input.credentialId,
             accountId: account.id,
@@ -897,6 +898,31 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             keyPrefix: input.keyPrefix,
             scopes: JSON.stringify(DEFAULT_AGENT_CREDENTIAL_SCOPES),
           },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: account.id,
+          resourceType: 'ACCOUNT',
+          resourceId: account.id,
+          eventType: 'ACCOUNT_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V1_ACCOUNT_PROVISIONING',
+          occurredAt: account.createdAt,
+          newStateJson: JSON.stringify({ status: account.status }),
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: account.id,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V1_ACCOUNT_PROVISIONING',
+          occurredAt: credential.createdAt,
+          newStateJson: JSON.stringify({
+            status: credential.status,
+            scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
+          }),
         })
         return account
       })
@@ -970,28 +996,64 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
     },
     async revokeCredential(accountId, credentialId): Promise<boolean> {
-      const result = await prisma.apiCredential.updateMany({
-        where: { id: credentialId, accountId, revokedAt: null },
-        data: {
-          status: 'REVOKED',
-          revokedAt: new Date(),
-          rowVersion: { increment: 1 },
-        },
+      return prisma.$transaction(async (transaction) => {
+        const result = await transaction.apiCredential.updateMany({
+          where: { id: credentialId, accountId, revokedAt: null },
+          data: {
+            status: 'REVOKED',
+            revokedAt: new Date(),
+            rowVersion: { increment: 1 },
+          },
+        })
+        if (result.count !== 1) return false
+        const credential = await transaction.apiCredential.findUniqueOrThrow({
+          where: { id: credentialId },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_REVOKED',
+          actorType: 'SYSTEM',
+          source: 'V1_CREDENTIAL_LIFECYCLE',
+          occurredAt: credential.revokedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'ACTIVE' }),
+          newStateJson: JSON.stringify({ status: credential.status }),
+        })
+        return true
       })
-      return result.count === 1
     },
     async createApiCredential(input): Promise<StoredApiCredential> {
-      const credential = await prisma.apiCredential.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          keyHash: input.keyHash,
-          keyPrefix: input.keyPrefix,
-          ...(input.scopes === undefined
-            ? {}
-            : { scopes: JSON.stringify(input.scopes) }),
-          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-        },
+      const credential = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.apiCredential.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            keyHash: input.keyHash,
+            keyPrefix: input.keyPrefix,
+            ...(input.scopes === undefined
+              ? {}
+              : { scopes: JSON.stringify(input.scopes) }),
+            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: created.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: created.id,
+          eventType: 'CREDENTIAL_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V1_CREDENTIAL_ISSUANCE',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            status: created.status,
+            scopes: input.scopes ?? DEFAULT_AGENT_CREDENTIAL_SCOPES,
+            expires_at: created.expiresAt?.toISOString() ?? null,
+          }),
+        })
+        return created
       })
       return {
         id: credential.id,
@@ -1107,6 +1169,29 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             type: created.type,
             managed_account_id: created.managedAccountId,
           },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: created.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: created.id,
+          eventType: 'RECIPIENT_CREATED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: created.ownerAccountId,
+          source: 'V2_RECIPIENTS',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            display_name: created.displayName,
+            type: created.type,
+            managed_account_id: created.managedAccountId,
+            destinations: created.destinations.map((destination) => ({
+              id: destination.id,
+              rail: destination.rail,
+              type: destination.type,
+              network: destination.network,
+              asset_reference: destination.assetReference,
+            })),
+          }),
         })
         return created
       })
@@ -1228,6 +1313,30 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             type: recipient.type,
             managed_account_id: recipient.managedAccountId,
           },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: recipient.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: recipient.id,
+          eventType: 'RECIPIENT_UPDATED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: recipient.ownerAccountId,
+          source: 'V2_RECIPIENTS',
+          occurredAt: recipient.updatedAt,
+          newStateJson: JSON.stringify({
+            row_version: recipient.rowVersion,
+            display_name: recipient.displayName,
+            type: recipient.type,
+            managed_account_id: recipient.managedAccountId,
+            destinations: recipient.destinations.map((destination) => ({
+              id: destination.id,
+              rail: destination.rail,
+              type: destination.type,
+              network: destination.network,
+              asset_reference: destination.assetReference,
+            })),
+          }),
         })
         return toRecipientRecord(recipient)
       })

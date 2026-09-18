@@ -16,6 +16,7 @@ import {
   type SettlementRoute,
 } from '@agent-payment/core'
 import type { Prisma, PrismaClient } from './generated/client/client.js'
+import { createTimelineEvent } from './timeline.js'
 import { enqueueWebhookEvent } from './webhook-events.js'
 
 export interface V2DenominationRecord {
@@ -667,55 +668,110 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     },
 
     async transitionAccount(input) {
-      const result = await prisma.agentAccount.updateMany({
-        where: {
-          id: input.accountId,
-          status: input.currentStatus,
-          rowVersion: input.rowVersion,
-        },
-        data: {
-          status: input.nextStatus,
-          rowVersion: { increment: 1 },
-          ...(input.nextStatus === 'DISABLED'
-            ? { disabledAt: new Date(), disabledReason: input.reason ?? null }
-            : {}),
-          ...(input.nextStatus === 'PROVISIONING_FAILED'
-            ? { provisioningFailureCode: input.reason ?? 'PROVISIONING_FAILED' }
-            : {}),
-        },
+      await prisma.$transaction(async (transaction) => {
+        const result = await transaction.agentAccount.updateMany({
+          where: {
+            id: input.accountId,
+            status: input.currentStatus,
+            rowVersion: input.rowVersion,
+          },
+          data: {
+            status: input.nextStatus,
+            rowVersion: { increment: 1 },
+            ...(input.nextStatus === 'DISABLED'
+              ? { disabledAt: new Date(), disabledReason: input.reason ?? null }
+              : {}),
+            ...(input.nextStatus === 'PROVISIONING_FAILED'
+              ? { provisioningFailureCode: input.reason ?? 'PROVISIONING_FAILED' }
+              : {}),
+          },
+        })
+        if (result.count !== 1) {
+          throw new ConflictError('Account lifecycle changed concurrently')
+        }
+        const account = await transaction.agentAccount.findUniqueOrThrow({
+          where: { id: input.accountId },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: account.id,
+          resourceType: 'ACCOUNT',
+          resourceId: account.id,
+          eventType: `ACCOUNT_${input.nextStatus}`,
+          actorType: 'SYSTEM',
+          source: 'V2_ACCOUNT_LIFECYCLE',
+          occurredAt: account.updatedAt,
+          oldStateJson: JSON.stringify({ status: input.currentStatus }),
+          newStateJson: JSON.stringify({
+            status: account.status,
+            reason: input.reason ?? null,
+          }),
+        })
       })
-      if (result.count !== 1) {
-        throw new ConflictError('Account lifecycle changed concurrently')
-      }
     },
 
     async createScopedCredential(input) {
-      await prisma.apiCredential.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          keyHash: input.keyHash,
-          keyPrefix: input.keyPrefix,
-          scopes: JSON.stringify([...input.scopes]),
-          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-          ...(input.rotatedFromId === undefined
-            ? {}
-            : { rotatedFromId: input.rotatedFromId }),
-        },
+      await prisma.$transaction(async (transaction) => {
+        const credential = await transaction.apiCredential.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            keyHash: input.keyHash,
+            keyPrefix: input.keyPrefix,
+            scopes: JSON.stringify([...input.scopes]),
+            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+            ...(input.rotatedFromId === undefined
+              ? {}
+              : { rotatedFromId: input.rotatedFromId }),
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: credential.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V2_CREDENTIAL_ISSUANCE',
+          occurredAt: credential.createdAt,
+          newStateJson: JSON.stringify({
+            status: credential.status,
+            scopes: input.scopes,
+            expires_at: credential.expiresAt?.toISOString() ?? null,
+            rotated_from_id: credential.rotatedFromId,
+          }),
+        })
       })
     },
 
     async revokeScopedCredential(accountId, credentialId) {
-      const result = await prisma.apiCredential.updateMany({
-        where: { id: credentialId, accountId, revokedAt: null },
-        data: {
-          status: 'REVOKED',
-          revokedAt: new Date(),
-          rowVersion: { increment: 1 },
-        },
+      await prisma.$transaction(async (transaction) => {
+        const result = await transaction.apiCredential.updateMany({
+          where: { id: credentialId, accountId, revokedAt: null },
+          data: {
+            status: 'REVOKED',
+            revokedAt: new Date(),
+            rowVersion: { increment: 1 },
+          },
+        })
+        if (result.count !== 1)
+          throw new NotFoundError('Credential was not found or already revoked')
+        const credential = await transaction.apiCredential.findUniqueOrThrow({
+          where: { id: credentialId },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_REVOKED',
+          actorType: 'SYSTEM',
+          source: 'V2_CREDENTIAL_LIFECYCLE',
+          occurredAt: credential.revokedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'ACTIVE' }),
+          newStateJson: JSON.stringify({ status: credential.status }),
+        })
       })
-      if (result.count !== 1)
-        throw new NotFoundError('Credential was not found or already revoked')
     },
 
     async archiveRecipient(input) {
@@ -746,32 +802,88 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             archived_at: recipient.archivedAt?.toISOString() ?? null,
           },
         })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: recipient.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: recipient.id,
+          eventType: 'RECIPIENT_ARCHIVED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: recipient.ownerAccountId,
+          source: 'V2_RECIPIENTS',
+          occurredAt: recipient.archivedAt ?? new Date(),
+          newStateJson: JSON.stringify({
+            archived_at: recipient.archivedAt?.toISOString() ?? null,
+            row_version: recipient.rowVersion,
+          }),
+        })
       })
     },
 
     async createApprovedDestination(input) {
-      await prisma.approvedDestination.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          fingerprint: input.fingerprint,
-          rail: input.rail,
-          network: input.network,
-          assetReference: input.assetReference,
-          destination: input.destination,
-          actorId: input.actorId,
-          ...(input.reason === undefined ? {} : { reason: input.reason }),
-        },
+      await prisma.$transaction(async (transaction) => {
+        const destination = await transaction.approvedDestination.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            fingerprint: input.fingerprint,
+            rail: input.rail,
+            network: input.network,
+            assetReference: input.assetReference,
+            destination: input.destination,
+            actorId: input.actorId,
+            ...(input.reason === undefined ? {} : { reason: input.reason }),
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: destination.accountId,
+          resourceType: 'APPROVED_DESTINATION',
+          resourceId: destination.id,
+          eventType: 'APPROVED_DESTINATION_CREATED',
+          actorType: 'OPERATOR',
+          actorId: destination.actorId,
+          source: 'V2_DESTINATION_ADMIN',
+          occurredAt: destination.createdAt,
+          newStateJson: JSON.stringify({
+            fingerprint: destination.fingerprint,
+            rail: destination.rail,
+            network: destination.network,
+            asset_reference: destination.assetReference,
+            status: destination.status,
+          }),
+        })
       })
     },
 
     async revokeApprovedDestination(input) {
-      const result = await prisma.approvedDestination.updateMany({
-        where: { id: input.id, accountId: input.accountId, status: 'ACTIVE' },
-        data: { status: 'REVOKED', revokedAt: new Date(), reason: input.reason },
+      await prisma.$transaction(async (transaction) => {
+        const result = await transaction.approvedDestination.updateMany({
+          where: { id: input.id, accountId: input.accountId, status: 'ACTIVE' },
+          data: { status: 'REVOKED', revokedAt: new Date(), reason: input.reason },
+        })
+        if (result.count !== 1)
+          throw new NotFoundError('Approved destination was not found')
+        const destination = await transaction.approvedDestination.findUniqueOrThrow({
+          where: { id: input.id },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: destination.accountId,
+          resourceType: 'APPROVED_DESTINATION',
+          resourceId: destination.id,
+          eventType: 'APPROVED_DESTINATION_REVOKED',
+          actorType: 'OPERATOR',
+          actorId: input.actorId,
+          source: 'V2_DESTINATION_ADMIN',
+          occurredAt: destination.revokedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'ACTIVE' }),
+          newStateJson: JSON.stringify({
+            status: destination.status,
+            reason: destination.reason,
+          }),
+        })
       })
-      if (result.count !== 1)
-        throw new NotFoundError('Approved destination was not found')
     },
 
     async findV2Idempotency(accountId, idempotencyKey) {
@@ -1105,7 +1217,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               : { originalPaymentId: input.originalPaymentId }),
           },
         })
-        await transaction.policyDecision.create({
+        const policyDecision = await transaction.policyDecision.create({
           data: {
             id: input.policyDecision.id,
             paymentId: payment.id,
@@ -1118,8 +1230,28 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             fingerprint: input.policyDecision.fingerprint,
           },
         })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: input.accountId,
+          resourceType: 'POLICY_DECISION',
+          resourceId: policyDecision.id,
+          eventType: 'POLICY_DECISION_RECORDED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: input.accountId,
+          requestId: input.requestId,
+          correlationId: input.correlationId,
+          source: 'V2_PAYMENT_ORCHESTRATOR',
+          occurredAt: policyDecision.createdAt,
+          newStateJson: JSON.stringify({
+            payment_id: policyDecision.paymentId,
+            policy_id: policyDecision.policyId,
+            policy_version: policyDecision.policyVersion,
+            decision: policyDecision.decision,
+            reason_codes: input.policyDecision.reasonCodes,
+          }),
+        })
         if (input.approval !== undefined) {
-          await transaction.approval.create({
+          const approval = await transaction.approval.create({
             data: {
               id: input.approval.id,
               paymentId: payment.id,
@@ -1129,9 +1261,27 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               expiresAt: input.approval.expiresAt,
             },
           })
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: input.accountId,
+            resourceType: 'APPROVAL',
+            resourceId: approval.id,
+            eventType: 'APPROVAL_CREATED',
+            actorType: 'AGENT_CREDENTIAL',
+            actorId: input.accountId,
+            requestId: input.requestId,
+            correlationId: input.correlationId,
+            source: 'V2_PAYMENT_ORCHESTRATOR',
+            occurredAt: approval.createdAt,
+            newStateJson: JSON.stringify({
+              payment_id: approval.paymentId,
+              status: approval.status,
+              expires_at: approval.expiresAt.toISOString(),
+            }),
+          })
         }
         if (decision === 'ALLOW') {
-          await transaction.outgoingReservation.create({
+          const reservation = await transaction.outgoingReservation.create({
             data: {
               id: input.reservationId,
               paymentId: payment.id,
@@ -1141,7 +1291,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               lifecycleState: 'HELD',
             },
           })
-          await transaction.paymentAttempt.create({
+          const attempt = await transaction.paymentAttempt.create({
             data: {
               id: input.attemptId,
               paymentId: payment.id,
@@ -1151,6 +1301,70 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               status: 'CREATED',
               outcome: 'NOT_STARTED',
             },
+          })
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: input.accountId,
+            resourceType: 'RESERVATION',
+            resourceId: reservation.id,
+            eventType: 'RESERVATION_HELD',
+            actorType: 'AGENT_CREDENTIAL',
+            actorId: input.accountId,
+            requestId: input.requestId,
+            correlationId: input.correlationId,
+            source: 'V2_PAYMENT_ORCHESTRATOR',
+            occurredAt: reservation.createdAt,
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              amount_atomic: reservation.amountAtomic.toString(),
+              currency: reservation.currency,
+              lifecycle_state: reservation.lifecycleState,
+            }),
+          })
+          if (input.route !== null) {
+            await createTimelineEvent(transaction, {
+              id: `timeline_${randomId()}`,
+              accountId: input.accountId,
+              resourceType: 'SETTLEMENT_ROUTE',
+              resourceId: input.route.id,
+              eventType: 'ROUTE_SELECTED',
+              actorType: 'AGENT_CREDENTIAL',
+              actorId: input.accountId,
+              requestId: input.requestId,
+              correlationId: input.correlationId,
+              source: 'V2_PAYMENT_ORCHESTRATOR',
+              occurredAt: payment.createdAt,
+              newStateJson: JSON.stringify({
+                payment_id: payment.id,
+                route_id: input.route.id,
+                rail: input.route.rail,
+                network: input.route.network,
+                settlement_asset_id: input.route.settlementAssetId,
+                economic_mapping_id: input.route.economicMappingId,
+                selection_reason: input.routeSelectionReason,
+                capability_snapshot_present:
+                  input.routeCapabilitySnapshotJson !== undefined,
+              }),
+            })
+          }
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: input.accountId,
+            resourceType: 'PAYMENT_ATTEMPT',
+            resourceId: attempt.id,
+            eventType: 'ATTEMPT_CREATED',
+            actorType: 'AGENT_CREDENTIAL',
+            actorId: input.accountId,
+            requestId: input.requestId,
+            correlationId: input.correlationId,
+            source: 'V2_PAYMENT_ORCHESTRATOR',
+            occurredAt: attempt.createdAt,
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              attempt_number: attempt.attemptNumber,
+              route_id: attempt.routeId,
+              outcome: attempt.outcome,
+            }),
           })
           await transaction.durableWorkItem.create({
             data: {
@@ -1290,49 +1504,71 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     },
 
     async updateAttemptOutcome(input) {
-      const result = await prisma.paymentAttempt.updateMany({
-        where: {
-          id: input.attemptId,
-          outcome: input.currentOutcome,
-          rowVersion: input.currentRowVersion,
-        },
-        data: {
-          outcome: input.nextOutcome,
-          rowVersion: { increment: 1 },
-          ...(input.status === undefined ? {} : { status: input.status as never }),
-          ...(input.externalId === undefined
-            ? {}
-            : { railTransactionId: input.externalId }),
-          ...(input.expectedExternalId === undefined
-            ? {}
-            : { expectedExternalId: input.expectedExternalId }),
-          ...(input.preparedEffectHash === undefined
-            ? {}
-            : { preparedEffectHash: input.preparedEffectHash }),
-          ...(input.preparedEffectJson === undefined
-            ? {}
-            : { preparedEffectJson: input.preparedEffectJson }),
-          ...(input.signedPayloadHash === undefined
-            ? {}
-            : { signedPayloadHash: input.signedPayloadHash }),
-          ...(input.signedPayloadEncrypted === undefined
-            ? {}
-            : { signedPayloadEncrypted: input.signedPayloadEncrypted }),
-          ...(input.validityExpiresAt === undefined
-            ? {}
-            : { validityExpiresAt: input.validityExpiresAt }),
-          ...(input.validitySlot === undefined
-            ? {}
-            : { validitySlot: input.validitySlot }),
-        },
-      })
-      if (result.count !== 1)
-        throw new ConflictError('Payment attempt changed concurrently')
-      return toV2AttemptSnapshot(
-        await prisma.paymentAttempt.findUniqueOrThrow({
+      return prisma.$transaction(async (transaction) => {
+        const result = await transaction.paymentAttempt.updateMany({
+          where: {
+            id: input.attemptId,
+            outcome: input.currentOutcome,
+            rowVersion: input.currentRowVersion,
+          },
+          data: {
+            outcome: input.nextOutcome,
+            rowVersion: { increment: 1 },
+            ...(input.status === undefined ? {} : { status: input.status as never }),
+            ...(input.externalId === undefined
+              ? {}
+              : { railTransactionId: input.externalId }),
+            ...(input.expectedExternalId === undefined
+              ? {}
+              : { expectedExternalId: input.expectedExternalId }),
+            ...(input.preparedEffectHash === undefined
+              ? {}
+              : { preparedEffectHash: input.preparedEffectHash }),
+            ...(input.preparedEffectJson === undefined
+              ? {}
+              : { preparedEffectJson: input.preparedEffectJson }),
+            ...(input.signedPayloadHash === undefined
+              ? {}
+              : { signedPayloadHash: input.signedPayloadHash }),
+            ...(input.signedPayloadEncrypted === undefined
+              ? {}
+              : { signedPayloadEncrypted: input.signedPayloadEncrypted }),
+            ...(input.validityExpiresAt === undefined
+              ? {}
+              : { validityExpiresAt: input.validityExpiresAt }),
+            ...(input.validitySlot === undefined
+              ? {}
+              : { validitySlot: input.validitySlot }),
+          },
+        })
+        if (result.count !== 1)
+          throw new ConflictError('Payment attempt changed concurrently')
+        const attempt = await transaction.paymentAttempt.findUniqueOrThrow({
           where: { id: input.attemptId },
-        }),
-      )
+        })
+        const payment = await transaction.payment.findUniqueOrThrow({
+          where: { id: attempt.paymentId },
+          select: { payerAccountId: true, correlationId: true },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: attempt.id,
+          eventType: 'ATTEMPT_OUTCOME_UPDATED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_OUTGOING_WORKER',
+          occurredAt: attempt.updatedAt,
+          oldStateJson: JSON.stringify({ outcome: input.currentOutcome }),
+          newStateJson: JSON.stringify({
+            outcome: attempt.outcome,
+            status: attempt.status,
+            external_id_present: attempt.railTransactionId !== null,
+          }),
+        })
+        return toV2AttemptSnapshot(attempt)
+      })
     },
 
     async updatePaymentExecution(input) {
@@ -1380,36 +1616,62 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           'Payment status does not match the durable execution projection',
         )
       }
-      const result = await prisma.payment.updateMany({
-        where: { id: input.paymentId, rowVersion: input.currentRowVersion },
-        data: {
-          rowVersion: { increment: 1 },
-          status: projectedStatus,
-          ...(input.executionState === undefined
-            ? {}
-            : { executionState: input.executionState }),
-          ...(input.settlementState === undefined
-            ? {}
-            : { settlementState: input.settlementState }),
-          ...(input.outcomeState === undefined
-            ? {}
-            : { outcomeState: input.outcomeState }),
-          ...(input.confirmedAt === undefined
-            ? {}
-            : { confirmedAt: input.confirmedAt }),
-          ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
-          ...(input.failureCode === undefined
-            ? {}
-            : { failureCode: input.failureCode }),
-          ...(input.failureMessageSafe === undefined
-            ? {}
-            : { failureMessageSafe: input.failureMessageSafe }),
-        },
+      return prisma.$transaction(async (transaction) => {
+        const result = await transaction.payment.updateMany({
+          where: { id: input.paymentId, rowVersion: input.currentRowVersion },
+          data: {
+            rowVersion: { increment: 1 },
+            status: projectedStatus,
+            ...(input.executionState === undefined
+              ? {}
+              : { executionState: input.executionState }),
+            ...(input.settlementState === undefined
+              ? {}
+              : { settlementState: input.settlementState }),
+            ...(input.outcomeState === undefined
+              ? {}
+              : { outcomeState: input.outcomeState }),
+            ...(input.confirmedAt === undefined
+              ? {}
+              : { confirmedAt: input.confirmedAt }),
+            ...(input.failedAt === undefined ? {} : { failedAt: input.failedAt }),
+            ...(input.failureCode === undefined
+              ? {}
+              : { failureCode: input.failureCode }),
+            ...(input.failureMessageSafe === undefined
+              ? {}
+              : { failureMessageSafe: input.failureMessageSafe }),
+          },
+        })
+        if (result.count !== 1) throw new ConflictError('Payment changed concurrently')
+        const updated = await transaction.payment.findUniqueOrThrow({
+          where: { id: input.paymentId },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: updated.payerAccountId,
+          resourceType: 'PAYMENT',
+          resourceId: updated.id,
+          eventType: 'PAYMENT_EXECUTION_UPDATED',
+          actorType: 'SYSTEM',
+          correlationId: updated.correlationId ?? undefined,
+          source: 'V2_OUTGOING_WORKER',
+          occurredAt: updated.updatedAt,
+          oldStateJson: JSON.stringify({
+            status: payment.status,
+            execution_state: payment.executionState,
+            settlement_state: payment.settlementState,
+            outcome_state: payment.outcomeState,
+          }),
+          newStateJson: JSON.stringify({
+            status: updated.status,
+            execution_state: updated.executionState,
+            settlement_state: updated.settlementState,
+            outcome_state: updated.outcomeState,
+          }),
+        })
+        return toV2PaymentSnapshot(updated)
       })
-      if (result.count !== 1) throw new ConflictError('Payment changed concurrently')
-      return toV2PaymentSnapshot(
-        await prisma.payment.findUniqueOrThrow({ where: { id: input.paymentId } }),
-      )
     },
 
     async abortPreEffectPayment(input) {
@@ -1443,6 +1705,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         } else if (attempt.outcome !== 'PRE_EFFECT_ABORTED') {
           throw new ConflictError('Payment attempt may already have an effect')
         }
+        const updatedAttempt = await transaction.paymentAttempt.findUniqueOrThrow({
+          where: { id: attempt.id },
+        })
         await transaction.payment.update({
           where: { id: payment.id },
           data: {
@@ -1463,7 +1728,10 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             rowVersion: { increment: 1 },
           },
         })
-        await transaction.evidenceRecord.create({
+        const reservationAfterAbort = await transaction.outgoingReservation.findUnique({
+          where: { paymentId: payment.id },
+        })
+        const evidence = await transaction.evidenceRecord.create({
           data: {
             id: `evidence_${randomId()}`,
             paymentId: payment.id,
@@ -1474,6 +1742,58 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             observedAt: new Date(),
             metadataJson: JSON.stringify({ reason: input.reason }),
           },
+        })
+        if (reservationAfterAbort !== null) {
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: payment.payerAccountId,
+            resourceType: 'RESERVATION',
+            resourceId: reservationAfterAbort.id,
+            eventType: 'RESERVATION_RELEASED',
+            actorType: 'SYSTEM',
+            correlationId: payment.correlationId ?? undefined,
+            source: 'V2_OUTGOING_WORKER',
+            occurredAt: reservationAfterAbort.releasedAt ?? new Date(),
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              lifecycle_state: reservationAfterAbort.lifecycleState,
+              release_reason: reservationAfterAbort.releaseReason,
+            }),
+          })
+        }
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: updatedAttempt.id,
+          eventType: 'ATTEMPT_OUTCOME_UPDATED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_OUTGOING_WORKER',
+          occurredAt: updatedAttempt.updatedAt,
+          oldStateJson: JSON.stringify({ outcome: attempt.outcome }),
+          newStateJson: JSON.stringify({
+            outcome: updatedAttempt.outcome,
+            status: updatedAttempt.status,
+          }),
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'EVIDENCE',
+          resourceId: evidence.id,
+          eventType: 'EVIDENCE_RECORDED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_OUTGOING_WORKER',
+          occurredAt: evidence.observedAt,
+          newStateJson: JSON.stringify({
+            payment_id: evidence.paymentId,
+            attempt_id: evidence.attemptId,
+            authority: evidence.authority,
+            outcome: evidence.outcome,
+            payload_hash_present: evidence.payloadHash !== null,
+          }),
         })
         await transaction.operationTimelineEvent.create({
           data: {
@@ -1567,6 +1887,43 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             status: 'CREATED',
             outcome: 'NOT_STARTED',
           },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'SETTLEMENT_ROUTE',
+          resourceId: input.route.id,
+          eventType: 'ROUTE_SELECTED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_OUTGOING_WORKER',
+          occurredAt: attempt.createdAt,
+          newStateJson: JSON.stringify({
+            payment_id: payment.id,
+            route_id: input.route.id,
+            rail: input.route.rail,
+            network: input.route.network,
+            settlement_asset_id: input.route.settlementAssetId,
+            economic_mapping_id: input.route.economicMappingId,
+            selection_reason: 'FALLBACK_AFTER_PROVED_NO_EFFECT',
+          }),
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: attempt.id,
+          eventType: 'ATTEMPT_CREATED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_OUTGOING_WORKER',
+          occurredAt: attempt.createdAt,
+          newStateJson: JSON.stringify({
+            payment_id: payment.id,
+            attempt_number: attempt.attemptNumber,
+            route_id: attempt.routeId,
+            outcome: attempt.outcome,
+          }),
         })
         await transaction.payment.update({
           where: { id: payment.id },
@@ -1676,7 +2033,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           input.currentOutcome as Parameters<typeof assertAttemptProgression>[0],
           input.nextOutcome as Parameters<typeof assertAttemptProgression>[1],
         )
-        await transaction.paymentAttempt.update({
+        const updatedAttempt = await transaction.paymentAttempt.update({
           where: { id: input.attemptId },
           data: {
             outcome: input.nextOutcome,
@@ -1743,7 +2100,11 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             },
           })
         }
-        await transaction.evidenceRecord.create({
+        const reservationAfterFinalize =
+          await transaction.outgoingReservation.findUnique({
+            where: { paymentId: input.paymentId },
+          })
+        const evidence = await transaction.evidenceRecord.create({
           data: {
             id: `evidence_${randomId()}`,
             paymentId: input.paymentId,
@@ -1789,7 +2150,103 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               }),
             },
           })
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: payment.payerAccountId,
+            resourceType: 'SETTLEMENT_ROUTE',
+            resourceId: input.replacement.route.id,
+            eventType: 'ROUTE_SELECTED',
+            actorType: 'SYSTEM',
+            correlationId: payment.correlationId ?? undefined,
+            source: input.source,
+            occurredAt: replacementAttempt.createdAt,
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              route_id: input.replacement.route.id,
+              rail: input.replacement.route.rail,
+              network: input.replacement.route.network,
+              settlement_asset_id: input.replacement.route.settlementAssetId,
+              economic_mapping_id: input.replacement.economicMappingId,
+              selection_reason: 'FALLBACK_AFTER_PROVED_NO_EFFECT',
+            }),
+          })
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: payment.payerAccountId,
+            resourceType: 'PAYMENT_ATTEMPT',
+            resourceId: replacementAttempt.id,
+            eventType: 'ATTEMPT_CREATED',
+            actorType: 'SYSTEM',
+            correlationId: payment.correlationId ?? undefined,
+            source: input.source,
+            occurredAt: replacementAttempt.createdAt,
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              attempt_number: replacementAttempt.attemptNumber,
+              route_id: replacementAttempt.routeId,
+              outcome: replacementAttempt.outcome,
+            }),
+          })
         }
+        if (reservationAfterFinalize !== null && input.reservation !== 'NONE') {
+          await createTimelineEvent(transaction, {
+            id: `timeline_${randomId()}`,
+            accountId: payment.payerAccountId,
+            resourceType: 'RESERVATION',
+            resourceId: reservationAfterFinalize.id,
+            eventType:
+              input.reservation === 'CONSUME'
+                ? 'RESERVATION_CONSUMED'
+                : 'RESERVATION_RELEASED',
+            actorType: 'SYSTEM',
+            correlationId: payment.correlationId ?? undefined,
+            source: input.source,
+            occurredAt:
+              reservationAfterFinalize.consumedAt ??
+              reservationAfterFinalize.releasedAt ??
+              new Date(),
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              lifecycle_state: reservationAfterFinalize.lifecycleState,
+              release_reason: reservationAfterFinalize.releaseReason,
+            }),
+          })
+        }
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: updatedAttempt.id,
+          eventType: 'ATTEMPT_OUTCOME_UPDATED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: input.source,
+          occurredAt: updatedAttempt.updatedAt,
+          oldStateJson: JSON.stringify({ outcome: input.currentOutcome }),
+          newStateJson: JSON.stringify({
+            outcome: updatedAttempt.outcome,
+            status: updatedAttempt.status,
+            external_id_present: updatedAttempt.railTransactionId !== null,
+          }),
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'EVIDENCE',
+          resourceId: evidence.id,
+          eventType: 'EVIDENCE_RECORDED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: input.source,
+          occurredAt: evidence.observedAt,
+          newStateJson: JSON.stringify({
+            payment_id: evidence.paymentId,
+            attempt_id: evidence.attemptId,
+            authority: evidence.authority,
+            outcome: evidence.outcome,
+            payload_hash_present: evidence.payloadHash !== null,
+          }),
+        })
         await transaction.operationTimelineEvent.create({
           data: {
             id: `timeline_${randomId()}`,
@@ -2008,27 +2465,52 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     },
 
     async recordEvidence(input) {
-      await prisma.evidenceRecord.create({
-        data: {
-          id: input.id,
-          paymentId: input.paymentId,
-          ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
-          authority: input.authority,
-          source: input.source,
-          outcome: input.outcome,
-          observedAt: input.observedAt,
-          ...(input.externalId === undefined ? {} : { externalId: input.externalId }),
-          ...(input.expectedExternalId === undefined
-            ? {}
-            : { expectedExternalId: input.expectedExternalId }),
-          ...(input.payloadHash === undefined
-            ? {}
-            : { payloadHash: input.payloadHash }),
-          ...(input.providerCorrelation === undefined
-            ? {}
-            : { providerCorrelation: input.providerCorrelation }),
-          metadataJson: input.metadataJson ?? '{}',
-        },
+      await prisma.$transaction(async (transaction) => {
+        const evidence = await transaction.evidenceRecord.create({
+          data: {
+            id: input.id,
+            paymentId: input.paymentId,
+            ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+            authority: input.authority,
+            source: input.source,
+            outcome: input.outcome,
+            observedAt: input.observedAt,
+            ...(input.externalId === undefined ? {} : { externalId: input.externalId }),
+            ...(input.expectedExternalId === undefined
+              ? {}
+              : { expectedExternalId: input.expectedExternalId }),
+            ...(input.payloadHash === undefined
+              ? {}
+              : { payloadHash: input.payloadHash }),
+            ...(input.providerCorrelation === undefined
+              ? {}
+              : { providerCorrelation: input.providerCorrelation }),
+            metadataJson: input.metadataJson ?? '{}',
+          },
+        })
+        const payment = await transaction.payment.findUniqueOrThrow({
+          where: { id: input.paymentId },
+          select: { payerAccountId: true, correlationId: true },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomId()}`,
+          accountId: payment.payerAccountId,
+          resourceType: 'EVIDENCE',
+          resourceId: evidence.id,
+          eventType: 'EVIDENCE_RECORDED',
+          actorType: 'SYSTEM',
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_RECONCILIATION',
+          occurredAt: evidence.observedAt,
+          newStateJson: JSON.stringify({
+            payment_id: evidence.paymentId,
+            attempt_id: evidence.attemptId,
+            authority: evidence.authority,
+            outcome: evidence.outcome,
+            payload_hash_present: evidence.payloadHash !== null,
+            external_id_present: evidence.externalId !== null,
+          }),
+        })
       })
     },
 
@@ -2446,6 +2928,23 @@ async function markWorkItemExhausted(
             : { correlationId: payment.correlationId }),
           newStateJson: JSON.stringify({ reason: errorCode }),
         },
+      })
+      await createTimelineEvent(transaction, {
+        id: `timeline_${randomId()}`,
+        accountId: payment.accountId,
+        resourceType: 'RECONCILIATION',
+        resourceId: item.id,
+        eventType: 'RECONCILIATION_WORK_EXHAUSTED',
+        actorType: 'SYSTEM',
+        correlationId: payment.correlationId ?? undefined,
+        source: 'V2_WORK_ITEM',
+        occurredAt: new Date(),
+        newStateJson: JSON.stringify({
+          payment_id: payment.id,
+          work_item_id: item.id,
+          error_code: errorCode,
+          attempt_count: item.attemptCount,
+        }),
       })
     }
     await transaction.operationalException.upsert({

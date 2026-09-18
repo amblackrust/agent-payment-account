@@ -128,9 +128,30 @@ function verifyBackup(inputArgument) {
     })
     runSql(
       targetDatabaseUrl,
-      `INSERT INTO backup_restore_verifications
-        (id, backup_reference, environment, status, schema_version, invariant_summary_json, custody_identity, verified_at)
-       VALUES (:'id', :'backup_reference', :'environment', 'VERIFIED', :'schema_version', :'summary', :'custody_identity', NOW())`,
+      `BEGIN;
+       INSERT INTO backup_restore_verifications
+         (id, backup_reference, environment, status, schema_version, invariant_summary_json, custody_identity, verified_at)
+       VALUES (:'id', :'backup_reference', :'environment', 'VERIFIED', :'schema_version', :'summary', :'custody_identity', NOW());
+       INSERT INTO operation_timeline_events
+         (id, account_id, resource_type, resource_id, event_type, actor_type, source, occurred_at, new_state_json)
+       VALUES (
+         'timeline_restore_' || :'id',
+         NULL,
+         'RESTORE_VERIFICATION',
+         :'id',
+         'RESTORE_VERIFICATION_PASSED',
+         'SYSTEM',
+         'BACKUP_RESTORE_VERIFIER',
+         NOW(),
+         jsonb_build_object(
+           'backup_reference', :'backup_reference',
+           'environment', :'environment',
+           'schema_version', :'schema_version',
+           'custody_identity_present', TRUE,
+           'invariant_summary_present', TRUE
+         )::TEXT
+       );
+       COMMIT;`,
       {
         id: verificationId,
         backup_reference: backupReference,
@@ -153,9 +174,28 @@ function verifyBackup(inputArgument) {
     try {
       runSql(
         targetDatabaseUrl,
-        `INSERT INTO backup_restore_verifications
-        (id, backup_reference, environment, status, schema_version, failure_safe)
-         VALUES (:'id', :'backup_reference', :'environment', 'FAILED', 'restore-check', :'failure')`,
+        `BEGIN;
+         INSERT INTO backup_restore_verifications
+           (id, backup_reference, environment, status, schema_version, failure_safe)
+         VALUES (:'id', :'backup_reference', :'environment', 'FAILED', 'restore-check', :'failure');
+         INSERT INTO operation_timeline_events
+           (id, account_id, resource_type, resource_id, event_type, actor_type, source, occurred_at, new_state_json)
+         VALUES (
+           'timeline_restore_' || :'id',
+           NULL,
+           'RESTORE_VERIFICATION',
+           :'id',
+           'RESTORE_VERIFICATION_FAILED',
+           'SYSTEM',
+           'BACKUP_RESTORE_VERIFIER',
+           NOW(),
+           jsonb_build_object(
+             'backup_reference', :'backup_reference',
+             'environment', :'environment',
+             'failure_present', TRUE
+           )::TEXT
+         );
+         COMMIT;`,
         {
           id: verificationId,
           backup_reference: backupReference,
@@ -310,6 +350,34 @@ function completeReconciliationSql() {
     END IF;
   END
   $restore_reconciliation_fence$;
+  INSERT INTO operation_timeline_events
+    (id, account_id, resource_type, resource_id, event_type, actor_type, source, occurred_at, new_state_json)
+  SELECT
+    'timeline_rr_' || verification.id,
+    NULL,
+    'RESTORE_VERIFICATION',
+    verification.id,
+    'RESTORE_RECONCILIATION_COMPLETED',
+    'OPERATOR',
+    'BACKUP_RESTORE_VERIFIER',
+    NOW(),
+    jsonb_build_object(
+      'evidence_reference', current_setting('mux_restore.evidence'),
+      'verification_id', verification.id,
+      'environment', verification.environment
+    )::TEXT
+  FROM backup_restore_verifications verification
+  WHERE verification.id = CASE
+    WHEN current_setting('mux_restore.verification_id') <> ''
+      THEN current_setting('mux_restore.verification_id')
+    ELSE (
+      SELECT id
+      FROM backup_restore_verifications
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    )
+  END
+  ON CONFLICT (id) DO NOTHING;
   COMMIT;`
 }
 

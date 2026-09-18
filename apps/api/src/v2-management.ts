@@ -226,6 +226,7 @@ export class V2ManagementService {
     oldCredentialId: string,
     idempotencyKey: string,
     scopes?: readonly string[],
+    actorId?: string,
   ) {
     if (this.options.recoveryCipher === undefined) {
       throw new DependencyUnavailableError('Credential recovery is unavailable')
@@ -264,6 +265,7 @@ export class V2ManagementService {
         recoveryExpiresAt: new Date(
           this.now().getTime() + this.credentialRecoveryTtlSeconds * 1000,
         ),
+        ...(actorId === undefined ? {} : { actorId }),
       })
       return serializeRotatedCredential(stored, credential.rawKey, credential.keyPrefix)
     } catch (error) {
@@ -337,9 +339,10 @@ export class V2ManagementService {
   public async revokeCredential(
     accountId: string,
     credentialId: string,
+    actorId?: string,
   ): Promise<void> {
     await this.requireAccount(accountId)
-    await this.options.repository.revokeCredential(accountId, credentialId)
+    await this.options.repository.revokeCredential(accountId, credentialId, actorId)
   }
 
   public async listPolicies(accountId: string) {
@@ -369,6 +372,7 @@ export class V2ManagementService {
     readonly approvalThreshold?: string | null
     readonly rollingBudgetEscalatable?: boolean
     readonly transactionCountEscalatable?: boolean
+    readonly actorId?: string
   }) {
     await this.requireAccount(input.accountId)
     const denomination = await this.loadDenomination(input.denominationId)
@@ -388,6 +392,7 @@ export class V2ManagementService {
       rollingBudgetEscalatable: input.rollingBudgetEscalatable ?? false,
       transactionCountEscalatable: input.transactionCountEscalatable ?? false,
       rulesJson: '{}',
+      ...(input.actorId === undefined ? {} : { actorId: input.actorId }),
     })
     return this.serializePolicy(policy)
   }

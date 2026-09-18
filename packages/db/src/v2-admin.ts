@@ -10,6 +10,7 @@ import {
   type AgentAccountLifecycleStatus,
 } from '@agent-payment/core'
 import type { Prisma, PrismaClient } from './generated/client/client.js'
+import { createTimelineEvent } from './timeline.js'
 import { enqueueWebhookEvent } from './webhook-events.js'
 
 export interface V2AccountRecord {
@@ -256,8 +257,13 @@ export interface V2AdminRepository {
     readonly recoveryAuthTag: string
     readonly recoveryIdempotencyKey: string
     readonly recoveryExpiresAt: Date
+    readonly actorId?: string
   }): Promise<V2CredentialRecord>
-  revokeCredential(accountId: string, credentialId: string): Promise<void>
+  revokeCredential(
+    accountId: string,
+    credentialId: string,
+    actorId?: string,
+  ): Promise<void>
   listSpendPolicies(accountId: string): Promise<readonly V2SpendPolicyAdminRecord[]>
   createSpendPolicy(input: {
     readonly id: string
@@ -271,6 +277,7 @@ export interface V2AdminRepository {
     readonly rollingBudgetEscalatable: boolean
     readonly transactionCountEscalatable: boolean
     readonly rulesJson: string
+    readonly actorId?: string
   }): Promise<V2SpendPolicyAdminRecord>
   replaceSpendPolicy(input: {
     readonly id: string
@@ -483,6 +490,31 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             },
           })
         }
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: account.id,
+          resourceType: 'ACCOUNT',
+          resourceId: account.id,
+          eventType: 'ACCOUNT_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V2_ACCOUNT_PROVISIONING',
+          occurredAt: account.createdAt,
+          newStateJson: JSON.stringify({ status: account.status }),
+        })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: account.id,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V2_ACCOUNT_PROVISIONING',
+          occurredAt: credential.createdAt,
+          newStateJson: JSON.stringify({
+            status: credential.status,
+            scopes: input.scopes,
+          }),
+        })
         await enqueueWebhookEvent(transaction, {
           accountId: account.id,
           resourceType: 'ACCOUNT',
@@ -765,13 +797,49 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
         const deleted = await transaction.credentialRecoveryEnvelope.deleteMany({
           where: { idempotencyKey, acknowledgedAt: null },
         })
-        return deleted.count === 1 ? toRecoveryEnvelope(envelope) : null
+        if (deleted.count !== 1) return null
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId,
+          resourceType: 'CREDENTIAL_RECOVERY_ENVELOPE',
+          resourceId: envelope.credentialId,
+          eventType: 'CREDENTIAL_RECOVERY_CONSUMED',
+          actorType: 'SYSTEM',
+          source: 'V2_CREDENTIAL_RECOVERY',
+          occurredAt: new Date(),
+          newStateJson: JSON.stringify({
+            credential_id: envelope.credentialId,
+            recovery_available: false,
+          }),
+        })
+        return toRecoveryEnvelope(envelope)
       })
     },
 
     async acknowledgeRecoveryEnvelope(accountId, idempotencyKey) {
-      await prisma.credentialRecoveryEnvelope.deleteMany({
-        where: { accountId, idempotencyKey },
+      await prisma.$transaction(async (transaction) => {
+        const envelope = await transaction.credentialRecoveryEnvelope.findUnique({
+          where: { idempotencyKey },
+        })
+        if (envelope === null || envelope.accountId !== accountId) return
+        const deleted = await transaction.credentialRecoveryEnvelope.deleteMany({
+          where: { accountId, idempotencyKey },
+        })
+        if (deleted.count !== 1) return
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId,
+          resourceType: 'CREDENTIAL_RECOVERY_ENVELOPE',
+          resourceId: envelope.credentialId,
+          eventType: 'CREDENTIAL_RECOVERY_ACKNOWLEDGED',
+          actorType: 'OPERATOR',
+          source: 'V2_CREDENTIAL_RECOVERY',
+          occurredAt: new Date(),
+          newStateJson: JSON.stringify({
+            credential_id: envelope.credentialId,
+            recovery_available: false,
+          }),
+        })
       })
     },
 
@@ -910,6 +978,19 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
         const revokedCredential = await transaction.apiCredential.findUniqueOrThrow({
           where: { id: oldCredential.id },
         })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: input.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: revokedCredential.id,
+          eventType: 'CREDENTIAL_REVOKED',
+          actorType: 'OPERATOR',
+          ...(input.actorId === undefined ? {} : { actorId: input.actorId }),
+          source: 'V2_CREDENTIAL_ROTATION',
+          occurredAt: revokedCredential.revokedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: oldCredential.status }),
+          newStateJson: JSON.stringify({ status: revokedCredential.status }),
+        })
         await enqueueWebhookEvent(transaction, {
           accountId: revokedCredential.accountId,
           resourceType: 'CREDENTIAL',
@@ -949,11 +1030,27 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             rotated_from_id: oldCredential.id,
           },
         })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: input.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: newCredential.id,
+          eventType: 'CREDENTIAL_ROTATED',
+          actorType: 'OPERATOR',
+          ...(input.actorId === undefined ? {} : { actorId: input.actorId }),
+          source: 'V2_CREDENTIAL_ROTATION',
+          occurredAt: newCredential.createdAt,
+          newStateJson: JSON.stringify({
+            status: newCredential.status,
+            scopes: input.scopes,
+            rotated_from_id: oldCredential.id,
+          }),
+        })
         return toCredentialRecord(newCredential)
       })
     },
 
-    async revokeCredential(accountId, credentialId) {
+    async revokeCredential(accountId, credentialId, actorId) {
       await prisma.$transaction(async (transaction) => {
         const result = await transaction.apiCredential.updateMany({
           where: { id: credentialId, accountId, revokedAt: null },
@@ -967,6 +1064,19 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           throw new NotFoundError('Credential was not found or already revoked')
         const credential = await transaction.apiCredential.findUniqueOrThrow({
           where: { id: credentialId },
+        })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_REVOKED',
+          actorType: 'OPERATOR',
+          ...(actorId === undefined ? {} : { actorId }),
+          source: 'V2_CREDENTIAL_LIFECYCLE',
+          occurredAt: credential.revokedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'ACTIVE' }),
+          newStateJson: JSON.stringify({ status: credential.status }),
         })
         await enqueueWebhookEvent(transaction, {
           accountId,
@@ -1014,6 +1124,22 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             transactionCountEscalatable: input.transactionCountEscalatable,
             rulesJson: input.rulesJson,
           },
+        })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: created.accountId,
+          resourceType: 'SPEND_POLICY',
+          resourceId: created.id,
+          eventType: 'SPEND_POLICY_CREATED',
+          actorType: 'OPERATOR',
+          ...(input.actorId === undefined ? {} : { actorId: input.actorId }),
+          source: 'V2_POLICY_ADMIN',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            version: created.version,
+            status: created.status,
+            denomination_id: created.denominationId,
+          }),
         })
         await enqueueWebhookEvent(transaction, {
           accountId: created.accountId,
@@ -1231,7 +1357,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           const available =
             (input.settledAtomic ?? 0n) - (reserved._sum.amountAtomic ?? 0n)
           if (payment.amountAtomic > available) throw new InsufficientFundsError()
-          await transaction.outgoingReservation.create({
+          const reservation = await transaction.outgoingReservation.create({
             data: {
               id: createId('resv'),
               paymentId: payment.id,
@@ -1241,7 +1367,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
               lifecycleState: 'HELD',
             },
           })
-          await transaction.paymentAttempt.create({
+          const attempt = await transaction.paymentAttempt.create({
             data: {
               id: createId('attempt'),
               paymentId: payment.id,
@@ -1251,6 +1377,62 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
               status: 'CREATED',
               outcome: 'NOT_STARTED',
             },
+          })
+          await createTimelineEvent(transaction, {
+            id: createId('timeline'),
+            accountId: input.accountId,
+            resourceType: 'RESERVATION',
+            resourceId: reservation.id,
+            eventType: 'RESERVATION_HELD',
+            actorType: 'OPERATOR',
+            actorId: input.actorId,
+            correlationId: payment.correlationId ?? undefined,
+            source: 'V2_APPROVAL_ADMIN',
+            occurredAt: reservation.createdAt,
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              amount_atomic: reservation.amountAtomic.toString(),
+              currency: reservation.currency,
+              lifecycle_state: reservation.lifecycleState,
+            }),
+          })
+          if (payment.routeId !== null) {
+            await createTimelineEvent(transaction, {
+              id: createId('timeline'),
+              accountId: input.accountId,
+              resourceType: 'SETTLEMENT_ROUTE',
+              resourceId: payment.routeId,
+              eventType: 'ROUTE_SELECTED',
+              actorType: 'OPERATOR',
+              actorId: input.actorId,
+              correlationId: payment.correlationId ?? undefined,
+              source: 'V2_APPROVAL_ADMIN',
+              occurredAt: payment.updatedAt,
+              newStateJson: JSON.stringify({
+                payment_id: payment.id,
+                route_id: payment.routeId,
+                rail: payment.route,
+                selection_reason: payment.routeSelectionReason,
+              }),
+            })
+          }
+          await createTimelineEvent(transaction, {
+            id: createId('timeline'),
+            accountId: input.accountId,
+            resourceType: 'PAYMENT_ATTEMPT',
+            resourceId: attempt.id,
+            eventType: 'ATTEMPT_CREATED',
+            actorType: 'OPERATOR',
+            actorId: input.actorId,
+            correlationId: payment.correlationId ?? undefined,
+            source: 'V2_APPROVAL_ADMIN',
+            occurredAt: attempt.createdAt,
+            newStateJson: JSON.stringify({
+              payment_id: payment.id,
+              attempt_number: attempt.attemptNumber,
+              route_id: attempt.routeId,
+              outcome: attempt.outcome,
+            }),
           })
           await transaction.durableWorkItem.create({
             data: {
@@ -1366,6 +1548,24 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             ...(input.reason === undefined ? {} : { reason: input.reason }),
           },
         })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: created.accountId,
+          resourceType: 'APPROVED_DESTINATION',
+          resourceId: created.id,
+          eventType: 'APPROVED_DESTINATION_CREATED',
+          actorType: 'OPERATOR',
+          actorId: created.actorId,
+          source: 'V2_DESTINATION_ADMIN',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            fingerprint: created.fingerprint,
+            rail: created.rail,
+            network: created.network,
+            asset_reference: created.assetReference,
+            status: created.status,
+          }),
+        })
         await enqueueWebhookEvent(transaction, {
           accountId: created.accountId,
           resourceType: 'APPROVED_DESTINATION',
@@ -1399,6 +1599,22 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           throw new NotFoundError('Approved destination was not found')
         const destination = await transaction.approvedDestination.findUniqueOrThrow({
           where: { id: input.id },
+        })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: destination.accountId,
+          resourceType: 'APPROVED_DESTINATION',
+          resourceId: destination.id,
+          eventType: 'APPROVED_DESTINATION_REVOKED',
+          actorType: 'OPERATOR',
+          actorId: input.actorId,
+          source: 'V2_DESTINATION_ADMIN',
+          occurredAt: destination.revokedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'ACTIVE' }),
+          newStateJson: JSON.stringify({
+            status: destination.status,
+            reason: destination.reason,
+          }),
         })
         await enqueueWebhookEvent(transaction, {
           accountId: destination.accountId,
@@ -1540,15 +1756,34 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     },
 
     async createCustodyKeyVersion(input) {
-      const key = await prisma.custodyKeyVersion.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId ?? null,
-          keyVersion: input.keyVersion,
-          backendIdentity: input.backendIdentity,
-          keyReference: input.keyReference,
-          rootKeyFingerprint: input.rootKeyFingerprint,
-        },
+      const key = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.custodyKeyVersion.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId ?? null,
+            keyVersion: input.keyVersion,
+            backendIdentity: input.backendIdentity,
+            keyReference: input.keyReference,
+            rootKeyFingerprint: input.rootKeyFingerprint,
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          ...(created.accountId === null ? {} : { accountId: created.accountId }),
+          resourceType: 'CUSTODY_KEY_VERSION',
+          resourceId: created.id,
+          eventType: 'CUSTODY_KEY_VERSION_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V2_CUSTODY_CONTROL_PLANE',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            key_version: created.keyVersion,
+            status: created.status,
+            backend_identity: created.backendIdentity,
+            root_key_fingerprint: created.rootKeyFingerprint,
+          }),
+        })
+        return created
       })
       return toCustodyKeyVersionRecord(key)
     },
@@ -1562,21 +1797,51 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     },
 
     async createSigningRequest(input) {
-      const request = await prisma.signingRequest.create({
-        data: {
-          id: input.id,
-          paymentId: input.paymentId,
-          attemptId: input.attemptId,
-          effectHash: input.effectHash,
-          routeId: input.routeId,
-          network: input.network,
-          assetReference: input.assetReference,
-          destination: input.destination,
-          amountAtomic: input.amountAtomic,
-          feePayerIdentity: input.feePayerIdentity,
-          keyVersion: input.keyVersion,
-          serviceIdentity: input.serviceIdentity,
-        },
+      const request = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.signingRequest.create({
+          data: {
+            id: input.id,
+            paymentId: input.paymentId,
+            attemptId: input.attemptId,
+            effectHash: input.effectHash,
+            routeId: input.routeId,
+            network: input.network,
+            assetReference: input.assetReference,
+            destination: input.destination,
+            amountAtomic: input.amountAtomic,
+            feePayerIdentity: input.feePayerIdentity,
+            keyVersion: input.keyVersion,
+            serviceIdentity: input.serviceIdentity,
+          },
+        })
+        const payment = await transaction.payment.findUniqueOrThrow({
+          where: { id: created.paymentId },
+          select: { payerAccountId: true, correlationId: true },
+        })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: payment.payerAccountId,
+          resourceType: 'SIGNING_REQUEST',
+          resourceId: created.id,
+          eventType: 'SIGNING_REQUEST_CREATED',
+          actorType: 'SERVICE',
+          actorId: created.serviceIdentity,
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_CUSTODY_CONTROL_PLANE',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            payment_id: created.paymentId,
+            attempt_id: created.attemptId,
+            effect_hash: created.effectHash,
+            route_id: created.routeId,
+            network: created.network,
+            asset_reference: created.assetReference,
+            amount_atomic: created.amountAtomic.toString(),
+            key_version: created.keyVersion,
+            status: created.status,
+          }),
+        })
+        return created
       })
       return toSigningRequestRecord(request)
     },
@@ -1587,15 +1852,40 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     },
 
     async completeSigningRequest(id, effectHash, status) {
-      const result = await prisma.signingRequest.updateMany({
-        where: { id, effectHash, status: 'PENDING' },
-        data: { status, completedAt: new Date() },
+      const request = await prisma.$transaction(async (transaction) => {
+        const result = await transaction.signingRequest.updateMany({
+          where: { id, effectHash, status: 'PENDING' },
+          data: { status, completedAt: new Date() },
+        })
+        if (result.count !== 1)
+          throw new ConflictError('Signing request changed concurrently')
+        const updated = await transaction.signingRequest.findUniqueOrThrow({
+          where: { id },
+        })
+        const payment = await transaction.payment.findUniqueOrThrow({
+          where: { id: updated.paymentId },
+          select: { payerAccountId: true, correlationId: true },
+        })
+        await createTimelineEvent(transaction, {
+          id: createId('timeline'),
+          accountId: payment.payerAccountId,
+          resourceType: 'SIGNING_REQUEST',
+          resourceId: updated.id,
+          eventType: 'SIGNING_REQUEST_COMPLETED',
+          actorType: 'SERVICE',
+          actorId: updated.serviceIdentity,
+          correlationId: payment.correlationId ?? undefined,
+          source: 'V2_CUSTODY_CONTROL_PLANE',
+          occurredAt: updated.completedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'PENDING' }),
+          newStateJson: JSON.stringify({
+            status: updated.status,
+            effect_hash: updated.effectHash,
+          }),
+        })
+        return updated
       })
-      if (result.count !== 1)
-        throw new ConflictError('Signing request changed concurrently')
-      return toSigningRequestRecord(
-        await prisma.signingRequest.findUniqueOrThrow({ where: { id } }),
-      )
+      return toSigningRequestRecord(request)
     },
 
     async consumeRateLimit(input) {

@@ -42,6 +42,11 @@ inside this codebase.
   account-scoped idempotency record, stores only a verification hash plus an
   encrypted short-lived recovery envelope, and exposes an idempotent recovery
   acknowledgement command.
+- Append-only timeline events are emitted in the same database transactions as
+  account, credential, recipient, destination, policy, approval, payment,
+  reservation, route, attempt, evidence, reconciliation, custody, webhook,
+  and restore state changes. Timeline snapshots contain state metadata only;
+  recovery ciphertext and signed payloads are not copied into the audit stream.
 
 ## Evidence currently available
 
@@ -101,7 +106,8 @@ operations requested by the implementation plan:
   maintenance runtime now require an explicit backup cadence and isolated
   verification material, create missing output directories, validate restored
   payment/reservation/evidence/credential metadata, compare actual PostgreSQL
-  backend identities, and reject reusing the source/restored runtime authority.
+  backend identities, reject reusing the source/restored runtime authority, and
+  record restore verification/reconciliation events in the append-only timeline.
   A real restore drill and OD-008 RPO/RTO/retention values still require
   controlled infrastructure.
 - TASK-035/TASK-039: repository regression commands and the exact changed-file
