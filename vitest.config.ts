@@ -5,6 +5,11 @@ export default defineConfig({
     conditions: ['development'],
   },
   test: {
-    include: ['apps/**/*.test.ts', 'packages/**/*.test.ts', 'tests/**/*.test.ts'],
+    include: [
+      'apps/**/*.test.ts',
+      'packages/**/*.test.ts',
+      'scripts/**/*.test.mjs',
+      'tests/**/*.test.ts',
+    ],
   },
 })

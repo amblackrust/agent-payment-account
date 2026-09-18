@@ -124,6 +124,55 @@ describe('webhook delivery worker', () => {
     expect(retries).toHaveLength(1)
   })
 
+  it('rejects IPv4-mapped loopback and multicast IPv6 resolver results', async () => {
+    for (const address of ['::ffff:7f00:1', 'ff02::1']) {
+      const retries: unknown[] = []
+      const sendMock = vi.fn()
+      const worker = new WebhookDeliveryWorker({
+        repository: repository(claim(), {
+          retryWebhookDelivery: async (input) => {
+            retries.push(input)
+          },
+        }),
+        signingKeys: { getKey: async () => new TextEncoder().encode('webhook-secret') },
+        owner: 'webhook-worker-1',
+        resolveHostname: async () => [{ address, family: 6 }],
+        send: sendMock,
+      })
+
+      await worker.runOnce()
+
+      expect(sendMock).not.toHaveBeenCalled()
+      expect(retries).toHaveLength(1)
+    }
+  })
+
+  it('moves a DNS resolution timeout to the durable retry path', async () => {
+    const retries: unknown[] = []
+    const sendMock = vi.fn()
+    const worker = new WebhookDeliveryWorker({
+      repository: repository(claim(), {
+        retryWebhookDelivery: async (input) => {
+          retries.push(input)
+        },
+      }),
+      signingKeys: { getKey: async () => new TextEncoder().encode('webhook-secret') },
+      owner: 'webhook-worker-1',
+      timeoutMs: 10,
+      resolveHostname: async () => await new Promise<never>(() => undefined),
+      send: sendMock,
+    })
+
+    await worker.runOnce()
+
+    expect(sendMock).not.toHaveBeenCalled()
+    expect(retries).toHaveLength(1)
+    expect(retries[0]).toMatchObject({
+      id: 'delivery_1',
+      errorSafe: 'Webhook delivery failed',
+    })
+  })
+
   it('verifies the timestamp-bound signature and rejects stale or modified deliveries', () => {
     const key = new TextEncoder().encode('webhook-secret')
     const rawBody = '{"id":"evt_1"}'

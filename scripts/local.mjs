@@ -14,6 +14,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { parse as parseDotenv } from 'dotenv'
+import { buildChildProcessEnvironment } from './child-environment.mjs'
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const localDirectory = path.join(repositoryRoot, '.local')
@@ -58,10 +59,12 @@ function executableName(command) {
   return process.platform === 'win32' && command === 'pnpm' ? 'pnpm.cmd' : command
 }
 
+const safeChildEnvironment = buildChildProcessEnvironment()
+
 function run(command, args, options = {}) {
   const result = spawnSync(executableName(command), args, {
     cwd: repositoryRoot,
-    env: { ...process.env, NO_DNA: '1', ...options.environment },
+    env: { ...safeChildEnvironment, NO_DNA: '1', ...options.environment },
     encoding: 'utf8',
     stdio: options.capture ? 'pipe' : 'inherit',
     timeout: options.timeoutMs ?? 120_000,
@@ -82,7 +85,7 @@ function run(command, args, options = {}) {
 function commandSucceeds(command, args) {
   const result = spawnSync(executableName(command), args, {
     cwd: repositoryRoot,
-    env: { ...process.env, NO_DNA: '1' },
+    env: { ...safeChildEnvironment, NO_DNA: '1' },
     stdio: 'ignore',
     timeout: commandTimeoutMs,
   })
@@ -440,7 +443,7 @@ async function ensureValidator() {
     {
       cwd: repositoryRoot,
       detached: true,
-      env: { ...process.env, NO_DNA: '1' },
+      env: { ...safeChildEnvironment, NO_DNA: '1' },
       stdio: ['ignore', logFile, logFile],
     },
   )
@@ -657,7 +660,9 @@ async function setup() {
   await ensureSettlementMint(mintAddress, feePayerAddress)
   console.log('✓ Settlement mint ready')
 
-  run('pnpm', ['db:migrate:deploy'], { environment })
+  run('pnpm', ['db:migrate:deploy'], {
+    environment: { DATABASE_URL: environment.DATABASE_URL },
+  })
   console.log('✓ Database migrations applied')
 
   console.log(`\nSettlement mint: ${mintAddress}`)

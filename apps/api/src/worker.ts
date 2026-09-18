@@ -34,6 +34,7 @@ import type { V2OutgoingWorker } from './outgoing-v2.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { waitForShutdown } from './lifecycle.js'
 import { buildRuntimeIdentity } from './runtime-identity.js'
+import { buildBackupChildEnvironment } from './worker-environment.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -95,10 +96,12 @@ class MaintenanceWorker implements RuntimeWorker {
   private stopped = false
   private currentRun: Promise<void> | undefined
   private readonly schedule: MaintenanceSchedule
+  private readonly recipient: string
 
   public constructor(
     private readonly outputDirectory: string,
-    private readonly recipient: string | undefined,
+    private readonly databaseUrl: string,
+    recipient: string | undefined,
     private readonly identity: string | undefined,
     private readonly verifyDatabaseUrl: string | undefined,
     private readonly runtimeAuthorityId: string | undefined,
@@ -111,6 +114,7 @@ class MaintenanceWorker implements RuntimeWorker {
         'BACKUP_AGE_RECIPIENT is required for the maintenance runtime role',
       )
     }
+    this.recipient = recipient
     if ((identity === undefined) !== (verifyDatabaseUrl === undefined)) {
       throw new ConfigurationError(
         'Backup verification identity and database URL must be configured together',
@@ -147,20 +151,20 @@ class MaintenanceWorker implements RuntimeWorker {
       path.dirname(fileURLToPath(import.meta.url)),
       '../../../scripts/backup-verify.mjs',
     )
-    const environment = {
-      ...process.env,
-      BACKUP_AGE_RECIPIENT: this.recipient,
-      ...(this.identity === undefined ? {} : { BACKUP_AGE_IDENTITY: this.identity }),
+    const environment = buildBackupChildEnvironment({
+      databaseUrl: this.databaseUrl,
+      recipient: this.recipient,
+      ...(this.identity === undefined ? {} : { identity: this.identity }),
       ...(this.verifyDatabaseUrl === undefined
         ? {}
-        : { BACKUP_VERIFY_DATABASE_URL: this.verifyDatabaseUrl }),
+        : { verifyDatabaseUrl: this.verifyDatabaseUrl }),
       ...(this.runtimeAuthorityId === undefined
         ? {}
-        : { BACKUP_VERIFY_RUNTIME_AUTHORITY_ID: this.runtimeAuthorityId }),
+        : { runtimeAuthorityId: this.runtimeAuthorityId }),
       ...(this.custodyIdentity === undefined
         ? {}
-        : { BACKUP_VERIFY_CUSTODY_IDENTITY: this.custodyIdentity }),
-    }
+        : { custodyIdentity: this.custodyIdentity }),
+    })
     await execFileAsync(process.execPath, [script, 'backup', output], {
       env: environment,
     })
@@ -288,6 +292,7 @@ async function startWorker(): Promise<void> {
   })
   const worker: RuntimeWorker = createWorker({
     role: config.runtimeRole,
+    databaseUrl: config.databaseUrl,
     database,
     ...(incomingReader === undefined ? {} : { incomingReader }),
     ...(v2OutgoingRuntime === undefined
@@ -406,6 +411,7 @@ function getWorkerIntervalMs(config: AppConfig, defaultIntervalMs: number): numb
 
 function createWorker(input: {
   readonly role: 'outgoing' | 'reconcile' | 'incoming' | 'webhook' | 'maintenance'
+  readonly databaseUrl: string
   readonly database: ReturnType<typeof createDatabaseClient>
   readonly incomingReader?: ReturnType<typeof createSolanaIncomingReader>
   readonly v2OutgoingWorker?: V2OutgoingWorker
@@ -469,6 +475,7 @@ function createWorker(input: {
   }
   return new MaintenanceWorker(
     input.backupOutputDirectory,
+    input.databaseUrl,
     input.backupAgeRecipient,
     input.backupAgeIdentity,
     input.backupVerifyDatabaseUrl,

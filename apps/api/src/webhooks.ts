@@ -180,6 +180,7 @@ export class WebhookDeliveryWorker {
       const target = await resolveWebhookTarget(
         claim.endpoint,
         this.options.resolveHostname ?? resolveWebhookHostname,
+        this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       )
       const timestampSeconds = Math.floor(this.now().getTime() / 1_000)
       const signature = createWebhookSignature(claim.rawBody, timestampSeconds, key)
@@ -307,6 +308,7 @@ async function resolveWebhookHostname(
 async function resolveWebhookTarget(
   endpoint: string,
   resolveHostname: WebhookHostnameResolver,
+  timeoutMs: number,
 ): Promise<{ endpoint: URL; address: WebhookResolvedAddress }> {
   assertSafeWebhookEndpoint(endpoint)
   const parsed = new URL(endpoint)
@@ -315,16 +317,130 @@ async function resolveWebhookTarget(
   const addresses =
     version === 4 || version === 6
       ? [{ address: hostname, family: version as 4 | 6 }]
-      : await resolveHostname(hostname)
+      : await resolveHostnameWithTimeout(hostname, resolveHostname, timeoutMs)
   if (addresses.length === 0) {
     throw new Error('Webhook endpoint did not resolve to a public address')
   }
-  for (const address of addresses) assertSafeWebhookAddress(address.address)
+  for (const address of addresses) {
+    assertSafeWebhookAddress(address.address)
+    assertSafeResolvedWebhookAddress(address.address)
+  }
   const address = addresses[0]
   if (address === undefined) {
     throw new Error('Webhook endpoint did not resolve to a public address')
   }
   return { endpoint: parsed, address }
+}
+
+async function resolveHostnameWithTimeout(
+  hostname: string,
+  resolveHostname: WebhookHostnameResolver,
+  timeoutMs: number,
+): Promise<readonly WebhookResolvedAddress[]> {
+  const boundedTimeoutMs = Math.max(1, timeoutMs)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      resolveHostname(hostname),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('Webhook endpoint DNS resolution timed out')),
+          boundedTimeoutMs,
+        )
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+function assertSafeResolvedWebhookAddress(address: string): void {
+  const normalized = address.replace(/^\[|\]$/gu, '').toLowerCase()
+  if (isIP(normalized) !== 6) return
+  const numeric = parseIpv6Address(normalized)
+  if (numeric === undefined || isUnsafeIpv6Address(numeric)) {
+    throw new Error('Webhook endpoint must resolve to a public address')
+  }
+}
+
+function parseIpv6Address(address: string): bigint | undefined {
+  const sections = address.split('::')
+  if (sections.length > 2) return undefined
+  const left = parseIpv6Section(sections[0] ?? '')
+  const right = sections.length === 2 ? parseIpv6Section(sections[1] ?? '') : []
+  if (left === undefined || right === undefined) return undefined
+
+  const compressed = sections.length === 2
+  const missingGroups = 8 - left.length - right.length
+  if ((compressed && missingGroups < 1) || (!compressed && missingGroups !== 0)) {
+    return undefined
+  }
+  const groups = [...left, ...Array.from({ length: missingGroups }, () => 0), ...right]
+  if (groups.length !== 8) return undefined
+
+  return groups.reduce((value, group) => (value << 16n) | BigInt(group), 0n)
+}
+
+function parseIpv6Section(section: string): number[] | undefined {
+  if (section === '') return []
+  const tokens = section.split(':')
+  const groups: number[] = []
+  for (const [index, token] of tokens.entries()) {
+    if (token.includes('.')) {
+      if (index !== tokens.length - 1) return undefined
+      const octets = token.split('.').map(Number)
+      if (
+        octets.length !== 4 ||
+        octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+      ) {
+        return undefined
+      }
+      const [first, second, third, fourth] = octets
+      if (
+        first === undefined ||
+        second === undefined ||
+        third === undefined ||
+        fourth === undefined
+      ) {
+        return undefined
+      }
+      groups.push(first * 256 + second, third * 256 + fourth)
+      continue
+    }
+    if (!/^[0-9a-f]{1,4}$/u.test(token)) return undefined
+    groups.push(Number.parseInt(token, 16))
+  }
+  return groups
+}
+
+function isUnsafeIpv6Address(address: bigint): boolean {
+  if (address === 0n || address === 1n) return true
+  const firstGroup = Number(address >> 112n)
+  if ((firstGroup & 0xff00) === 0xff00) return true
+  if ((firstGroup & 0xfe00) === 0xfc00) return true
+  if ((firstGroup & 0xffc0) === 0xfe80) return true
+  if ((firstGroup & 0xffc0) === 0xfec0) return true
+
+  const ipv4Mapped = address >> 32n === 0xffffn
+  if (ipv4Mapped) return isUnsafeIpv4Address(Number(address & 0xffff_ffffn))
+  return false
+}
+
+function isUnsafeIpv4Address(address: number): boolean {
+  const first = address >>> 24
+  const second = (address >>> 16) & 0xff
+  return (
+    first === 0 ||
+    first === 10 ||
+    first === 127 ||
+    (first === 100 && second >= 64 && second <= 127) ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 0) ||
+    (first === 192 && second === 168) ||
+    (first === 198 && (second === 18 || second === 19)) ||
+    first >= 224
+  )
 }
 
 async function sendWebhookRequest(

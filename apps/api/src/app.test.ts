@@ -61,6 +61,7 @@ describe('API foundation', () => {
     expect(health.json()).toEqual({ status: 'ok' })
     expect(health.headers['x-request-id']).toBeTruthy()
     expect(health.headers['x-correlation-id']).toBe('trace-123')
+    expect(health.headers['cache-control']).toBe('no-store')
     expect(liveness.statusCode).toBe(200)
     expect(healthReadiness.statusCode).toBe(200)
     expect(readiness.statusCode).toBe(200)
@@ -240,6 +241,40 @@ describe('API foundation', () => {
     await app.close()
   })
 
+  it('does not let untrusted bearer values create separate pre-auth rate-limit buckets', async () => {
+    const consumeRateLimit = vi.fn(async (_input: { readonly subjectId: string }) => ({
+      allowed: true,
+      count: 1,
+      retryAt: new Date('2026-09-18T00:01:00.000Z'),
+    }))
+    const app = buildApp({
+      config: testConfig,
+      readinessDependency: { checkReadiness: async () => undefined },
+      accountRepository: {} as never,
+      accountService: {} as never,
+      solanaRail: {} as never,
+      v2OperationsService: { listExceptions: async () => [] } as never,
+      v2AdminRepository: { consumeRateLimit },
+    })
+
+    const first = await app.inject({
+      method: 'GET',
+      url: '/v2/operator/exceptions',
+      headers: { authorization: 'Bearer attacker-token-one' },
+    })
+    const second = await app.inject({
+      method: 'GET',
+      url: '/v2/operator/exceptions',
+      headers: { authorization: 'Bearer attacker-token-two' },
+    })
+
+    expect(first.statusCode).toBe(401)
+    expect(second.statusCode).toBe(401)
+    const subjects = consumeRateLimit.mock.calls.map(([input]) => input.subjectId)
+    expect(new Set(subjects)).toHaveLength(1)
+    await app.close()
+  })
+
   it('registers strict V2 operations response contracts', async () => {
     const listExceptions = vi.fn(async () => [])
     const app = buildApp({
@@ -399,6 +434,7 @@ describe('API foundation', () => {
     expect(missingIdempotencyKey.statusCode).toBe(400)
     expect(first.statusCode).toBe(201)
     expect(first.json()).toMatchObject({ api_key: 'apa_issued_secret' })
+    expect(first.headers['cache-control']).toBe('no-store')
     expect(replay.statusCode).toBe(200)
     expect(replay.json()).toMatchObject({
       credential_id: 'cred_issued',

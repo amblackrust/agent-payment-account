@@ -1,16 +1,19 @@
 import { spawnSync } from 'node:child_process'
 
+import { buildChildProcessEnvironment } from './child-environment.mjs'
+
 const composeFile = 'docker-compose.e2e.yml'
 const projectName = 'agent-payment-account-verify-' + process.pid
 const databaseUrl =
   process.env.VERIFY_DATABASE_URL ??
   'postgresql://postgres:postgres@127.0.0.1:55432/agent_payment_account?schema=public'
 const composePrefix = ['compose', '-f', composeFile, '-p', projectName]
+const safeChildEnvironment = buildChildProcessEnvironment()
 
 function run(command, args, environment = {}) {
   const result = spawnSync(command, args, {
     stdio: 'inherit',
-    env: { ...process.env, ...environment },
+    env: { ...safeChildEnvironment, ...environment },
   })
   if (result.error !== undefined) throw result.error
   if (result.status !== 0) {
@@ -28,7 +31,7 @@ function stopDatabase() {
   const result = spawnSync(
     'docker',
     [...composePrefix, 'down', '-v', '--remove-orphans'],
-    { stdio: 'inherit', env: process.env },
+    { stdio: 'inherit', env: safeChildEnvironment },
   )
   if (result.error !== undefined || result.status !== 0) {
     process.exitCode = 1

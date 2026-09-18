@@ -3,43 +3,128 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
 
 import {
   assertDistinctDatabaseIdentity,
   assertFreshRuntimeAuthority,
 } from './restore-safety.mjs'
 
-const command = process.argv[2]
+if (isMainModule()) {
+  const command = process.argv[2]
 
-if (command === 'backup') {
-  createBackup(process.argv[3])
-} else if (command === 'verify') {
-  verifyBackup(process.argv[3])
-} else if (command === 'complete-reconciliation') {
-  completeReconciliation(process.argv[3])
-} else {
-  throw new Error(
-    'Usage: node scripts/backup-verify.mjs backup <encrypted-output> | verify <encrypted-input> | complete-reconciliation <evidence-reference>',
+  if (command === 'backup') {
+    createBackup(process.argv[3])
+  } else if (command === 'verify') {
+    verifyBackup(process.argv[3])
+  } else if (command === 'complete-reconciliation') {
+    completeReconciliation(process.argv[3])
+  } else {
+    throw new Error(
+      'Usage: node scripts/backup-verify.mjs backup <encrypted-output> | verify <encrypted-input> | complete-reconciliation <evidence-reference>',
+    )
+  }
+}
+
+const inheritedCommandEnvironmentKeys = [
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'LANG',
+  'LC_ALL',
+  'TZ',
+  'TMPDIR',
+  'SystemRoot',
+  'WINDIR',
+  'ComSpec',
+  'PATHEXT',
+  'PGSERVICE',
+  'PGSERVICEFILE',
+  'PGSYSCONFDIR',
+  'PGPASSFILE',
+  'PGSSLROOTCERT',
+  'PGSSLCERT',
+  'PGSSLKEY',
+  'PGSSLMODE',
+  'PGAPPNAME',
+]
+
+const databaseSecretQueryParameters = new Set(['password', 'sslpassword'])
+
+function isMainModule() {
+  const entrypoint = process.argv[1]
+  return (
+    entrypoint !== undefined &&
+    pathToFileURL(path.resolve(entrypoint)).href === import.meta.url
   )
+}
+
+export function prepareDatabaseConnection(databaseUrl) {
+  let parsed
+  try {
+    parsed = new URL(databaseUrl)
+  } catch {
+    throw new Error('Database URL must be a valid PostgreSQL URL')
+  }
+  if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') {
+    throw new Error('Database URL must use the PostgreSQL protocol')
+  }
+
+  const environment = {}
+  if (parsed.password.length > 0) {
+    environment.PGPASSWORD = decodeURIComponent(parsed.password)
+    parsed.password = ''
+  } else if (process.env.PGPASSWORD !== undefined) {
+    environment.PGPASSWORD = process.env.PGPASSWORD
+  }
+
+  for (const [name, value] of [...parsed.searchParams.entries()]) {
+    if (!databaseSecretQueryParameters.has(name.toLowerCase())) continue
+    parsed.searchParams.delete(name)
+    if (name.toLowerCase() === 'password' && environment.PGPASSWORD === undefined) {
+      environment.PGPASSWORD = value
+    } else if (name.toLowerCase() === 'sslpassword') {
+      environment.PGSSLPASSWORD = value
+    }
+  }
+
+  return { connectionString: parsed.toString(), environment }
+}
+
+export function buildExternalCommandEnvironment(overrides = {}, source = process.env) {
+  const environment = {}
+  for (const name of inheritedCommandEnvironmentKeys) {
+    if (source[name] !== undefined) environment[name] = source[name]
+  }
+  for (const name of ['PGPASSWORD', 'PGSSLPASSWORD']) {
+    if (overrides[name] !== undefined) environment[name] = overrides[name]
+  }
+  return environment
 }
 
 function createBackup(outputArgument) {
   const databaseUrl = requiredEnvironment('DATABASE_URL')
   const recipient = requiredEnvironment('BACKUP_AGE_RECIPIENT')
   const output = requiredArgument(outputArgument, 'encrypted output path')
+  const database = prepareDatabaseConnection(databaseUrl)
   const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), 'mux-backup-'))
   const dumpPath = path.join(temporaryDirectory, 'database.dump')
 
   try {
     mkdirSync(path.dirname(output), { recursive: true, mode: 0o700 })
-    run('pg_dump', [
-      '--format=custom',
-      '--no-owner',
-      '--no-privileges',
-      '--file',
-      dumpPath,
-      databaseUrl,
-    ])
+    run(
+      'pg_dump',
+      [
+        '--format=custom',
+        '--no-owner',
+        '--no-privileges',
+        '--file',
+        dumpPath,
+        database.connectionString,
+      ],
+      database.environment,
+    )
     run('age', ['--encrypt', '--recipient', recipient, '--output', output, dumpPath])
     chmodSync(output, 0o600)
     process.stdout.write(`Encrypted backup created at ${output}\n`)
@@ -57,6 +142,7 @@ function verifyBackup(inputArgument) {
   const environment =
     process.env.BACKUP_VERIFY_ENVIRONMENT?.trim() || 'isolated-restore'
   const input = requiredArgument(inputArgument, 'encrypted input path')
+  const targetDatabase = prepareDatabaseConnection(targetDatabaseUrl)
   if (environment === 'production') {
     throw new Error('Backup verification must target a non-production environment')
   }
@@ -72,16 +158,20 @@ function verifyBackup(inputArgument) {
 
   try {
     run('age', ['--decrypt', '--identity', identity, '--output', dumpPath, input])
-    run('pg_restore', [
-      '--clean',
-      '--if-exists',
-      '--exit-on-error',
-      '--no-owner',
-      '--no-privileges',
-      '--dbname',
-      targetDatabaseUrl,
-      dumpPath,
-    ])
+    run(
+      'pg_restore',
+      [
+        '--clean',
+        '--if-exists',
+        '--exit-on-error',
+        '--no-owner',
+        '--no-privileges',
+        '--dbname',
+        targetDatabase.connectionString,
+        dumpPath,
+      ],
+      targetDatabase.environment,
+    )
     const restoredRuntimeAuthority = readRuntimeAuthority(targetDatabaseUrl)
     assertFreshRuntimeAuthority(
       sourceRuntimeAuthority,
@@ -445,6 +535,7 @@ function setRestoredRuntimePendingSql() {
 }
 
 function runSql(databaseUrl, sql, variables = {}) {
+  const database = prepareDatabaseConnection(databaseUrl)
   const args = [
     '--no-psqlrc',
     '--set=ON_ERROR_STOP=1',
@@ -454,12 +545,12 @@ function runSql(databaseUrl, sql, variables = {}) {
     '--field-separator',
     '\t',
     '--dbname',
-    databaseUrl,
+    database.connectionString,
   ]
   for (const [key, value] of Object.entries(variables))
     args.push('--variable', `${key}=${value}`)
   args.push('--command', sql)
-  return run('psql', args).trim()
+  return run('psql', args, database.environment).trim()
 }
 
 function readDatabaseIdentity(databaseUrl) {
@@ -484,10 +575,11 @@ function readRuntimeAuthority(databaseUrl) {
   return authority
 }
 
-function run(commandName, args) {
+function run(commandName, args, environment = {}) {
   return execFileSync(commandName, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: buildExternalCommandEnvironment(environment),
   })
 }
 

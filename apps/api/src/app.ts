@@ -17,11 +17,9 @@ import { getRuntimeLimits, type AppConfig } from './config.js'
 import { serializeAccountCreation, serializeReceiveDestination } from './accounts.js'
 import type { AccountService } from './accounts.js'
 import {
-  ADMIN_API_KEY_HEADER,
   assertAdminApiKey,
   authenticateAgentWithScope,
   getAdminOperatorId,
-  hashApiKey,
 } from './auth.js'
 import type { authenticateAgent } from './auth.js'
 import { serializePayment } from './payments.js'
@@ -243,6 +241,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       CORRELATION_ID_HEADER,
       normalizeCorrelationId(request.headers[CORRELATION_ID_HEADER], request.id),
     )
+    reply.header('cache-control', 'no-store')
   })
 
   app.get(
@@ -2706,16 +2705,6 @@ async function enforceRequestRateLimits(
 function getRequestRateLimitSubject(
   request: Parameters<typeof authenticateAgent>[0],
 ): string {
-  const authorization = request.headers.authorization
-  if (typeof authorization === 'string' && authorization.startsWith('Bearer ')) {
-    const apiKey = authorization.slice('Bearer '.length).trim()
-    if (apiKey.length > 0) return `credential:${hashApiKey(apiKey)}`
-  }
-  const adminApiKey = request.headers[ADMIN_API_KEY_HEADER]
-  const adminValue = Array.isArray(adminApiKey) ? adminApiKey[0] : adminApiKey
-  if (typeof adminValue === 'string' && adminValue.length > 0) {
-    return `admin:${hashApiKey(adminValue)}`
-  }
   return `ip:${request.ip}`
 }
 
