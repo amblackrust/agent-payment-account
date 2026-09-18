@@ -175,6 +175,18 @@ Requires admin authentication. Returns `201` with `credential_id`, `account_id`,
 
 Requires admin authentication. Returns `{ "status": "REVOKED" }`. A missing or already revoked credential returns `422`.
 
+### Rotate a V2 credential
+
+`POST /v2/accounts/:accountId/credentials/:credentialId/rotate`
+
+Requires admin authentication and an `idempotency-key` header. The active
+credential is revoked only after its replacement and encrypted recovery
+envelope are durable. The response contains the replacement `api_key` once;
+the plaintext is never stored as credential state. If the response is lost,
+retry with the same idempotency key within the recovery TTL to consume the
+one-time encrypted envelope. After that envelope is consumed or expires, the
+plaintext cannot be recovered and a new rotation is required.
+
 ## Balance
 
 ### Get balance

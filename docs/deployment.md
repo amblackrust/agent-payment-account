@@ -9,8 +9,9 @@ OD-003 decisions.
 Deploy the following independently scalable roles against one PostgreSQL
 coordination database:
 
-- `api` — stateless HTTPS API. It owns no fee-payer or agent private-key
-  material.
+- `api` — stateless HTTPS API. It does not load the platform fee-payer secret,
+  submit settlement effects, or decrypt existing agent signer secrets. Account
+  provisioning may transiently generate and encrypt a new managed signer.
 - `outgoing` — prepares, signs through the constrained custody boundary, and
   submits new settlement effects.
 - `reconcile` — inspects submitted or unknown effects and records only
@@ -31,8 +32,11 @@ implicitly multiply a dependency budget.
 
 - Terminate TLS at the selected ingress and forward only authenticated traffic
   to the API role.
-- Inject `DATABASE_URL`, API credentials, runtime identity, custody identity,
-  webhook keys, and backup age material from the deployment secret manager.
+- Inject `DATABASE_URL`, API credentials, role-appropriate provisioning or
+  custody material, runtime identity, custody identity, webhook keys, and
+  backup age material from the deployment secret manager. Reconcile, incoming,
+  webhook, and maintenance roles do not require `WALLET_MASTER_KEY` or
+  `RECOVERY_ENVELOPE_KEY`.
 - Do not place private keys, decrypted wallet material, signed payloads, or
   recovery plaintext in PostgreSQL backups, API containers, logs, or metrics.
 - Keep the external custody adapter behind the constrained signing contract.

@@ -63,13 +63,15 @@ const configSchema = z.object({
     .regex(
       /^[0-9a-fA-F]{64}$/,
       'WALLET_MASTER_KEY must be 32 bytes encoded as 64 hexadecimal characters',
-    ),
+    )
+    .optional(),
   RECOVERY_ENVELOPE_KEY: z
     .string()
     .regex(
       /^[0-9a-fA-F]{64}$/,
       'RECOVERY_ENVELOPE_KEY must be 32 bytes encoded as 64 hexadecimal characters',
-    ),
+    )
+    .optional(),
   RUNTIME_ROLE: z
     .enum(['api', 'outgoing', 'reconcile', 'incoming', 'webhook', 'maintenance', 'all'])
     .optional(),
@@ -167,8 +169,8 @@ export type AppConfig = {
   readonly solanaCluster: 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
   readonly solanaSettlementMint: string
   readonly solanaFeePayerSecret: string | undefined
-  readonly walletMasterKey: string
-  readonly recoveryEnvelopeKey: string
+  readonly walletMasterKey: string | undefined
+  readonly recoveryEnvelopeKey: string | undefined
   readonly webhookSigningKeysJson?: string
   readonly backupAgeRecipient?: string
   readonly backupAgeIdentity?: string
@@ -210,6 +212,22 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     )
   }
   const runtimeRole: RuntimeRole = result.data.RUNTIME_ROLE ?? 'all'
+  if (
+    (runtimeRole === 'api' || runtimeRole === 'outgoing' || runtimeRole === 'all') &&
+    result.data.WALLET_MASTER_KEY === undefined
+  ) {
+    throw new ConfigurationError(
+      'WALLET_MASTER_KEY is required for API or outgoing account custody',
+    )
+  }
+  if (
+    (runtimeRole === 'api' || runtimeRole === 'all') &&
+    result.data.RECOVERY_ENVELOPE_KEY === undefined
+  ) {
+    throw new ConfigurationError(
+      'RECOVERY_ENVELOPE_KEY is required for account provisioning and credential recovery',
+    )
+  }
   if (result.data.NODE_ENV === 'production' && runtimeRole === 'all') {
     throw new ConfigurationError(
       'Production must select an explicit runtime role; RUNTIME_ROLE=all is development-only',
@@ -401,8 +419,8 @@ export function redactConfig(config: AppConfig): RedactedConfig {
     allowMainnet: config.allowMainnet,
     hasAdminApiKey: config.adminApiKey.length > 0,
     hasSolanaFeePayerSecret: config.solanaFeePayerSecret !== undefined,
-    hasWalletMasterKey: config.walletMasterKey.length > 0,
-    hasRecoveryEnvelopeKey: config.recoveryEnvelopeKey.length > 0,
+    hasWalletMasterKey: config.walletMasterKey !== undefined,
+    hasRecoveryEnvelopeKey: config.recoveryEnvelopeKey !== undefined,
     hasWebhookSigningKeys: config.webhookSigningKeysJson !== undefined,
     hasBackupAgeIdentity: config.backupAgeIdentity !== undefined,
     ...(config.custodyBackendIdentity === undefined

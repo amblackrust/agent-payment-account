@@ -101,6 +101,26 @@ describe('configuration', () => {
     expect(config.solanaFeePayerSecret).toBeUndefined()
   })
 
+  it('does not require wallet or recovery keys for read-only worker roles', () => {
+    const {
+      WALLET_MASTER_KEY: _walletMasterKey,
+      RECOVERY_ENVELOPE_KEY: _recoveryKey,
+      ...environment
+    } = {
+      ...validEnvironment,
+      RUNTIME_ROLE: 'reconcile',
+      SOLANA_FEE_PAYER_SECRET: undefined,
+      CUSTODY_BACKEND_IDENTITY: 'external-custody',
+      CUSTODY_BACKEND_MODE: 'EXTERNAL',
+    }
+
+    const config = loadConfig(environment)
+
+    expect(config.runtimeRole).toBe('reconcile')
+    expect(config.walletMasterKey).toBeUndefined()
+    expect(config.recoveryEnvelopeKey).toBeUndefined()
+  })
+
   it('requires an explicit authority and isolated environment for the restore gate', () => {
     expect(() =>
       loadConfig({ ...validEnvironment, RESTORE_GATE_REQUIRED: 'true' }),

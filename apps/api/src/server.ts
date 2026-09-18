@@ -59,24 +59,28 @@ async function startServer(): Promise<void> {
     allowMainnet: config.allowMainnet,
     settlementMint: config.solanaSettlementMint,
   })
-  const walletCipher = new WalletSecretCipher(config.walletMasterKey)
-  const recoveryCipher = new RecoveryEnvelopeCipher(config.recoveryEnvelopeKey)
-  await database.initializeRuntimeIdentity(
-    {
-      rail: 'SOLANA_SPL',
-      version: '1',
-      cluster: config.solanaCluster,
-      settlementMint: config.solanaSettlementMint,
-      custodyKeyFingerprint: fingerprintWalletMasterKey(config.walletMasterKey),
-      ...(config.custodyBackendIdentity === undefined
-        ? {}
-        : { custodyBackendIdentity: config.custodyBackendIdentity }),
-      ...(config.custodyBackendMode === undefined
-        ? {}
-        : { custodyBackendMode: config.custodyBackendMode }),
-    },
-    (custody) => validateLegacyWalletCustody(walletCipher, custody),
-  )
+  const walletMasterKey = requireWalletMasterKey(config.walletMasterKey)
+  const recoveryEnvelopeKey = requireRecoveryEnvelopeKey(config.recoveryEnvelopeKey)
+  const walletCipher = new WalletSecretCipher(walletMasterKey)
+  const recoveryCipher = new RecoveryEnvelopeCipher(recoveryEnvelopeKey)
+  if (legacyRuntimeEnabled) {
+    await database.initializeRuntimeIdentity(
+      {
+        rail: 'SOLANA_SPL',
+        version: '1',
+        cluster: config.solanaCluster,
+        settlementMint: config.solanaSettlementMint,
+        custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
+        ...(config.custodyBackendIdentity === undefined
+          ? {}
+          : { custodyBackendIdentity: config.custodyBackendIdentity }),
+        ...(config.custodyBackendMode === undefined
+          ? {}
+          : { custodyBackendMode: config.custodyBackendMode }),
+      },
+      (custody) => validateLegacyWalletCustody(walletCipher, custody),
+    )
+  }
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
   }
@@ -344,6 +348,22 @@ async function startServer(): Promise<void> {
 }
 
 await startServer()
+
+function requireWalletMasterKey(value: string | undefined): string {
+  if (value === undefined) {
+    throw new ConfigurationError('WALLET_MASTER_KEY is required for the API runtime')
+  }
+  return value
+}
+
+function requireRecoveryEnvelopeKey(value: string | undefined): string {
+  if (value === undefined) {
+    throw new ConfigurationError(
+      'RECOVERY_ENVELOPE_KEY is required for the API runtime',
+    )
+  }
+  return value
+}
 
 async function getLogicalSettledAtomic(
   rail: SolanaRail,

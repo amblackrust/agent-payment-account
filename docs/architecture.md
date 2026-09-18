@@ -13,7 +13,8 @@ flowchart TB
   API --> Services[Account, recipient, payment, receive services]
   Services --> Core[Core money, lifecycle, and rail contracts]
   Services --> DB[(PostgreSQL / Prisma)]
-  Services --> Custody[Wallet secret cipher]
+  Services --> Provisioning[Wallet secret encryption for provisioning]
+  Outgoing --> Custody[Constrained custody boundary]
   Services --> Rail[Solana rail]
 
   Custody -->|account signer| Rail
@@ -32,7 +33,9 @@ flowchart TB
 
 The API authenticates administrators and Agent Accounts, validates HTTP input, and coordinates account, recipient, balance, payment, receive, and transaction services. It returns wire-format JSON from the shared contracts and adds an `x-request-id` response header.
 
-The server also starts periodic outgoing and incoming reconciliation work. HTTP handlers do not redefine the rail or database contracts.
+The dedicated API role does not sign settlement effects. The development-only
+`all` role may run the legacy-compatible worker loop in the same process.
+HTTP handlers do not redefine the rail or database contracts.
 
 ### Core — `packages/core`
 
@@ -66,6 +69,7 @@ sequenceDiagram
   participant A as Agent application
   participant API as Fastify API
   participant DB as PostgreSQL
+  participant W as Outgoing worker
   participant C as Custody
   participant S as Solana rail
   participant R as Solana RPC
@@ -73,11 +77,12 @@ sequenceDiagram
   A->>API: POST /v1/pay or /v1/send
   API->>DB: authenticate credential and resolve recipient
   API->>DB: create/replay idempotent payment and reserve funds
-  API->>C: decrypt managed account signer
-  C-->>API: account signer material
-  API->>S: prepare and sign transfer
-  S->>R: submit signed classic SPL transaction
-  API->>DB: persist attempt and observed outcome
+  API->>DB: persist intent and durable work item
+  W->>DB: claim and load durable attempt
+  W->>C: request constrained effect signing
+  C-->>W: signed effect
+  W->>S: submit signed classic SPL transaction
+  W->>DB: persist attempt and observed outcome
   API-->>A: payment with lifecycle status
   Note over A,R: HTTP success is not equivalent to chain confirmation
 ```
@@ -162,7 +167,10 @@ Before submission, the runtime persists payment and attempt state. If transport 
 
 - Administrators know `ADMIN_API_KEY` and can create accounts, inspect non-secret credential metadata, issue credentials, and revoke them.
 - An agent application knows only its one-time bearer credential and the normalized API surface. It never receives the managed signer secret.
-- The API process can access the database, `WALLET_MASTER_KEY`, the platform fee-payer secret, and decrypted account secrets while signing. Compromise of this boundary is a custody compromise.
+- A dedicated API process can access the database and provisioning encryption
+  material but does not load the platform fee-payer secret or decrypt existing
+  account signer secrets. The outgoing role owns settlement signing authority;
+  the development-only `all` role intentionally combines these boundaries.
 - PostgreSQL stores sensitive encrypted signer material plus all off-chain financial workflow state. Database access alone does not provide the wallet master key, but database integrity is required for safe orchestration.
 - The configured Solana cluster is the final settlement system. RPC responses are checked against the configured cluster and mint, but the operator chooses the RPC provider.
 - Mainnet is disabled unless both `SOLANA_CLUSTER=mainnet-beta` and `ALLOW_MAINNET=true` are present.

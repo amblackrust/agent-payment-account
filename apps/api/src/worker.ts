@@ -183,28 +183,30 @@ async function startWorker(): Promise<void> {
     allowMainnet: config.allowMainnet,
     settlementMint: config.solanaSettlementMint,
   })
-  const walletCipher =
+  const walletMasterKey =
     config.runtimeRole === 'outgoing'
-      ? new WalletSecretCipher(config.walletMasterKey)
+      ? requireWalletMasterKey(config.walletMasterKey)
       : undefined
-  await database.initializeRuntimeIdentity(
-    {
-      rail: 'SOLANA_SPL',
-      version: '1',
-      cluster: config.solanaCluster,
-      settlementMint: config.solanaSettlementMint,
-      custodyKeyFingerprint: fingerprintWalletMasterKey(config.walletMasterKey),
-      ...(config.custodyBackendIdentity === undefined
-        ? {}
-        : { custodyBackendIdentity: config.custodyBackendIdentity }),
-      ...(config.custodyBackendMode === undefined
-        ? {}
-        : { custodyBackendMode: config.custodyBackendMode }),
-    },
-    config.runtimeRole === 'outgoing'
-      ? (custody) => validateLegacyWalletCustody(walletCipher!, custody)
-      : undefined,
-  )
+  const walletCipher =
+    walletMasterKey === undefined ? undefined : new WalletSecretCipher(walletMasterKey)
+  if (walletMasterKey !== undefined) {
+    await database.initializeRuntimeIdentity(
+      {
+        rail: 'SOLANA_SPL',
+        version: '1',
+        cluster: config.solanaCluster,
+        settlementMint: config.solanaSettlementMint,
+        custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
+        ...(config.custodyBackendIdentity === undefined
+          ? {}
+          : { custodyBackendIdentity: config.custodyBackendIdentity }),
+        ...(config.custodyBackendMode === undefined
+          ? {}
+          : { custodyBackendMode: config.custodyBackendMode }),
+      },
+      (custody) => validateLegacyWalletCustody(walletCipher!, custody),
+    )
+  }
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
   }
@@ -422,3 +424,12 @@ function createWorker(input: {
 }
 
 await startWorker()
+
+function requireWalletMasterKey(value: string | undefined): string {
+  if (value === undefined) {
+    throw new ConfigurationError(
+      'WALLET_MASTER_KEY is required for the outgoing runtime',
+    )
+  }
+  return value
+}

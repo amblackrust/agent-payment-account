@@ -3,9 +3,10 @@
 ## Runtime roles
 
 Production starts with one explicit `RUNTIME_ROLE`: `api`, `outgoing`,
-`reconcile`, `incoming`, `webhook`, or `maintenance`. The API role does not load the
-platform fee-payer secret or mount the legacy payment signer. Development may
-use `RUNTIME_ROLE=all` for the local compatibility runtime.
+`reconcile`, `incoming`, `webhook`, or `maintenance`. The API role does not
+load the platform fee-payer secret, submit settlement effects, or decrypt
+existing signer secrets. Development may use `RUNTIME_ROLE=all` for the local
+compatibility runtime.
 
 The platform-neutral topology, secret boundaries, promotion sequence, and
 shutdown contract are in [deployment.md](./deployment.md).
