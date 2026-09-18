@@ -145,7 +145,7 @@ export interface V2Payment {
 }
 
 export interface V2PaymentInput {
-  readonly kind?: PaymentKind
+  readonly kind?: 'PAY' | 'SEND'
   readonly recipientId: string
   readonly amount: string
   readonly denominationId: string
@@ -193,12 +193,12 @@ export interface V2Balance {
 }
 
 export interface V2FundingDestination {
-  readonly id: string
+  readonly id: string | null
   readonly accountId: string
-  readonly routeId: string
-  readonly network: string
-  readonly assetId: string
-  readonly destination: string
+  readonly routeId: string | null
+  readonly network: string | null
+  readonly assetId: string | null
+  readonly destination: string | null
   readonly readiness: 'READY' | 'PENDING' | 'DEGRADED' | 'UNAVAILABLE'
   readonly senderConstraints: Readonly<Record<string, unknown>>
   readonly lastValidatedAt: string | null
@@ -478,11 +478,25 @@ export class IdempotencyConflictError extends SdkError {
 
 export class PolicyDeniedError extends SdkError {
   public readonly paymentId: string | undefined
+  public readonly paymentStatus: V2PaymentStatus | undefined
+  public readonly reasonCodes: readonly string[]
+  public readonly requestId: string | undefined
 
-  public constructor(message = 'Payment was denied by policy', paymentId?: string) {
+  public constructor(
+    message = 'Payment was denied by policy',
+    paymentId?: string,
+    options?: {
+      readonly paymentStatus?: V2PaymentStatus
+      readonly reasonCodes?: readonly string[]
+      readonly requestId?: string
+    },
+  ) {
     super('POLICY_DENIED', message, 403)
     this.name = 'PolicyDeniedError'
     this.paymentId = paymentId
+    this.paymentStatus = options?.paymentStatus
+    this.reasonCodes = options?.reasonCodes ?? []
+    this.requestId = options?.requestId
   }
 }
 
@@ -1336,8 +1350,10 @@ export class AgentPaymentAccount {
   ): Promise<unknown> {
     const attempts =
       method === 'GET' || idempotencyKey !== undefined ? 1 + this.retryCount : 1
+    const mutationIdempotencyKey = method === 'POST' ? idempotencyKey : undefined
     let lastTransportError: unknown
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      let responseReceived = false
       try {
         const controller = new AbortController()
         const timeout = setTimeout(() => controller.abort(), this.timeoutMs)
@@ -1354,6 +1370,7 @@ export class AgentPaymentAccount {
             },
             ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           })
+          responseReceived = true
           const payload = await readJson(response)
           if (!response.ok) {
             throw mapHttpError(response.status, payload, idempotencyKey)
@@ -1365,6 +1382,13 @@ export class AgentPaymentAccount {
       } catch (error) {
         if (error instanceof SdkError) {
           if (error instanceof HttpResponseExternalServiceError) throw error
+          if (responseReceived && mutationIdempotencyKey !== undefined) {
+            if (error.code !== 'EXTERNAL_SERVICE_ERROR') throw error
+            throw new PaymentPendingError(
+              mutationIdempotencyKey,
+              'Payment response could not be read; outcome is unknown',
+            )
+          }
           if (
             method === 'POST' &&
             idempotencyKey !== undefined &&
@@ -1385,6 +1409,12 @@ export class AgentPaymentAccount {
             )
           }
           throw error
+        }
+        if (responseReceived && mutationIdempotencyKey !== undefined) {
+          throw new PaymentPendingError(
+            mutationIdempotencyKey,
+            'Payment response could not be read; outcome is unknown',
+          )
         }
         lastTransportError = error
         if (attempt + 1 >= attempts) break
@@ -1447,7 +1477,15 @@ function mapHttpError(
       case 'IDEMPOTENCY_CONFLICT':
         return new IdempotencyConflictError(body.message)
       case 'POLICY_DENIED':
-        return new PolicyDeniedError(body.message, paymentId)
+        return new PolicyDeniedError(body.message, paymentId, {
+          ...(body.payment_status === undefined
+            ? {}
+            : { paymentStatus: body.payment_status }),
+          ...(body.reason_codes === undefined
+            ? {}
+            : { reasonCodes: body.reason_codes }),
+          ...(body.request_id === undefined ? {} : { requestId: body.request_id }),
+        })
       case 'APPROVAL_REQUIRED':
         return new ApprovalRequiredError(body.message)
       case 'REVIEW_REQUIRED':

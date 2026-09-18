@@ -7,6 +7,7 @@ import {
   ExternalServiceError,
   InsufficientFundsError,
   PaymentPendingError,
+  PolicyDeniedError,
   RecipientError,
   RefundNotSupportedError,
   UnsupportedRailError,
@@ -323,6 +324,44 @@ describe('AgentPaymentAccount SDK', () => {
     }
   })
 
+  it('preserves policy-denial recovery fields from the V2 error envelope', async () => {
+    const account = new AgentPaymentAccount({
+      baseUrl: 'https://payments.example.test',
+      apiKey: 'agent-secret',
+      fetch: async () =>
+        jsonResponse(
+          {
+            code: 'POLICY_DENIED',
+            message: 'Payment was denied by policy',
+            request_id: 'req_policy_denied',
+            payment_id: 'pay_policy_denied',
+            payment_status: 'REJECTED_BY_POLICY',
+            reason_codes: ['PER_PAYMENT_LIMIT'],
+          },
+          403,
+        ),
+    })
+
+    const error = await account
+      .createPaymentV2(
+        {
+          recipientId: 'rcpt_test',
+          amount: '1.20',
+          denominationId: 'usd',
+        },
+        'policy-denied-key',
+      )
+      .catch((value: unknown) => value)
+
+    expect(error).toBeInstanceOf(PolicyDeniedError)
+    expect(error).toMatchObject({
+      paymentId: 'pay_policy_denied',
+      paymentStatus: 'REJECTED_BY_POLICY',
+      reasonCodes: ['PER_PAYMENT_LIMIT'],
+      requestId: 'req_policy_denied',
+    })
+  })
+
   it('uses the local Fastify HTTP contract for the basic financial flow', async () => {
     const { app, requests } = await createLocalApi()
     const account = new AgentPaymentAccount({
@@ -565,16 +604,21 @@ describe('AgentPaymentAccount SDK', () => {
   })
 
   it('treats invalid money POST responses and unknown 5xx responses as pending', async () => {
+    let invalidJsonCalls = 0
     await expect(
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',
         apiKey: 'agent-secret',
-        fetch: async () => new Response('{not-json', { status: 201 }),
+        fetch: async () => {
+          invalidJsonCalls += 1
+          return new Response('{not-json', { status: 201 })
+        },
       }).send({ recipientId: 'rcpt_test', amount: '1.20' }, 'invalid-json-key'),
     ).rejects.toMatchObject({
       code: 'PAYMENT_PENDING',
       idempotencyKey: 'invalid-json-key',
     })
+    expect(invalidJsonCalls).toBe(1)
     await expect(
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',
