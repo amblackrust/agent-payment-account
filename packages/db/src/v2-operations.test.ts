@@ -26,6 +26,9 @@ describe('V2 operations domain health', () => {
       incomingReconciliationIssue: {
         count: vi.fn(async () => 0),
       },
+      operationalException: {
+        count: vi.fn(async () => 0),
+      },
       webhookDelivery: {
         count: vi.fn(async () => 0),
       },
@@ -62,6 +65,7 @@ describe('V2 operations domain health', () => {
       payment,
       durableWorkItem: { findFirst: vi.fn(async () => null) },
       incomingReconciliationIssue: { count: vi.fn(async () => 0) },
+      operationalException: { count: vi.fn(async () => 0) },
       webhookDelivery: { count: vi.fn(async () => 0) },
       backupRestoreVerification: { findFirst: vi.fn(async () => null) },
     }

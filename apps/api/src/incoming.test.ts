@@ -127,6 +127,75 @@ describe('incoming reconciliation worker', () => {
     expect(scans).toBe(1)
   })
 
+  it('does not let another worker scan an owned account partition', async () => {
+    let partitionHeld = false
+    let claimCount = 0
+    let scans = 0
+    let releaseScan!: () => void
+    let scanStarted!: () => void
+    const scanStartedPromise = new Promise<void>((resolve) => {
+      scanStarted = resolve
+    })
+    const scanRelease = new Promise<void>((resolve) => {
+      releaseScan = resolve
+    })
+    const repository = {
+      listActiveAccountSettlements: async () => [
+        { accountId: 'acct_1', solanaPublicKey: 'owner' },
+      ],
+      claimIncomingPartition: async (input: { owner: string }) => {
+        claimCount += 1
+        if (partitionHeld) return null
+        partitionHeld = true
+        return {
+          accountId: 'acct_1',
+          rail: 'SOLANA_SPL',
+          address: 'owner',
+          cursorSignature: null,
+          owner: input.owner,
+        }
+      },
+      releaseIncomingPartition: async () => {
+        partitionHeld = false
+      },
+      renewIncomingPartition: async () => undefined,
+      saveIncomingCursor: async () => undefined,
+      expireOpenReceiveRequests: async () => undefined,
+      createIncomingPayment: async () => ({ payment: {} as never, created: true }),
+      getIncomingCursor: async () => null,
+    }
+    const reader: SolanaIncomingReader = {
+      scan: async () => [],
+      scanWithCursor: async () => {
+        scans += 1
+        scanStarted()
+        await scanRelease
+        return { transfers: [], nextCursor: 'signature-1' }
+      },
+    }
+    const serviceA = new IncomingReconciliationService(
+      repository as never,
+      reader,
+      { error: () => undefined },
+      { owner: 'worker-a' },
+    )
+    const serviceB = new IncomingReconciliationService(
+      repository as never,
+      reader,
+      { error: () => undefined },
+      { owner: 'worker-b' },
+    )
+
+    const firstRun = serviceA.runOnce()
+    await scanStartedPromise
+    await serviceB.runOnce()
+    expect(scans).toBe(1)
+    expect(claimCount).toBe(2)
+
+    releaseScan()
+    await firstRun
+  })
+
   it('processes confirmed transfers before wall-clock expiry cleanup', async () => {
     const harness = createHarness()
     const events: string[] = []

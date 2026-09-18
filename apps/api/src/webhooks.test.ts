@@ -1,6 +1,10 @@
 import { createHmac } from 'node:crypto'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { V2OperationsRepository, V2WebhookDeliveryClaim } from '@agent-payment/db'
+import {
+  assertSafeWebhookEndpoint,
+  type V2OperationsRepository,
+  type V2WebhookDeliveryClaim,
+} from '@agent-payment/db'
 import { verifyWebhookSignature, WebhookDeliveryWorker } from './webhooks.js'
 
 const originalFetch = globalThis.fetch
@@ -57,6 +61,7 @@ describe('webhook delivery worker', () => {
       expect(new Headers(init?.headers).get('x-mux-event-id')).toBe(
         currentClaim.eventId,
       )
+      expect(init?.redirect).toBe('error')
       return new Response(null, { status: 204 })
     })
     globalThis.fetch = fetchMock as typeof globalThis.fetch
@@ -77,6 +82,21 @@ describe('webhook delivery worker', () => {
     expect(delivered).toEqual([
       { id: 'delivery_1', owner: 'webhook-worker-1', status: 204 },
     ])
+  })
+
+  it('rejects private, loopback, and local-only webhook endpoints', () => {
+    expect(() => assertSafeWebhookEndpoint('https://127.0.0.1/webhook')).toThrow(
+      'public address',
+    )
+    expect(() => assertSafeWebhookEndpoint('https://[::1]/webhook')).toThrow(
+      'public address',
+    )
+    expect(() => assertSafeWebhookEndpoint('https://service.internal/webhook')).toThrow(
+      'public address',
+    )
+    expect(() =>
+      assertSafeWebhookEndpoint('https://merchant.example.test/webhook'),
+    ).not.toThrow()
   })
 
   it('verifies the timestamp-bound signature and rejects stale or modified deliveries', () => {

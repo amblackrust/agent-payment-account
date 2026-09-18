@@ -191,12 +191,12 @@ export const v2ApprovalResponseSchema = z
 
 export const v2FundingDestinationResponseSchema = z
   .object({
-    id: z.string().min(1),
+    id: z.string().min(1).nullable(),
     account_id: z.string().min(1),
-    route_id: z.string().min(1),
-    network: z.string().min(1),
-    asset_id: z.string().min(1),
-    destination: z.string().min(1),
+    route_id: z.string().min(1).nullable(),
+    network: z.string().min(1).nullable(),
+    asset_id: z.string().min(1).nullable(),
+    destination: z.string().min(1).nullable(),
     readiness: z.enum(['READY', 'PENDING', 'DEGRADED', 'UNAVAILABLE']),
     sender_constraints: z.record(z.string(), z.unknown()),
     last_validated_at: z.string().nullable(),

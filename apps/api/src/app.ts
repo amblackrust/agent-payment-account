@@ -16,7 +16,11 @@ import type { SolanaRail } from '@agent-payment/solana-rail'
 import { getRuntimeLimits, type AppConfig } from './config.js'
 import { serializeAccountCreation, serializeReceiveDestination } from './accounts.js'
 import type { AccountService } from './accounts.js'
-import { assertAdminApiKey, authenticateAgentWithScope } from './auth.js'
+import {
+  assertAdminApiKey,
+  authenticateAgentWithScope,
+  getAdminOperatorId,
+} from './auth.js'
 import type { authenticateAgent } from './auth.js'
 import { serializePayment } from './payments.js'
 import type { PaymentServiceLike } from './payments.js'
@@ -1418,6 +1422,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           rolling_window_seconds: { type: ['integer', 'null'], minimum: 1 },
           transaction_count_cap: { type: ['integer', 'null'], minimum: 1 },
           approval_threshold: { type: ['string', 'null'] },
+          version: { type: 'integer', minimum: 1 },
           rolling_budget_escalatable: { type: 'boolean' },
           transaction_count_escalatable: { type: 'boolean' },
         },
@@ -1481,12 +1486,13 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
         },
         async (request) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           return management.transitionAccount({
             accountId: request.params.accountId,
             currentStatus: request.body.current_status,
             nextStatus: request.body.next_status,
             rowVersion: request.body.row_version,
+            actorId: operatorId,
             ...(request.body.reason === undefined
               ? {}
               : { reason: request.body.reason }),
@@ -1559,6 +1565,68 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         async (request) => {
           assertAdminApiKey(request, options.config.adminApiKey)
           return { policies: await management.listPolicies(request.params.accountId) }
+        },
+      )
+      app.get<{ Params: { accountId: string } }>(
+        '/v2/accounts/:accountId/policy',
+        { schema: { params: accountParams } },
+        async (request) => {
+          assertAdminApiKey(request, options.config.adminApiKey)
+          return management.getPolicy(request.params.accountId)
+        },
+      )
+      app.put<{
+        Params: { accountId: string }
+        Body: {
+          denomination_id: string
+          max_per_payment?: string | null
+          rolling_budget?: string | null
+          rolling_window_seconds?: number | null
+          transaction_count_cap?: number | null
+          approval_threshold?: string | null
+          version?: number
+          rolling_budget_escalatable?: boolean
+          transaction_count_escalatable?: boolean
+        }
+      }>(
+        '/v2/accounts/:accountId/policy',
+        { schema: { params: accountParams, body: policyBody } },
+        async (request) => {
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
+          return management.replacePolicy({
+            accountId: request.params.accountId,
+            denominationId: request.body.denomination_id,
+            ...(request.body.max_per_payment === undefined
+              ? {}
+              : { maxPerPayment: request.body.max_per_payment }),
+            ...(request.body.rolling_budget === undefined
+              ? {}
+              : { rollingBudget: request.body.rolling_budget }),
+            ...(request.body.rolling_window_seconds === undefined
+              ? {}
+              : { rollingWindowSeconds: request.body.rolling_window_seconds }),
+            ...(request.body.transaction_count_cap === undefined
+              ? {}
+              : { transactionCountCap: request.body.transaction_count_cap }),
+            ...(request.body.approval_threshold === undefined
+              ? {}
+              : { approvalThreshold: request.body.approval_threshold }),
+            ...(request.body.version === undefined
+              ? {}
+              : { expectedVersion: request.body.version }),
+            ...(request.body.rolling_budget_escalatable === undefined
+              ? {}
+              : {
+                  rollingBudgetEscalatable: request.body.rolling_budget_escalatable,
+                }),
+            ...(request.body.transaction_count_escalatable === undefined
+              ? {}
+              : {
+                  transactionCountEscalatable:
+                    request.body.transaction_count_escalatable,
+                }),
+            actorId: operatorId,
+          })
         },
       )
       app.post<{
@@ -1634,11 +1702,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           },
         },
         async (request) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           return management.activatePolicy(
             request.body.account_id,
             request.params.policyId,
             request.body.version,
+            operatorId,
           )
         },
       )
@@ -1655,7 +1724,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         Params: { accountId: string; approvalId: string }
         Body: {
           action: 'APPROVE' | 'REJECT' | 'EXPIRE'
-          actor_id: string
+          actor_id?: string
           comment?: string
           row_version: number
         }
@@ -1680,17 +1749,17 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                 comment: { type: 'string', maxLength: 500 },
                 row_version: { type: 'integer', minimum: 1 },
               },
-              required: ['action', 'actor_id', 'row_version'],
+              required: ['action', 'row_version'],
             },
           },
         },
         async (request) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           return management.decideApproval({
             accountId: request.params.accountId,
             approvalId: request.params.approvalId,
             action: request.body.action,
-            actorId: request.body.actor_id,
+            actorId: operatorId,
             rowVersion: request.body.row_version,
             ...(request.body.comment === undefined
               ? {}
@@ -1719,7 +1788,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           network: string
           asset_reference: string
           destination: string
-          actor_id: string
+          actor_id?: string
           reason?: string
         }
       }>(
@@ -1745,13 +1814,12 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                 'network',
                 'asset_reference',
                 'destination',
-                'actor_id',
               ],
             },
           },
         },
         async (request, reply) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           const destination = await management.createApprovedDestination({
             accountId: request.params.accountId,
             fingerprint: request.body.fingerprint,
@@ -1759,7 +1827,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             network: request.body.network,
             assetReference: request.body.asset_reference,
             destination: request.body.destination,
-            actorId: request.body.actor_id,
+            actorId: operatorId,
             ...(request.body.reason === undefined
               ? {}
               : { reason: request.body.reason }),
@@ -1769,7 +1837,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       )
       app.post<{
         Params: { accountId: string; destinationId: string }
-        Body: { actor_id: string; reason: string }
+        Body: { actor_id?: string; reason: string }
       }>(
         '/v2/accounts/:accountId/approved-destinations/:destinationId/revoke',
         {
@@ -1789,16 +1857,16 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                 actor_id: { type: 'string', minLength: 1, maxLength: 255 },
                 reason: { type: 'string', minLength: 1, maxLength: 500 },
               },
-              required: ['actor_id', 'reason'],
+              required: ['reason'],
             },
           },
         },
         async (request) => {
-          assertAdminApiKey(request, options.config.adminApiKey)
+          const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
           await management.revokeApprovedDestination({
             accountId: request.params.accountId,
             id: request.params.destinationId,
-            actorId: request.body.actor_id,
+            actorId: operatorId,
             reason: request.body.reason,
           })
           return { status: 'REVOKED' }

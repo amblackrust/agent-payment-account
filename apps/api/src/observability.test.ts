@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  createDomainHealthSnapshot,
   evaluateDomainAlerts,
   MetricsRegistry,
   normalizeCorrelationId,
@@ -65,6 +66,37 @@ describe('MetricsRegistry', () => {
       'DEPENDENCY_DEGRADED',
       'WEBHOOK_BACKLOG',
       'RESTORE_VERIFICATION_FAILED',
+      'RUNTIME_IDENTITY_MISMATCH',
+    ])
+  })
+
+  it('projects durable health data into checks without dropping alert categories', () => {
+    const snapshot = createDomainHealthSnapshot({
+      health: {
+        reviewRequiredPayments: 0,
+        oldestReviewRequiredAgeSeconds: null,
+        oldestWorkItemAgeSeconds: 600,
+        exhaustedIncomingIssues: 0,
+        custodyFailures: 1,
+        databaseSaturationRatio: 0.95,
+        pendingWebhookDeliveries: 0,
+        restoreVerificationFailed: false,
+        runtimeIdentityMismatch: true,
+      },
+      dependencyDegraded: false,
+    })
+
+    expect(snapshot.status).toBe('degraded')
+    expect(snapshot.checks).toMatchObject({
+      custody: 'degraded',
+      database_saturation: 'degraded',
+      no_progress: 'degraded',
+      runtime_identity: 'degraded',
+    })
+    expect(snapshot.alerts?.map((alert) => alert.name)).toEqual([
+      'CUSTODY_FAILURES',
+      'NO_PROGRESS',
+      'DATABASE_SATURATION',
       'RUNTIME_IDENTITY_MISMATCH',
     ])
   })

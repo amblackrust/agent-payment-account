@@ -29,6 +29,7 @@ import {
   validateLegacyWalletCustody,
   WalletSecretCipher,
 } from './custody.js'
+import { createDomainHealthSnapshot } from './observability.js'
 import type { V2OutgoingWorker } from './outgoing-v2.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { waitForShutdown } from './lifecycle.js'
@@ -189,23 +190,39 @@ async function startWorker(): Promise<void> {
       : undefined
   const walletCipher =
     walletMasterKey === undefined ? undefined : new WalletSecretCipher(walletMasterKey)
+  const runtimeIdentity =
+    walletMasterKey === undefined
+      ? undefined
+      : {
+          rail: 'SOLANA_SPL',
+          version: '1',
+          cluster: config.solanaCluster,
+          settlementMint: config.solanaSettlementMint,
+          custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
+          ...(config.custodyBackendIdentity === undefined
+            ? {}
+            : { custodyBackendIdentity: config.custodyBackendIdentity }),
+          ...(config.custodyBackendMode === undefined
+            ? {}
+            : { custodyBackendMode: config.custodyBackendMode }),
+        }
   if (walletMasterKey !== undefined) {
-    await database.initializeRuntimeIdentity(
-      {
-        rail: 'SOLANA_SPL',
-        version: '1',
-        cluster: config.solanaCluster,
-        settlementMint: config.solanaSettlementMint,
-        custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
-        ...(config.custodyBackendIdentity === undefined
-          ? {}
-          : { custodyBackendIdentity: config.custodyBackendIdentity }),
-        ...(config.custodyBackendMode === undefined
-          ? {}
-          : { custodyBackendMode: config.custodyBackendMode }),
-      },
-      (custody) => validateLegacyWalletCustody(walletCipher!, custody),
+    await database.initializeRuntimeIdentity(runtimeIdentity!, (custody) =>
+      validateLegacyWalletCustody(walletCipher!, custody),
     )
+  } else {
+    await database.checkRuntimeIdentity({
+      rail: 'SOLANA_SPL',
+      version: '1',
+      cluster: config.solanaCluster,
+      settlementMint: config.solanaSettlementMint,
+      ...(config.custodyBackendIdentity === undefined
+        ? {}
+        : { custodyBackendIdentity: config.custodyBackendIdentity }),
+      ...(config.custodyBackendMode === undefined
+        ? {}
+        : { custodyBackendMode: config.custodyBackendMode }),
+    })
   }
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
@@ -243,12 +260,37 @@ async function startWorker(): Promise<void> {
       },
     },
     domainHealthDependency: {
-      checkDomainHealth: async () => ({
-        status: lastWorkerError === undefined ? 'ok' : 'degraded',
-        checks: {
-          worker: lastWorkerError === undefined ? 'ok' : 'degraded',
-        },
-      }),
+      checkDomainHealth: async () => {
+        const health = await database.v2Operations.getDomainHealth?.({
+          databaseCapacityPerWindow: limits.databaseCapacityPerWindow,
+          capacityWindowSeconds: limits.capacityWindowSeconds,
+          ...(runtimeIdentity === undefined
+            ? {}
+            : { expectedRuntimeIdentity: JSON.stringify(runtimeIdentity) }),
+        })
+        let dependencyDegraded = false
+        try {
+          await rail.checkReadiness?.()
+          await v2OutgoingRuntime?.checkReadiness()
+        } catch {
+          dependencyDegraded = true
+        }
+        if (health === undefined) {
+          return {
+            status:
+              lastWorkerError === undefined && !dependencyDegraded ? 'ok' : 'degraded',
+            checks: {
+              worker: lastWorkerError === undefined ? 'ok' : 'degraded',
+              dependency: dependencyDegraded ? 'degraded' : 'ok',
+            },
+          }
+        }
+        return createDomainHealthSnapshot({
+          health,
+          dependencyDegraded,
+          ...(lastWorkerError === undefined ? {} : { workerError: lastWorkerError }),
+        })
+      },
     },
   })
   const worker: RuntimeWorker = createWorker({
@@ -384,6 +426,7 @@ function createWorker(input: {
       input.logger,
       {
         accountConcurrency: input.limits.incomingAccountConcurrency,
+        owner: `incoming-${process.pid}`,
         capacity: input.capacity,
       },
     )

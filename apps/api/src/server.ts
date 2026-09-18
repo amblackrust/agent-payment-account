@@ -39,7 +39,7 @@ import { V2PaymentServiceAdapter } from './payments-v1-adapter.js'
 import { V2ManagementService } from './v2-management.js'
 import { V2OperationsService } from './v2-operations.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
-import { evaluateDomainAlerts } from './observability.js'
+import { createDomainHealthSnapshot } from './observability.js'
 import { waitForShutdown } from './lifecycle.js'
 
 async function startServer(): Promise<void> {
@@ -63,23 +63,36 @@ async function startServer(): Promise<void> {
   const recoveryEnvelopeKey = requireRecoveryEnvelopeKey(config.recoveryEnvelopeKey)
   const walletCipher = new WalletSecretCipher(walletMasterKey)
   const recoveryCipher = new RecoveryEnvelopeCipher(recoveryEnvelopeKey)
+  const runtimeIdentity = {
+    rail: 'SOLANA_SPL',
+    version: '1',
+    cluster: config.solanaCluster,
+    settlementMint: config.solanaSettlementMint,
+    custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
+    ...(config.custodyBackendIdentity === undefined
+      ? {}
+      : { custodyBackendIdentity: config.custodyBackendIdentity }),
+    ...(config.custodyBackendMode === undefined
+      ? {}
+      : { custodyBackendMode: config.custodyBackendMode }),
+  } as const
   if (legacyRuntimeEnabled) {
-    await database.initializeRuntimeIdentity(
-      {
-        rail: 'SOLANA_SPL',
-        version: '1',
-        cluster: config.solanaCluster,
-        settlementMint: config.solanaSettlementMint,
-        custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
-        ...(config.custodyBackendIdentity === undefined
-          ? {}
-          : { custodyBackendIdentity: config.custodyBackendIdentity }),
-        ...(config.custodyBackendMode === undefined
-          ? {}
-          : { custodyBackendMode: config.custodyBackendMode }),
-      },
-      (custody) => validateLegacyWalletCustody(walletCipher, custody),
+    await database.initializeRuntimeIdentity(runtimeIdentity, (custody) =>
+      validateLegacyWalletCustody(walletCipher, custody),
     )
+  } else {
+    await database.checkRuntimeIdentity({
+      rail: runtimeIdentity.rail,
+      version: runtimeIdentity.version,
+      cluster: runtimeIdentity.cluster,
+      settlementMint: runtimeIdentity.settlementMint,
+      ...(runtimeIdentity.custodyBackendIdentity === undefined
+        ? {}
+        : { custodyBackendIdentity: runtimeIdentity.custodyBackendIdentity }),
+      ...(runtimeIdentity.custodyBackendMode === undefined
+        ? {}
+        : { custodyBackendMode: runtimeIdentity.custodyBackendMode }),
+    })
   }
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
@@ -100,6 +113,18 @@ async function startServer(): Promise<void> {
           'Settlement asset configuration is unavailable',
         )
       }
+      if (
+        route.rail !== 'SOLANA_SPL' ||
+        route.network !== config.solanaCluster ||
+        asset.rail !== route.rail ||
+        asset.network !== route.network ||
+        asset.assetReference !== config.solanaSettlementMint
+      ) {
+        throw new DependencyUnavailableError(
+          'Funding route does not match the configured Solana settlement identity',
+        )
+      }
+      await rail.checkReadiness?.()
       const destination = await rail.getReceiveDestination(input.owner)
       await database.v2Admin.upsertFundingDestination({
         id: `funding_${input.accountId}_${route.id}_${asset.id}`,
@@ -202,7 +227,11 @@ async function startServer(): Promise<void> {
     v2AdminRepository: database.v2Admin,
     domainHealthDependency: {
       checkDomainHealth: async () => {
-        const health = await database.v2Operations.getDomainHealth?.()
+        const health = await database.v2Operations.getDomainHealth?.({
+          databaseCapacityPerWindow: limits.databaseCapacityPerWindow,
+          capacityWindowSeconds: limits.capacityWindowSeconds,
+          expectedRuntimeIdentity: JSON.stringify(runtimeIdentity),
+        })
         if (health === undefined) return { status: 'ok', checks: {} }
         let dependencyDegraded = false
         try {
@@ -210,48 +239,7 @@ async function startServer(): Promise<void> {
         } catch {
           dependencyDegraded = true
         }
-        const alerts = evaluateDomainAlerts({
-          reviewRequiredPayments: health.reviewRequiredPayments,
-          oldestReviewRequiredAgeSeconds: health.oldestReviewRequiredAgeSeconds ?? null,
-          exhaustedIncomingIssues: health.exhaustedIncomingIssues,
-          custodyFailures: 0,
-          noProgressSeconds: health.oldestWorkItemAgeSeconds ?? null,
-          databaseSaturationRatio: null,
-          dependencyDegraded,
-          pendingWebhookDeliveries: health.pendingWebhookDeliveries,
-          restoreVerificationFailed: health.restoreVerificationFailed ?? false,
-          runtimeIdentityMismatch: false,
-        })
-        const checks = {
-          review_required:
-            health.reviewRequiredPayments === 0
-              ? ('ok' as const)
-              : ('degraded' as const),
-          incoming_issues:
-            health.exhaustedIncomingIssues === 0
-              ? ('ok' as const)
-              : ('degraded' as const),
-          webhooks:
-            health.pendingWebhookDeliveries === 0
-              ? ('ok' as const)
-              : ('degraded' as const),
-          no_progress: alerts.some((alert) => alert.name === 'NO_PROGRESS')
-            ? ('degraded' as const)
-            : ('ok' as const),
-          dependency: alerts.some((alert) => alert.name === 'DEPENDENCY_DEGRADED')
-            ? ('degraded' as const)
-            : ('ok' as const),
-          restore: alerts.some((alert) => alert.name === 'RESTORE_VERIFICATION_FAILED')
-            ? ('degraded' as const)
-            : ('ok' as const),
-        }
-        return {
-          status: Object.values(checks).includes('degraded')
-            ? ('degraded' as const)
-            : ('ok' as const),
-          checks,
-          alerts,
-        }
+        return createDomainHealthSnapshot({ health, dependencyDegraded })
       },
     },
   })
@@ -264,6 +252,7 @@ async function startServer(): Promise<void> {
         },
         {
           accountConcurrency: limits.incomingAccountConcurrency,
+          owner: `incoming-api-${process.pid}`,
           capacity,
         },
       )

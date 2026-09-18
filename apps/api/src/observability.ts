@@ -70,6 +70,55 @@ export interface DomainHealthDependency {
   checkDomainHealth(): Promise<DomainHealthSnapshot>
 }
 
+export interface DomainHealthData {
+  readonly reviewRequiredPayments: number
+  readonly oldestReviewRequiredAgeSeconds?: number | null
+  readonly oldestWorkItemAgeSeconds?: number | null
+  readonly exhaustedIncomingIssues: number
+  readonly custodyFailures?: number
+  readonly databaseSaturationRatio?: number | null
+  readonly pendingWebhookDeliveries: number
+  readonly restoreVerificationFailed?: boolean
+  readonly runtimeIdentityMismatch?: boolean
+}
+
+export function createDomainHealthSnapshot(input: {
+  readonly health: DomainHealthData
+  readonly dependencyDegraded: boolean
+  readonly workerError?: string
+}): DomainHealthSnapshot {
+  const alerts = evaluateDomainAlerts({
+    reviewRequiredPayments: input.health.reviewRequiredPayments,
+    oldestReviewRequiredAgeSeconds: input.health.oldestReviewRequiredAgeSeconds ?? null,
+    exhaustedIncomingIssues: input.health.exhaustedIncomingIssues,
+    custodyFailures: input.health.custodyFailures ?? 0,
+    noProgressSeconds: input.health.oldestWorkItemAgeSeconds ?? null,
+    databaseSaturationRatio: input.health.databaseSaturationRatio ?? null,
+    dependencyDegraded: input.dependencyDegraded,
+    pendingWebhookDeliveries: input.health.pendingWebhookDeliveries,
+    restoreVerificationFailed: input.health.restoreVerificationFailed ?? false,
+    runtimeIdentityMismatch: input.health.runtimeIdentityMismatch ?? false,
+  })
+  const alertNames = new Set(alerts.map((alert) => alert.name))
+  const checks: Record<string, 'ok' | 'degraded'> = {
+    review_required: input.health.reviewRequiredPayments === 0 ? 'ok' : 'degraded',
+    incoming_issues: input.health.exhaustedIncomingIssues === 0 ? 'ok' : 'degraded',
+    custody: alertNames.has('CUSTODY_FAILURES') ? 'degraded' : 'ok',
+    database_saturation: alertNames.has('DATABASE_SATURATION') ? 'degraded' : 'ok',
+    no_progress: alertNames.has('NO_PROGRESS') ? 'degraded' : 'ok',
+    dependency: alertNames.has('DEPENDENCY_DEGRADED') ? 'degraded' : 'ok',
+    webhooks: input.health.pendingWebhookDeliveries === 0 ? 'ok' : 'degraded',
+    restore: alertNames.has('RESTORE_VERIFICATION_FAILED') ? 'degraded' : 'ok',
+    runtime_identity: alertNames.has('RUNTIME_IDENTITY_MISMATCH') ? 'degraded' : 'ok',
+  }
+  if (input.workerError !== undefined) checks.worker = 'degraded'
+  return {
+    status: alerts.length > 0 || input.workerError !== undefined ? 'degraded' : 'ok',
+    checks,
+    alerts,
+  }
+}
+
 export function normalizeCorrelationId(
   value: string | readonly string[] | undefined,
   fallback: string,

@@ -165,4 +165,48 @@ describe('API foundation', () => {
     expect(response.headers['x-correlation-id']).toBe('trace-v2')
     await app.close()
   })
+
+  it('exposes atomic versioned policy replacement through the admin contract', async () => {
+    const getPolicy = vi.fn(async () => ({ id: 'policy_1', status: 'ACTIVE' }))
+    const replacePolicy = vi.fn(async (input: unknown) => input)
+    const app = buildApp({
+      config: testConfig,
+      readinessDependency: { checkReadiness: async () => undefined },
+      accountRepository: {} as never,
+      accountService: {} as never,
+      solanaRail: {} as never,
+      v2ManagementService: { getPolicy, replacePolicy } as never,
+    })
+
+    const headers = { 'x-admin-api-key': testConfig.adminApiKey }
+    const current = await app.inject({
+      method: 'GET',
+      url: '/v2/accounts/acct_1/policy',
+      headers,
+    })
+    const replacement = await app.inject({
+      method: 'PUT',
+      url: '/v2/accounts/acct_1/policy',
+      headers,
+      payload: {
+        denomination_id: 'usd',
+        max_per_payment: '1.25',
+        version: 1,
+      },
+    })
+
+    expect(current.statusCode).toBe(200)
+    expect(current.json()).toEqual({ id: 'policy_1', status: 'ACTIVE' })
+    expect(replacement.statusCode).toBe(200)
+    expect(replacePolicy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: 'acct_1',
+        denominationId: 'usd',
+        maxPerPayment: '1.25',
+        expectedVersion: 1,
+        actorId: expect.stringMatching(/^platform-operator:/u),
+      }),
+    )
+    await app.close()
+  })
 })

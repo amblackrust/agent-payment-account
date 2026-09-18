@@ -21,7 +21,10 @@ import {
 const MAX_INCOMING_ISSUE_RETRIES = 8
 export { createV2DatabaseRepository } from './v2.js'
 export { createV2AdminRepository } from './v2-admin.js'
-export { createV2OperationsRepository } from './v2-operations.js'
+export {
+  assertSafeWebhookEndpoint,
+  createV2OperationsRepository,
+} from './v2-operations.js'
 export type {
   V2AccountRecord,
   V2AdminRepository,
@@ -40,6 +43,7 @@ export type {
   V2BackupRestoreVerificationRecord,
   V2OperationalExceptionRecord,
   V2OperationsRepository,
+  V2DomainHealthInput,
   V2PlatformCostRecord,
   V2TimelineRecord,
   V2WebhookDeliveryClaim,
@@ -50,6 +54,7 @@ export type {
   V2DatabaseRepository,
   V2DenominationRecord,
   V2EconomicMappingRecord,
+  V2IdempotencyRecord,
   V2PaymentAttemptSnapshot,
   V2PaymentCreateInput,
   V2PaymentCreateResult,
@@ -177,6 +182,10 @@ export interface RecipientDestinationRecord {
   readonly rail: string
   readonly type: string
   readonly walletAddress: string
+  readonly network?: string | null
+  readonly assetReference?: string | null
+  readonly status?: string
+  readonly version?: number
 }
 
 export interface RecipientRecord {
@@ -204,6 +213,8 @@ export interface CreateRecipientInput {
     readonly rail: string
     readonly type: string
     readonly walletAddress: string
+    readonly network?: string
+    readonly assetReference?: string
   }
 }
 
@@ -218,6 +229,8 @@ export interface UpdateRecipientInput {
     readonly rail: string
     readonly type: string
     readonly walletAddress: string
+    readonly network?: string
+    readonly assetReference?: string
   }
   readonly rowVersion?: number
 }
@@ -445,11 +458,34 @@ export interface IncomingPaymentRepository {
     rail: string,
     address: string,
   ): Promise<IncomingCursor | null>
+  readonly claimIncomingPartition?: (input: {
+    readonly accountId: string
+    readonly rail: string
+    readonly address: string
+    readonly owner: string
+    readonly leaseSeconds: number
+    readonly now?: Date
+  }) => Promise<IncomingCursor | null>
+  readonly releaseIncomingPartition?: (input: {
+    readonly accountId: string
+    readonly rail: string
+    readonly address: string
+    readonly owner: string
+  }) => Promise<void>
+  readonly renewIncomingPartition?: (input: {
+    readonly accountId: string
+    readonly rail: string
+    readonly address: string
+    readonly owner: string
+    readonly leaseSeconds: number
+    readonly now?: Date
+  }) => Promise<void>
   saveIncomingCursor(input: {
     readonly accountId: string
     readonly rail: string
     readonly address: string
     readonly cursorSignature: string
+    readonly leaseOwner?: string
   }): Promise<void>
   createIncomingPayment(
     input: CreateIncomingPaymentInput,
@@ -668,6 +704,7 @@ export interface DatabaseClient
     input: RuntimeIdentity,
     validateLegacyCustody?: (custody: AccountCustodyRecord) => Promise<void>,
   ): Promise<void>
+  checkRuntimeIdentity(input: RuntimeIdentityCompatibility): Promise<void>
   initializeRuntimeAuthority(authorityId: string): Promise<void>
   getRuntimeMetadata(key: string): Promise<string | null>
   reserveFeeSponsorship(input: {
@@ -690,6 +727,15 @@ export interface RuntimeIdentity {
   readonly cluster: string
   readonly settlementMint: string
   readonly custodyKeyFingerprint: string
+  readonly custodyBackendIdentity?: string
+  readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
+}
+
+export interface RuntimeIdentityCompatibility {
+  readonly rail: string
+  readonly version: string
+  readonly cluster: string
+  readonly settlementMint: string
   readonly custodyBackendIdentity?: string
   readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
 }
@@ -995,6 +1041,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
               rail: input.destination.rail,
               type: input.destination.type,
               walletAddress: input.destination.walletAddress,
+              ...(input.destination.network === undefined
+                ? {}
+                : { network: input.destination.network }),
+              ...(input.destination.assetReference === undefined
+                ? {}
+                : { assetReference: input.destination.assetReference }),
             },
           },
         },
@@ -1085,6 +1137,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
               rail: input.destination.rail,
               type: input.destination.type,
               walletAddress: input.destination.walletAddress,
+              ...(input.destination.network === undefined
+                ? {}
+                : { network: input.destination.network }),
+              ...(input.destination.assetReference === undefined
+                ? {}
+                : { assetReference: input.destination.assetReference }),
             },
           })
           if (destinationResult.count !== 1) {
@@ -1131,7 +1189,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         }
 
         const activeReservations = await transaction.outgoingReservation.aggregate({
-          where: { ownerAccountId: input.ownerAccountId, status: 'ACTIVE' },
+          where: {
+            ownerAccountId: input.ownerAccountId,
+            status: 'ACTIVE',
+            currency: input.currency,
+          },
           _sum: { amountAtomic: true },
         })
         const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
@@ -1256,7 +1318,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         })
         const refundedAtomic = refunds._sum.amountAtomic ?? 0n
         const activeReservations = await transaction.outgoingReservation.aggregate({
-          where: { ownerAccountId: input.ownerAccountId, status: 'ACTIVE' },
+          where: {
+            ownerAccountId: input.ownerAccountId,
+            status: 'ACTIVE',
+            currency: input.currency,
+          },
           _sum: { amountAtomic: true },
         })
         const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
@@ -1910,18 +1976,106 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
       return cursor === null ? null : cursor
     },
-    async saveIncomingCursor(input) {
-      await prisma.indexerCheckpoint.upsert({
-        where: {
-          accountId_rail_address: {
-            accountId: input.accountId,
-            rail: input.rail,
-            address: input.address,
+    async claimIncomingPartition(input) {
+      if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
+        throw new Error('Incoming partition lease must be positive')
+      }
+      const now = input.now ?? new Date()
+      return prisma.$transaction(async (transaction) => {
+        await transaction.$executeRaw`
+          INSERT INTO "indexer_checkpoints"
+            ("id", "account_id", "rail", "address", "created_at", "updated_at")
+          VALUES
+            (${`idx_${randomBytes(16).toString('hex')}`}, ${input.accountId}, ${input.rail}, ${input.address}, ${now}, ${now})
+          ON CONFLICT ("account_id", "rail", "address") DO NOTHING
+        `
+        const rows = await transaction.$queryRaw<
+          Array<{
+            id: string
+            cursor_signature: string | null
+            lease_owner: string | null
+            lease_expires_at: Date | null
+          }>
+        >`
+          SELECT "id", "cursor_signature", "lease_owner", "lease_expires_at"
+          FROM "indexer_checkpoints"
+          WHERE "account_id" = ${input.accountId}
+            AND "rail" = ${input.rail}
+            AND "address" = ${input.address}
+          FOR UPDATE
+        `
+        const checkpoint = rows[0]
+        if (checkpoint === undefined) {
+          throw new Error('Incoming partition checkpoint disappeared')
+        }
+        if (
+          checkpoint.lease_owner !== null &&
+          checkpoint.lease_expires_at !== null &&
+          checkpoint.lease_expires_at > now &&
+          checkpoint.lease_owner !== input.owner
+        ) {
+          return null
+        }
+        await transaction.indexerCheckpoint.update({
+          where: { id: checkpoint.id },
+          data: {
+            leaseOwner: input.owner,
+            leaseExpiresAt: new Date(now.getTime() + input.leaseSeconds * 1_000),
           },
-        },
-        create: { id: `idx_${randomBytes(16).toString('hex')}`, ...input },
-        update: { cursorSignature: input.cursorSignature },
+        })
+        return {
+          accountId: input.accountId,
+          rail: input.rail,
+          address: input.address,
+          cursorSignature: checkpoint.cursor_signature,
+        }
       })
+    },
+    async releaseIncomingPartition(input) {
+      await prisma.indexerCheckpoint.updateMany({
+        where: {
+          accountId: input.accountId,
+          rail: input.rail,
+          address: input.address,
+          leaseOwner: input.owner,
+        },
+        data: { leaseOwner: null, leaseExpiresAt: null },
+      })
+    },
+    async renewIncomingPartition(input) {
+      if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
+        throw new Error('Incoming partition lease must be positive')
+      }
+      const now = input.now ?? new Date()
+      const result = await prisma.indexerCheckpoint.updateMany({
+        where: {
+          accountId: input.accountId,
+          rail: input.rail,
+          address: input.address,
+          leaseOwner: input.owner,
+        },
+        data: {
+          leaseExpiresAt: new Date(now.getTime() + input.leaseSeconds * 1_000),
+        },
+      })
+      if (result.count !== 1) {
+        throw new Error('Incoming partition lease is no longer owned')
+      }
+    },
+    async saveIncomingCursor(input) {
+      const where = {
+        accountId: input.accountId,
+        rail: input.rail,
+        address: input.address,
+        ...(input.leaseOwner === undefined ? {} : { leaseOwner: input.leaseOwner }),
+      }
+      const result = await prisma.indexerCheckpoint.updateMany({
+        where,
+        data: { cursorSignature: input.cursorSignature },
+      })
+      if (result.count !== 1) {
+        throw new Error('Incoming partition lease is no longer owned')
+      }
     },
     async recordIncomingReconciliationIssue(input): Promise<void> {
       const now = new Date()
@@ -2244,6 +2398,37 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         }
       })
     },
+    async checkRuntimeIdentity(input): Promise<void> {
+      const existing = await prisma.runtimeMetadata.findUnique({
+        where: { key: 'runtime_identity' },
+        select: { value: true },
+      })
+      if (existing === null) return
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(existing.value) as unknown
+      } catch {
+        throw new Error('Persisted runtime financial identity is invalid JSON')
+      }
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('Persisted runtime financial identity is invalid JSON')
+      }
+      const record = parsed as Record<string, unknown>
+      if (
+        record.rail !== input.rail ||
+        record.version !== input.version ||
+        record.cluster !== input.cluster ||
+        record.settlementMint !== input.settlementMint ||
+        (input.custodyBackendIdentity !== undefined &&
+          record.custodyBackendIdentity !== input.custodyBackendIdentity) ||
+        (input.custodyBackendMode !== undefined &&
+          record.custodyBackendMode !== input.custodyBackendMode)
+      ) {
+        throw new Error(
+          'Runtime financial identity mismatch; configured rail, cluster, settlement mint, or custody backend differs from the database',
+        )
+      }
+    },
     async initializeRuntimeAuthority(authorityId): Promise<void> {
       const normalized = authorityId.trim()
       if (normalized.length === 0) {
@@ -2295,6 +2480,10 @@ function toRecipientRecord(recipient: {
     rail: string
     type: string
     walletAddress: string
+    network: string | null
+    assetReference: string | null
+    status: string
+    version: number
   }[]
 }): RecipientRecord {
   return {
@@ -2309,6 +2498,10 @@ function toRecipientRecord(recipient: {
       rail: destination.rail,
       type: destination.type,
       walletAddress: destination.walletAddress,
+      network: destination.network,
+      assetReference: destination.assetReference,
+      status: destination.status,
+      version: destination.version,
     })),
     createdAt: recipient.createdAt,
     updatedAt: recipient.updatedAt,

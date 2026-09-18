@@ -109,6 +109,15 @@ export function assertAdminApiKey(request: FastifyRequest, expected: string): vo
   }
 }
 
+/**
+ * Returns the durable audit identity for the authenticated platform operator.
+ * The raw credential is intentionally never persisted or exposed.
+ */
+export function getAdminOperatorId(request: FastifyRequest, expected: string): string {
+  assertAdminApiKey(request, expected)
+  return `platform-operator:${hashApiKey(expected).slice(0, 24)}`
+}
+
 declare module 'fastify' {
   interface FastifyRequest {
     agentAccount: AuthenticatedAccount | null

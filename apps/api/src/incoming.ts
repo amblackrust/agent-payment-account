@@ -14,6 +14,8 @@ const MAX_ISSUE_RETRIES = 8
 
 export interface IncomingReconciliationOptions {
   readonly accountConcurrency?: number
+  readonly owner?: string
+  readonly leaseSeconds?: number
   readonly capacity?: {
     acquire(dependency: 'rpc', now?: Date): Promise<CapacityResult>
   }
@@ -79,11 +81,27 @@ export class IncomingReconciliationService {
   }
 
   private async reconcileAccount(account: IndexedAccount): Promise<void> {
-    const cursor = await this.repository.getIncomingCursor(
-      account.accountId,
-      'SOLANA_SPL',
-      account.solanaPublicKey,
-    )
+    const owner = this.options.owner ?? `incoming-${process.pid}`
+    const leaseSeconds = this.options.leaseSeconds ?? 60
+    const partition = await this.repository.claimIncomingPartition?.({
+      accountId: account.accountId,
+      rail: 'SOLANA_SPL',
+      address: account.solanaPublicKey,
+      owner,
+      leaseSeconds,
+      now: new Date(),
+    })
+    if (this.repository.claimIncomingPartition !== undefined && partition === null) {
+      return
+    }
+    const cursor =
+      partition ??
+      (await this.repository.getIncomingCursor(
+        account.accountId,
+        'SOLANA_SPL',
+        account.solanaPublicKey,
+      ))
+    const heartbeat = this.startPartitionLeaseHeartbeat(account, owner, leaseSeconds)
     try {
       if (!(await this.hasRpcCapacity(account.accountId))) return
       const scan =
@@ -120,6 +138,9 @@ export class IncomingReconciliationService {
           rail: 'SOLANA_SPL',
           address: account.solanaPublicKey,
           cursorSignature: scan.nextCursor,
+          ...(this.repository.claimIncomingPartition === undefined
+            ? {}
+            : { leaseOwner: owner }),
         })
       }
     } catch (error) {
@@ -130,7 +151,48 @@ export class IncomingReconciliationService {
         },
         'Incoming reconciliation failed',
       )
+    } finally {
+      heartbeat.stop()
+      await this.repository.releaseIncomingPartition?.({
+        accountId: account.accountId,
+        rail: 'SOLANA_SPL',
+        address: account.solanaPublicKey,
+        owner,
+      })
     }
+  }
+
+  private startPartitionLeaseHeartbeat(
+    account: IndexedAccount,
+    owner: string,
+    leaseSeconds: number,
+  ): { stop(): void } {
+    const renew = this.repository.renewIncomingPartition
+    if (renew === undefined || this.repository.claimIncomingPartition === undefined) {
+      return { stop: () => undefined }
+    }
+    const timer = setInterval(
+      () => {
+        void renew({
+          accountId: account.accountId,
+          rail: 'SOLANA_SPL',
+          address: account.solanaPublicKey,
+          owner,
+          leaseSeconds,
+          now: new Date(),
+        }).catch((error: unknown) => {
+          this.logger.error(
+            {
+              accountId: account.accountId,
+              errorCode: error instanceof Error ? error.name : 'UNKNOWN',
+            },
+            'Incoming partition lease renewal failed',
+          )
+        })
+      },
+      Math.max(1_000, Math.floor((leaseSeconds * 1_000) / 3)),
+    )
+    return { stop: () => clearInterval(timer) }
   }
 
   private async hasRpcCapacity(accountId: string): Promise<boolean> {

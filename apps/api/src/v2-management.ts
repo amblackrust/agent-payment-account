@@ -81,6 +81,7 @@ export class V2ManagementService {
     readonly nextStatus: AgentAccountLifecycleStatus
     readonly rowVersion: number
     readonly reason?: string
+    readonly actorId?: string
   }) {
     const account = await this.options.repository.transitionAccount(input)
     return {
@@ -215,6 +216,14 @@ export class V2ManagementService {
     )
   }
 
+  public async getPolicy(accountId: string) {
+    const policies = await this.listPolicies(accountId)
+    const active = policies.find((policy) => policy.status === 'ACTIVE')
+    if (active === undefined)
+      throw new NotFoundError('No active spend policy is configured')
+    return active
+  }
+
   public async createPolicy(input: {
     readonly accountId: string
     readonly denominationId: string
@@ -248,10 +257,59 @@ export class V2ManagementService {
     return this.serializePolicy(policy)
   }
 
-  public async activatePolicy(accountId: string, policyId: string, version?: number) {
+  public async replacePolicy(input: {
+    readonly accountId: string
+    readonly denominationId: string
+    readonly maxPerPayment?: string | null
+    readonly rollingBudget?: string | null
+    readonly rollingWindowSeconds?: number | null
+    readonly transactionCountCap?: number | null
+    readonly approvalThreshold?: string | null
+    readonly rollingBudgetEscalatable?: boolean
+    readonly transactionCountEscalatable?: boolean
+    readonly expectedVersion?: number
+    readonly actorId: string
+  }) {
+    await this.requireAccount(input.accountId)
+    const denomination = await this.loadDenomination(input.denominationId)
+    const parseOptional = (value: string | null | undefined) =>
+      value === undefined || value === null
+        ? null
+        : parseExactMoney(value, denomination).atomicUnits
+    const policy = await this.options.repository.replaceSpendPolicy({
+      id: createId('policy'),
+      accountId: input.accountId,
+      denominationId: denomination.id,
+      maxPerPaymentAtomic: parseOptional(input.maxPerPayment),
+      rollingBudgetAtomic: parseOptional(input.rollingBudget),
+      rollingWindowSeconds: input.rollingWindowSeconds ?? null,
+      transactionCountCap: input.transactionCountCap ?? null,
+      approvalThresholdAtomic: parseOptional(input.approvalThreshold),
+      rollingBudgetEscalatable: input.rollingBudgetEscalatable ?? false,
+      transactionCountEscalatable: input.transactionCountEscalatable ?? false,
+      rulesJson: '{}',
+      ...(input.expectedVersion === undefined
+        ? {}
+        : { expectedVersion: input.expectedVersion }),
+      actorId: input.actorId,
+    })
+    return this.serializePolicy(policy)
+  }
+
+  public async activatePolicy(
+    accountId: string,
+    policyId: string,
+    version?: number,
+    actorId?: string,
+  ) {
     await this.requireAccount(accountId)
     return this.serializePolicy(
-      await this.options.repository.activateSpendPolicy(accountId, policyId, version),
+      await this.options.repository.activateSpendPolicy(
+        accountId,
+        policyId,
+        version,
+        actorId,
+      ),
     )
   }
 
@@ -352,8 +410,20 @@ export class V2ManagementService {
       accountId,
       routeId,
     )
-    if (destination === null)
-      throw new NotFoundError('Funding destination is unavailable')
+    if (destination === null) {
+      return {
+        id: null,
+        account_id: accountId,
+        route_id: routeId ?? null,
+        network: null,
+        asset_id: null,
+        destination: null,
+        readiness: 'UNAVAILABLE' as const,
+        sender_constraints: {},
+        last_validated_at: null,
+        last_failure_code: 'FUNDING_DESTINATION_UNAVAILABLE',
+      }
+    }
     return {
       id: destination.id,
       account_id: destination.accountId,

@@ -1,6 +1,10 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { computeRetryAt } from '@agent-payment/core'
-import type { V2OperationsRepository, V2WebhookDeliveryClaim } from '@agent-payment/db'
+import {
+  assertSafeWebhookEndpoint,
+  type V2OperationsRepository,
+  type V2WebhookDeliveryClaim,
+} from '@agent-payment/db'
 import type { CapacityResult } from './capacity.js'
 import { retryAtAfter } from './capacity.js'
 
@@ -139,6 +143,7 @@ export class WebhookDeliveryWorker {
         claim.signingKeyVersion,
       )
       if (key.byteLength === 0) throw new Error('Webhook signing key is empty')
+      assertSafeWebhookEndpoint(claim.endpoint)
       const timestampSeconds = Math.floor(this.now().getTime() / 1_000)
       const signature = createWebhookSignature(claim.rawBody, timestampSeconds, key)
       if (!(await this.acquireCapacity(claim))) return
@@ -159,6 +164,7 @@ export class WebhookDeliveryWorker {
             [WEBHOOK_TIMESTAMP_HEADER]: String(timestampSeconds),
           },
           body: claim.rawBody,
+          redirect: 'error',
           signal: controller.signal,
         })
       } finally {

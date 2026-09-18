@@ -47,8 +47,10 @@ Agent-authenticated V2 routes include:
   `GET /v2/accounts/:accountId/balance?denomination_id=...` — settled,
   reserved, and spendable exact balances.
 - `GET /v2/funding-destination` and
-  `GET /v2/accounts/:accountId/funding-destination` — the usable funding
-  destination for an optional route.
+  `GET /v2/accounts/:accountId/funding-destination` — the funding destination
+  and its readiness for an optional route. Missing provisioning is returned as
+  `readiness: "UNAVAILABLE"` with null destination fields and a stable failure
+  code rather than as an indistinguishable 404.
 - `POST`, `GET`, `PATCH`, and archive operations under `/v2/recipients` —
   account-owned recipient directory and approved destination checks.
 - `POST`, `GET`, list, and cancel operations under `/v2/receive-requests` —
@@ -74,9 +76,11 @@ policies, approvals, approved destinations, and the operator exception inbox:
 - `POST /v2/accounts` provisions an account with an idempotent request.
 - `/v2/accounts/:accountId/credentials` lists credentials; lifecycle,
   revoke, and rotate routes apply the corresponding guarded commands.
-- `/v2/accounts/:accountId/policies`, `/v2/policies/:policyId/activate`,
-  and `/v2/accounts/:accountId/approvals` manage versioned policy and approval
-  state.
+- `GET|PUT /v2/accounts/:accountId/policy`,
+  `/v2/accounts/:accountId/policies`, `/v2/policies/:policyId/activate`, and
+  `/v2/accounts/:accountId/approvals` manage versioned policy and approval
+  state. A replacement PUT creates a new immutable active version; when a
+  policy already exists, the request must include its current `version`.
 - `/v2/accounts/:accountId/approved-destinations` manages separately
   authorized destinations.
 - `/v2/operator/exceptions` and its domain-command routes expose operational

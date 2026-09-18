@@ -82,7 +82,10 @@ export function createV2OutgoingWorker(input: {
   const executor = createSolanaV2OutgoingExecutor({
     rpc: createSolanaRpc(input.config.solanaRpcUrl as ClusterUrl),
     settlementMint: input.config.solanaSettlementMint,
-    ...(feePayerSecret === undefined ? {} : { feePayerSecret }),
+    ...(reconcileOnly || feePayerSecret === undefined ? {} : { feePayerSecret }),
+    ...(input.config.solanaPlatformCostAssetId === undefined
+      ? {}
+      : { platformCostAssetId: input.config.solanaPlatformCostAssetId }),
     getPayerPublicKey: (accountId) => input.database.findAccountPublicKey(accountId),
     getDenomination: (denominationId) =>
       input.database.v2.findDenomination(denominationId),
@@ -113,6 +116,7 @@ export function createV2OutgoingWorker(input: {
   const worker = new V2OutgoingWorker({
     repository: input.database.v2,
     custody: input.database.v2Admin,
+    platformCosts: input.database.v2Operations,
     ...(input.walletCipher === undefined
       ? {}
       : { signedPayloadCipher: input.walletCipher }),

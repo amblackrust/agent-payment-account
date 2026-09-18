@@ -57,6 +57,7 @@ const configSchema = z.object({
     .enum(['localnet', 'devnet', 'testnet', 'mainnet-beta'])
     .default('localnet'),
   SOLANA_SETTLEMENT_MINT: z.string().min(1, 'SOLANA_SETTLEMENT_MINT is required'),
+  SOLANA_PLATFORM_COST_ASSET_ID: z.string().trim().min(1).optional(),
   SOLANA_FEE_PAYER_SECRET: z.string().min(1).optional(),
   WALLET_MASTER_KEY: z
     .string()
@@ -168,6 +169,7 @@ export type AppConfig = {
   readonly solanaRpcUrl: string
   readonly solanaCluster: 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
   readonly solanaSettlementMint: string
+  readonly solanaPlatformCostAssetId?: string
   readonly solanaFeePayerSecret: string | undefined
   readonly walletMasterKey: string | undefined
   readonly recoveryEnvelopeKey: string | undefined
@@ -328,6 +330,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     solanaRpcUrl: result.data.SOLANA_RPC_URL,
     solanaCluster: result.data.SOLANA_CLUSTER,
     solanaSettlementMint: result.data.SOLANA_SETTLEMENT_MINT,
+    ...(result.data.SOLANA_PLATFORM_COST_ASSET_ID === undefined
+      ? {}
+      : { solanaPlatformCostAssetId: result.data.SOLANA_PLATFORM_COST_ASSET_ID }),
     solanaFeePayerSecret: result.data.SOLANA_FEE_PAYER_SECRET,
     walletMasterKey: result.data.WALLET_MASTER_KEY,
     recoveryEnvelopeKey: result.data.RECOVERY_ENVELOPE_KEY,
@@ -386,6 +391,7 @@ export interface RedactedConfig {
   readonly restoreGateEnvironment?: string
   readonly solanaCluster: AppConfig['solanaCluster']
   readonly solanaSettlementMint: string
+  readonly solanaPlatformCostAssetId?: string
   readonly allowMainnet: boolean
   readonly hasAdminApiKey: boolean
   readonly hasSolanaFeePayerSecret: boolean
@@ -416,6 +422,9 @@ export function redactConfig(config: AppConfig): RedactedConfig {
       : { restoreGateEnvironment: config.restoreGateEnvironment }),
     solanaCluster: config.solanaCluster,
     solanaSettlementMint: config.solanaSettlementMint,
+    ...(config.solanaPlatformCostAssetId === undefined
+      ? {}
+      : { solanaPlatformCostAssetId: config.solanaPlatformCostAssetId }),
     allowMainnet: config.allowMainnet,
     hasAdminApiKey: config.adminApiKey.length > 0,
     hasSolanaFeePayerSecret: config.solanaFeePayerSecret !== undefined,

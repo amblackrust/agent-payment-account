@@ -157,18 +157,19 @@ Useful commands:
 
 See [`.env.example`](.env.example) for safe manual defaults and accepted secret formats.
 
-| Variable                  | Purpose                                                 |
-| ------------------------- | ------------------------------------------------------- |
-| `DATABASE_URL`            | PostgreSQL connection URL                               |
-| `PORT`                    | API port; defaults to `3000`                            |
-| `NODE_ENV`                | `development`, `test`, or `production`                  |
-| `ADMIN_API_KEY`           | Administrative account and credential authentication    |
-| `SOLANA_RPC_URL`          | RPC endpoint for the configured cluster                 |
-| `SOLANA_CLUSTER`          | `localnet`, `devnet`, `testnet`, or `mainnet-beta`      |
-| `SOLANA_SETTLEMENT_MINT`  | One classic SPL mint used for settlement                |
-| `SOLANA_FEE_PAYER_SECRET` | Separate platform fee-payer signer secret               |
-| `WALLET_MASTER_KEY`       | 32-byte key used to encrypt managed signer secrets      |
-| `ALLOW_MAINNET`           | Additional explicit mainnet opt-in; defaults to `false` |
+| Variable                        | Purpose                                                       |
+| ------------------------------- | ------------------------------------------------------------- |
+| `DATABASE_URL`                  | PostgreSQL connection URL                                     |
+| `PORT`                          | API port; defaults to `3000`                                  |
+| `NODE_ENV`                      | `development`, `test`, or `production`                        |
+| `ADMIN_API_KEY`                 | Administrative account and credential authentication          |
+| `SOLANA_RPC_URL`                | RPC endpoint for the configured cluster                       |
+| `SOLANA_CLUSTER`                | `localnet`, `devnet`, `testnet`, or `mainnet-beta`            |
+| `SOLANA_SETTLEMENT_MINT`        | One classic SPL mint used for settlement                      |
+| `SOLANA_PLATFORM_COST_ASSET_ID` | Explicit asset identity for durable SOL fee/rent cost records |
+| `SOLANA_FEE_PAYER_SECRET`       | Separate platform fee-payer signer secret                     |
+| `WALLET_MASTER_KEY`             | 32-byte key used to encrypt managed signer secrets            |
+| `ALLOW_MAINNET`                 | Additional explicit mainnet opt-in; defaults to `false`       |
 
 For a custom RPC, devnet, or testnet, create `.env` from `.env.example` and supply a mint and funded fee payer belonging to that cluster. Do not use `local:setup` to prepare a custom network. Mainnet is never part of Quick Start and requires both `SOLANA_CLUSTER=mainnet-beta` and `ALLOW_MAINNET=true`.
 

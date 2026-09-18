@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { AuthenticationError } from '@agent-payment/core'
 import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 import { getRuntimeLimits, type AppConfig } from './config.js'
-import { assertAdminApiKey, authenticateAgentWithScope } from './auth.js'
+import { authenticateAgentWithScope, getAdminOperatorId } from './auth.js'
 import type { V2OperationsService } from './v2-operations.js'
 
 const exceptionParams = {
@@ -19,7 +19,7 @@ const operatorActionBody = {
     operator_id: { type: 'string', minLength: 1, maxLength: 255 },
     row_version: { type: 'integer', minimum: 1 },
   },
-  required: ['operator_id', 'row_version'],
+  required: ['row_version'],
 } as const
 
 const operatorResolutionBody = {
@@ -170,7 +170,7 @@ export function registerV2OperationsRoutes(
       },
     },
     async (request) => {
-      assertAdminApiKey(request, options.config.adminApiKey)
+      getAdminOperatorId(request, options.config.adminApiKey)
       return {
         exceptions: await options.service.listExceptions({
           ...(request.query.status === undefined
@@ -188,24 +188,24 @@ export function registerV2OperationsRoutes(
       schema: { params: exceptionParams },
     },
     async (request) => {
-      assertAdminApiKey(request, options.config.adminApiKey)
+      getAdminOperatorId(request, options.config.adminApiKey)
       return options.service.getException(request.params.exceptionId)
     },
   )
 
   app.post<{
     Params: { exceptionId: string }
-    Body: { operator_id: string; row_version: number }
+    Body: { operator_id?: string; row_version: number }
   }>(
     '/v2/operator/exceptions/:exceptionId/acknowledge',
     {
       schema: { params: exceptionParams, body: operatorActionBody },
     },
     async (request) => {
-      assertAdminApiKey(request, options.config.adminApiKey)
+      const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
       return options.service.acknowledgeException({
         id: request.params.exceptionId,
-        operatorId: request.body.operator_id,
+        operatorId,
         rowVersion: request.body.row_version,
       })
     },
@@ -213,17 +213,17 @@ export function registerV2OperationsRoutes(
 
   app.post<{
     Params: { exceptionId: string }
-    Body: { operator_id: string; row_version: number; evidence_id?: string }
+    Body: { operator_id?: string; row_version: number; evidence_id?: string }
   }>(
     '/v2/operator/exceptions/:exceptionId/resolve-confirmed',
     {
       schema: { params: exceptionParams, body: operatorResolutionBody },
     },
     async (request) => {
-      assertAdminApiKey(request, options.config.adminApiKey)
+      const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
       return options.service.resolveConfirmedException({
         id: request.params.exceptionId,
-        operatorId: request.body.operator_id,
+        operatorId,
         rowVersion: request.body.row_version,
         ...(request.body.evidence_id === undefined
           ? {}
@@ -234,17 +234,17 @@ export function registerV2OperationsRoutes(
 
   app.post<{
     Params: { exceptionId: string }
-    Body: { operator_id: string; row_version: number; evidence_id?: string }
+    Body: { operator_id?: string; row_version: number; evidence_id?: string }
   }>(
     '/v2/operator/exceptions/:exceptionId/resolve-proved-no-effect',
     {
       schema: { params: exceptionParams, body: operatorResolutionBody },
     },
     async (request) => {
-      assertAdminApiKey(request, options.config.adminApiKey)
+      const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
       return options.service.resolveProvedNoEffectException({
         id: request.params.exceptionId,
-        operatorId: request.body.operator_id,
+        operatorId,
         rowVersion: request.body.row_version,
         ...(request.body.evidence_id === undefined
           ? {}
@@ -255,17 +255,17 @@ export function registerV2OperationsRoutes(
 
   app.post<{
     Params: { exceptionId: string }
-    Body: { operator_id: string; row_version: number }
+    Body: { operator_id?: string; row_version: number }
   }>(
     '/v2/operator/exceptions/:exceptionId/close-unresolved',
     {
       schema: { params: exceptionParams, body: operatorActionBody },
     },
     async (request) => {
-      assertAdminApiKey(request, options.config.adminApiKey)
+      const operatorId = getAdminOperatorId(request, options.config.adminApiKey)
       return options.service.closeUnresolvedException({
         id: request.params.exceptionId,
-        operatorId: request.body.operator_id,
+        operatorId,
         rowVersion: request.body.row_version,
       })
     },

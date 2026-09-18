@@ -175,3 +175,31 @@ describe('V2ManagementService credential rotation', () => {
     expect(rotateCredential).toHaveBeenCalledOnce()
   })
 })
+
+describe('V2ManagementService funding readiness', () => {
+  it('returns explicit unavailable readiness when provisioning has no destination', async () => {
+    const repository = {
+      findAccount: async () => account,
+      findFundingDestination: async () => null,
+    } as unknown as V2AdminRepository
+    const service = new V2ManagementService({
+      repository,
+      financialRepository: {} as never,
+    })
+
+    await expect(
+      service.getFundingDestination(account.id, 'route_solana'),
+    ).resolves.toEqual({
+      id: null,
+      account_id: account.id,
+      route_id: 'route_solana',
+      network: null,
+      asset_id: null,
+      destination: null,
+      readiness: 'UNAVAILABLE',
+      sender_constraints: {},
+      last_validated_at: null,
+      last_failure_code: 'FUNDING_DESTINATION_UNAVAILABLE',
+    })
+  })
+})

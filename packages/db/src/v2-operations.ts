@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { isIP } from 'node:net'
 import {
   ConflictError,
   InvalidStateError,
@@ -91,8 +92,17 @@ export interface V2DomainHealthRecord {
   readonly oldestReviewRequiredAgeSeconds?: number | null
   readonly oldestWorkItemAgeSeconds?: number | null
   readonly exhaustedIncomingIssues: number
+  readonly custodyFailures?: number
+  readonly databaseSaturationRatio?: number | null
   readonly pendingWebhookDeliveries: number
   readonly restoreVerificationFailed?: boolean
+  readonly runtimeIdentityMismatch?: boolean
+}
+
+export interface V2DomainHealthInput {
+  readonly databaseCapacityPerWindow?: number
+  readonly capacityWindowSeconds?: number
+  readonly expectedRuntimeIdentity?: string
 }
 
 export interface V2BackupRestoreVerificationRecord {
@@ -109,7 +119,9 @@ export interface V2BackupRestoreVerificationRecord {
 }
 
 export interface V2OperationsRepository {
-  readonly getDomainHealth?: () => Promise<V2DomainHealthRecord>
+  readonly getDomainHealth?: (
+    input?: V2DomainHealthInput,
+  ) => Promise<V2DomainHealthRecord>
   listTimeline(input: {
     readonly accountId: string
     readonly limit: number
@@ -225,14 +237,46 @@ export function createV2OperationsRepository(
   prisma: PrismaClient,
 ): V2OperationsRepository {
   return {
-    async getDomainHealth() {
+    async getDomainHealth(input: V2DomainHealthInput = {}) {
+      const now = new Date()
+      const capacityWindowStart =
+        input.capacityWindowSeconds === undefined
+          ? undefined
+          : new Date(
+              Math.floor(now.getTime() / (input.capacityWindowSeconds * 1_000)) *
+                input.capacityWindowSeconds *
+                1_000,
+            )
+      const capacityBucketPromise =
+        input.databaseCapacityPerWindow === undefined ||
+        capacityWindowStart === undefined
+          ? Promise.resolve(null)
+          : prisma.rateLimitBucket.findFirst({
+              where: {
+                subjectType: 'RUNTIME_CAPACITY',
+                subjectId: 'global',
+                bucket: 'database',
+                windowStartedAt: capacityWindowStart,
+              },
+              select: { requestCount: true },
+            })
+      const runtimeMetadataPromise =
+        input.expectedRuntimeIdentity === undefined
+          ? Promise.resolve(null)
+          : prisma.runtimeMetadata.findUnique({
+              where: { key: 'runtime_identity' },
+              select: { value: true },
+            })
       const [
         reviewRequiredPayments,
         oldestReviewRequiredPayment,
         oldestActiveWorkItem,
         exhaustedIncomingIssues,
+        custodyFailures,
         pendingWebhookDeliveries,
         latestBackupVerification,
+        capacityBucket,
+        runtimeMetadata,
       ] = await Promise.all([
         prisma.payment.count({ where: { status: 'REVIEW_REQUIRED' } }),
         prisma.payment.findFirst({
@@ -246,6 +290,12 @@ export function createV2OperationsRepository(
           select: { updatedAt: true },
         }),
         prisma.incomingReconciliationIssue.count({ where: { status: 'EXHAUSTED' } }),
+        prisma.operationalException.count({
+          where: {
+            status: { in: ['OPEN', 'ACKNOWLEDGED'] },
+            detailsJson: { contains: 'CUSTODY' },
+          },
+        }),
         prisma.webhookDelivery.count({
           where: { status: { in: ['AVAILABLE', 'RETRY_WAIT', 'CLAIMED'] } },
         }),
@@ -253,6 +303,8 @@ export function createV2OperationsRepository(
           orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           select: { status: true },
         }),
+        capacityBucketPromise,
+        runtimeMetadataPromise,
       ])
       const ageSeconds = (timestamp: Date | undefined): number | null =>
         timestamp === undefined
@@ -267,8 +319,20 @@ export function createV2OperationsRepository(
         oldestReviewRequiredAgeSeconds,
         oldestWorkItemAgeSeconds,
         exhaustedIncomingIssues,
+        custodyFailures,
+        databaseSaturationRatio:
+          capacityBucket === null || input.databaseCapacityPerWindow === undefined
+            ? null
+            : Math.min(
+                1,
+                capacityBucket.requestCount / input.databaseCapacityPerWindow,
+              ),
         pendingWebhookDeliveries,
         restoreVerificationFailed: latestBackupVerification?.status === 'FAILED',
+        runtimeIdentityMismatch:
+          runtimeMetadata !== null &&
+          input.expectedRuntimeIdentity !== undefined &&
+          runtimeMetadata.value !== input.expectedRuntimeIdentity,
       }
     },
 
@@ -385,40 +449,80 @@ export function createV2OperationsRepository(
     },
 
     async createPlatformCostEstimate(input) {
-      const cost = await prisma.platformCostRecord.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          ...(input.paymentId === undefined ? {} : { paymentId: input.paymentId }),
-          ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
-          assetId: input.assetId,
-          estimatedAmount: input.estimatedAmount,
-        },
+      const cost = await prisma.$transaction(async (transaction) => {
+        const existing = await transaction.platformCostRecord.findUnique({
+          where: { id: input.id },
+        })
+        if (existing !== null) {
+          if (
+            existing.accountId !== input.accountId ||
+            existing.paymentId !== (input.paymentId ?? null) ||
+            existing.attemptId !== (input.attemptId ?? null) ||
+            existing.assetId !== input.assetId ||
+            existing.estimatedAmount !== input.estimatedAmount
+          ) {
+            throw new ConflictError('Platform cost estimate identity changed')
+          }
+          return existing
+        }
+        return transaction.platformCostRecord.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            ...(input.paymentId === undefined ? {} : { paymentId: input.paymentId }),
+            ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+            assetId: input.assetId,
+            estimatedAmount: input.estimatedAmount,
+          },
+        })
       })
       return toCostRecord(cost)
     },
 
     async reconcilePlatformCost(input) {
-      const cost = await prisma.platformCostRecord.findUnique({
-        where: { id: input.id },
+      const cost = await prisma.$transaction(async (transaction) => {
+        const existing = await transaction.platformCostRecord.findUnique({
+          where: { id: input.id },
+        })
+        if (existing === null) {
+          throw new NotFoundError('Platform cost record was not found')
+        }
+        if (existing.actualAmount !== null) {
+          if (existing.actualAmount !== input.actualAmount) {
+            throw new ConflictError('Platform cost actual amount is immutable')
+          }
+          return existing
+        }
+        const updated = await transaction.platformCostRecord.updateMany({
+          where: { id: existing.id, actualAmount: null },
+          data: {
+            actualAmount: input.actualAmount,
+            reconciliationStatus: 'RECONCILED',
+            observedAt: input.observedAt,
+          },
+        })
+        if (updated.count === 1) {
+          return transaction.platformCostRecord.findUniqueOrThrow({
+            where: { id: existing.id },
+          })
+        }
+        const concurrentlyReconciled =
+          await transaction.platformCostRecord.findUniqueOrThrow({
+            where: { id: existing.id },
+          })
+        if (concurrentlyReconciled.actualAmount !== input.actualAmount) {
+          throw new ConflictError('Platform cost actual amount is immutable')
+        }
+        return concurrentlyReconciled
       })
-      if (cost === null) throw new NotFoundError('Platform cost record was not found')
-      const updated = await prisma.platformCostRecord.update({
-        where: { id: cost.id },
-        data: {
-          actualAmount: input.actualAmount,
-          reconciliationStatus: 'RECONCILED',
-          observedAt: input.observedAt,
-        },
-      })
-      return toCostRecord(updated)
+      return toCostRecord(cost)
     },
 
     async createWebhookSubscription(input) {
       if (input.eventTypes.length === 0) {
         throw new InvalidStateError('Webhook subscription requires an event type')
       }
-      validateWebhookEndpoint(input.endpoint)
+      assertSafeWebhookEndpoint(input.endpoint)
       const eventTypes = [
         ...new Set(input.eventTypes.map((eventType) => eventType.trim())),
       ]
@@ -1059,7 +1163,7 @@ function parseStringArray(value: string): readonly string[] {
   return parsed
 }
 
-function validateWebhookEndpoint(endpoint: string): void {
+export function assertSafeWebhookEndpoint(endpoint: string): void {
   let parsed: URL
   try {
     parsed = new URL(endpoint)
@@ -1075,6 +1179,57 @@ function validateWebhookEndpoint(endpoint: string): void {
       'Webhook endpoint must use HTTPS without embedded credentials',
     )
   }
+  const hostname = parsed.hostname.replace(/^\[|\]$/gu, '').toLowerCase()
+  if (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal') ||
+    isPrivateWebhookIp(hostname)
+  ) {
+    throw new ValidationError('Webhook endpoint must resolve to a public address')
+  }
+}
+
+function isPrivateWebhookIp(hostname: string): boolean {
+  const version = isIP(hostname)
+  if (version === 4) {
+    const octets = hostname.split('.').map(Number)
+    if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet))) {
+      return true
+    }
+    const [first, second] = octets
+    if (first === undefined || second === undefined) return true
+    return (
+      first === 0 ||
+      first === 10 ||
+      first === 127 ||
+      (first === 100 && second >= 64 && second <= 127) ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 0) ||
+      (first === 192 && second === 168) ||
+      (first === 198 && (second === 18 || second === 19)) ||
+      first >= 224
+    )
+  }
+  if (version === 6) {
+    return (
+      hostname === '::' ||
+      hostname === '::1' ||
+      hostname.startsWith('fc') ||
+      hostname.startsWith('fd') ||
+      hostname.startsWith('fe8') ||
+      hostname.startsWith('fe9') ||
+      hostname.startsWith('fea') ||
+      hostname.startsWith('feb') ||
+      hostname.startsWith('::ffff:10.') ||
+      hostname.startsWith('::ffff:127.') ||
+      hostname.startsWith('::ffff:192.168.') ||
+      hostname.startsWith('::ffff:169.254.')
+    )
+  }
+  return false
 }
 
 function randomId(): string {
