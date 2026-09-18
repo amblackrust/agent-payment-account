@@ -129,7 +129,36 @@ describe('API foundation', () => {
 
   it('serves a V2 payment through the authenticated HTTP contract', async () => {
     const getPayment = vi.fn(async () => ({}) as never)
-    const serialize = vi.fn(async () => ({ payment_id: 'pay_1', status: 'ROUTING' }))
+    const serializedPayment = {
+      id: 'pay_1',
+      kind: 'PAY',
+      recipient_id: 'recipient_1',
+      description: null,
+      external_reference: null,
+      metadata: {},
+      amount: '1.25',
+      denomination_id: 'usd',
+      denomination_symbol: 'USD',
+      status: 'ROUTING',
+      policy_decision: 'ALLOW',
+      policy_reason_codes: [],
+      approval_state: 'NOT_REQUIRED',
+      attempt_count: 1,
+      reservation_status: 'HELD',
+      route_id: 'route_1',
+      route_selection_reason: 'preferred',
+      settlement_asset_id: 'asset_usdc',
+      execution_state: 'QUEUED',
+      settlement_state: 'NOT_SUBMITTED',
+      outcome_state: 'NONE',
+      created_at: '2026-09-18T00:00:00.000Z',
+      updated_at: '2026-09-18T00:00:00.000Z',
+      confirmed_at: null,
+      failure_code: null,
+      failure_message: null,
+      original_payment_id: null,
+    }
+    const serialize = vi.fn(async () => serializedPayment)
     const consumeRateLimit = vi.fn(async () => ({
       allowed: true,
       count: 1,
@@ -158,7 +187,7 @@ describe('API foundation', () => {
     })
 
     expect(response.statusCode).toBe(200)
-    expect(response.json()).toEqual({ payment_id: 'pay_1', status: 'ROUTING' })
+    expect(response.json()).toEqual(serializedPayment)
     expect(getPayment).toHaveBeenCalledWith('acct_1', 'pay_1')
     expect(serialize).toHaveBeenCalledOnce()
     expect(consumeRateLimit).not.toHaveBeenCalled()

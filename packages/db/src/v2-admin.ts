@@ -9,6 +9,7 @@ import {
   type AgentAccountLifecycleStatus,
 } from '@agent-payment/core'
 import type { Prisma, PrismaClient } from './generated/client/client.js'
+import { enqueueWebhookEvent } from './webhook-events.js'
 
 export interface V2AccountRecord {
   readonly id: string
@@ -449,6 +450,31 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             },
           })
         }
+        await enqueueWebhookEvent(transaction, {
+          accountId: account.id,
+          resourceType: 'ACCOUNT',
+          resourceId: account.id,
+          resourceVersion: account.rowVersion,
+          eventType: 'account.created',
+          resource: {
+            id: account.id,
+            name: account.name,
+            status: account.status,
+          },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: account.id,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          resourceVersion: credential.rowVersion,
+          eventType: 'credential.created',
+          resource: {
+            id: credential.id,
+            account_id: credential.accountId,
+            status: credential.status,
+            scopes: input.scopes,
+          },
+        })
         await transaction.idempotencyRecord.create({
           data: {
             id: createId('idem'),
@@ -519,6 +545,22 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             reference: input.reference,
             createdAt: input.createdAt,
             ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+          },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: request.accountId,
+          resourceType: 'RECEIVE_REQUEST',
+          resourceId: request.id,
+          resourceVersion: 1,
+          eventType: 'receive_request.created',
+          resource: {
+            id: request.id,
+            account_id: request.accountId,
+            amount_atomic: request.amountAtomic?.toString() ?? null,
+            denomination_id: request.denominationId,
+            reference: request.reference,
+            status: request.status,
+            expires_at: request.expiresAt?.toISOString() ?? null,
           },
         })
         await transaction.idempotencyRecord.create({
@@ -632,9 +674,23 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             }),
           },
         })
-        return transaction.agentAccount.findUniqueOrThrow({
+        const updatedAccount = await transaction.agentAccount.findUniqueOrThrow({
           where: { id: input.accountId },
         })
+        await enqueueWebhookEvent(transaction, {
+          accountId: updatedAccount.id,
+          resourceType: 'ACCOUNT',
+          resourceId: updatedAccount.id,
+          resourceVersion: updatedAccount.rowVersion,
+          eventType: 'account.updated',
+          resource: {
+            id: updatedAccount.id,
+            name: updatedAccount.name,
+            status: updatedAccount.status,
+            reason: input.reason ?? null,
+          },
+        })
+        return updatedAccount
       })
       return toAccountRecord(result)
     },
@@ -674,6 +730,21 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
         if (revoked.count !== 1) {
           throw new NotFoundError('Credential was not found or already revoked')
         }
+        const revokedCredential = await transaction.apiCredential.findUniqueOrThrow({
+          where: { id: oldCredential.id },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: revokedCredential.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: revokedCredential.id,
+          resourceVersion: revokedCredential.rowVersion,
+          eventType: 'credential.revoked',
+          resource: {
+            id: revokedCredential.id,
+            account_id: revokedCredential.accountId,
+            status: revokedCredential.status,
+          },
+        })
         await transaction.credentialRecoveryEnvelope.upsert({
           where: { idempotencyKey: input.recoveryIdempotencyKey },
           create: {
@@ -687,21 +758,52 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           },
           update: {},
         })
+        await enqueueWebhookEvent(transaction, {
+          accountId: newCredential.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: newCredential.id,
+          resourceVersion: newCredential.rowVersion,
+          eventType: 'credential.rotated',
+          resource: {
+            id: newCredential.id,
+            account_id: newCredential.accountId,
+            status: newCredential.status,
+            scopes: input.scopes,
+            rotated_from_id: oldCredential.id,
+          },
+        })
         return toCredentialRecord(newCredential)
       })
     },
 
     async revokeCredential(accountId, credentialId) {
-      const result = await prisma.apiCredential.updateMany({
-        where: { id: credentialId, accountId, revokedAt: null },
-        data: {
-          status: 'REVOKED',
-          revokedAt: new Date(),
-          rowVersion: { increment: 1 },
-        },
+      await prisma.$transaction(async (transaction) => {
+        const result = await transaction.apiCredential.updateMany({
+          where: { id: credentialId, accountId, revokedAt: null },
+          data: {
+            status: 'REVOKED',
+            revokedAt: new Date(),
+            rowVersion: { increment: 1 },
+          },
+        })
+        if (result.count !== 1)
+          throw new NotFoundError('Credential was not found or already revoked')
+        const credential = await transaction.apiCredential.findUniqueOrThrow({
+          where: { id: credentialId },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          resourceVersion: credential.rowVersion,
+          eventType: 'credential.revoked',
+          resource: {
+            id: credential.id,
+            account_id: credential.accountId,
+            status: credential.status,
+          },
+        })
       })
-      if (result.count !== 1)
-        throw new NotFoundError('Credential was not found or already revoked')
     },
 
     async listSpendPolicies(accountId) {
@@ -720,7 +822,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           orderBy: { version: 'desc' },
           select: { version: true },
         })
-        return transaction.spendPolicy.create({
+        const created = await transaction.spendPolicy.create({
           data: {
             id: input.id,
             accountId: input.accountId,
@@ -736,6 +838,21 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             rulesJson: input.rulesJson,
           },
         })
+        await enqueueWebhookEvent(transaction, {
+          accountId: created.accountId,
+          resourceType: 'SPEND_POLICY',
+          resourceId: created.id,
+          resourceVersion: created.version,
+          eventType: 'policy.created',
+          resource: {
+            id: created.id,
+            account_id: created.accountId,
+            version: created.version,
+            status: created.status,
+            denomination_id: created.denominationId,
+          },
+        })
+        return created
       })
       return toSpendPolicyAdminRecord(policy)
     },
@@ -802,6 +919,21 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             }),
           },
         })
+        await enqueueWebhookEvent(transaction, {
+          accountId: created.accountId,
+          resourceType: 'SPEND_POLICY',
+          resourceId: created.id,
+          resourceVersion: created.version,
+          eventType: 'policy.updated',
+          resource: {
+            id: created.id,
+            account_id: created.accountId,
+            version: created.version,
+            status: created.status,
+            denomination_id: created.denominationId,
+            previous_version: active?.version ?? null,
+          },
+        })
         return created
       })
       return toSpendPolicyAdminRecord(policy)
@@ -839,6 +971,20 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             source: 'V2_POLICY_ADMIN',
             occurredAt: new Date(),
             newStateJson: JSON.stringify({ version: activated.version }),
+          },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: activated.accountId,
+          resourceType: 'SPEND_POLICY',
+          resourceId: activated.id,
+          resourceVersion: activated.version,
+          eventType: 'policy.activated',
+          resource: {
+            id: activated.id,
+            account_id: activated.accountId,
+            version: activated.version,
+            status: activated.status,
+            denomination_id: activated.denominationId,
           },
         })
         return toSpendPolicyAdminRecord(activated)
@@ -985,6 +1131,36 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             }),
           },
         })
+        const updatedPayment = await transaction.payment.findUniqueOrThrow({
+          where: { id: payment.id },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: input.accountId,
+          resourceType: 'APPROVAL',
+          resourceId: updated.id,
+          resourceVersion: updated.rowVersion,
+          eventType: 'approval.updated',
+          resource: {
+            id: updated.id,
+            payment_id: updated.paymentId,
+            account_id: updated.accountId,
+            status: updated.status,
+            actor_id: updated.actorId,
+          },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: updatedPayment.payerAccountId,
+          resourceType: 'PAYMENT',
+          resourceId: updatedPayment.id,
+          resourceVersion: updatedPayment.rowVersion,
+          eventType: 'payment.updated',
+          resource: {
+            id: updatedPayment.id,
+            status: updatedPayment.status,
+            amount_atomic: updatedPayment.amountAtomic.toString(),
+            denomination_id: updatedPayment.denominationId,
+          },
+        })
         return toApprovalAdminRecord(updated)
       })
     },
@@ -1000,7 +1176,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     async createApprovedDestination(input) {
       const destination = await prisma.$transaction(async (transaction) => {
         await lockAgentAccount(transaction, input.accountId)
-        return transaction.approvedDestination.create({
+        const created = await transaction.approvedDestination.create({
           data: {
             id: input.id,
             accountId: input.accountId,
@@ -1013,20 +1189,59 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             ...(input.reason === undefined ? {} : { reason: input.reason }),
           },
         })
+        await enqueueWebhookEvent(transaction, {
+          accountId: created.accountId,
+          resourceType: 'APPROVED_DESTINATION',
+          resourceId: created.id,
+          resourceVersion: 1,
+          eventType: 'destination.created',
+          resource: {
+            id: created.id,
+            account_id: created.accountId,
+            fingerprint: created.fingerprint,
+            rail: created.rail,
+            network: created.network,
+            asset_reference: created.assetReference,
+            destination: created.destination,
+            status: created.status,
+          },
+        })
+        return created
       })
       return toApprovedDestinationRecord(destination)
     },
 
     async revokeApprovedDestination(input) {
-      const result = await prisma.$transaction(async (transaction) => {
+      await prisma.$transaction(async (transaction) => {
         await lockAgentAccount(transaction, input.accountId)
-        return transaction.approvedDestination.updateMany({
+        const result = await transaction.approvedDestination.updateMany({
           where: { id: input.id, accountId: input.accountId, status: 'ACTIVE' },
           data: { status: 'REVOKED', revokedAt: new Date(), reason: input.reason },
         })
+        if (result.count !== 1)
+          throw new NotFoundError('Approved destination was not found')
+        const destination = await transaction.approvedDestination.findUniqueOrThrow({
+          where: { id: input.id },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: destination.accountId,
+          resourceType: 'APPROVED_DESTINATION',
+          resourceId: destination.id,
+          resourceVersion: 2,
+          eventType: 'destination.revoked',
+          resource: {
+            id: destination.id,
+            account_id: destination.accountId,
+            fingerprint: destination.fingerprint,
+            rail: destination.rail,
+            network: destination.network,
+            asset_reference: destination.assetReference,
+            destination: destination.destination,
+            status: destination.status,
+            reason: destination.reason,
+          },
+        })
       })
-      if (result.count !== 1)
-        throw new NotFoundError('Approved destination was not found')
     },
 
     async findFundingDestination(accountId, routeId) {

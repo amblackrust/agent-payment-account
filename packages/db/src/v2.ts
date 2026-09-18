@@ -16,6 +16,7 @@ import {
   type SettlementRoute,
 } from '@agent-payment/core'
 import type { Prisma, PrismaClient } from './generated/client/client.js'
+import { enqueueWebhookEvent } from './webhook-events.js'
 
 export interface V2DenominationRecord {
   readonly id: string
@@ -714,17 +715,34 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     },
 
     async archiveRecipient(input) {
-      const result = await prisma.recipient.updateMany({
-        where: {
-          id: input.recipientId,
-          ownerAccountId: input.ownerAccountId,
-          archivedAt: null,
-          rowVersion: input.rowVersion,
-        },
-        data: { archivedAt: new Date(), rowVersion: { increment: 1 } },
+      await prisma.$transaction(async (transaction) => {
+        const result = await transaction.recipient.updateMany({
+          where: {
+            id: input.recipientId,
+            ownerAccountId: input.ownerAccountId,
+            archivedAt: null,
+            rowVersion: input.rowVersion,
+          },
+          data: { archivedAt: new Date(), rowVersion: { increment: 1 } },
+        })
+        if (result.count !== 1)
+          throw new ConflictError('Recipient changed concurrently or is archived')
+        const recipient = await transaction.recipient.findUniqueOrThrow({
+          where: { id: input.recipientId },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: recipient.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: recipient.id,
+          resourceVersion: recipient.rowVersion,
+          eventType: 'recipient.archived',
+          resource: {
+            id: recipient.id,
+            account_id: recipient.ownerAccountId,
+            archived_at: recipient.archivedAt?.toISOString() ?? null,
+          },
+        })
       })
-      if (result.count !== 1)
-        throw new ConflictError('Recipient changed concurrently or is archived')
     },
 
     async createApprovedDestination(input) {
@@ -2374,47 +2392,17 @@ async function enqueuePaymentWebhookEvent(
     readonly denominationId: string | null
   },
 ): Promise<void> {
-  const eventId = `payment:${input.paymentId}:${input.resourceVersion}:${input.eventType}`
-  const existing = await transaction.webhookEvent.findUnique({ where: { eventId } })
-  if (existing !== null) return
-  const event = await transaction.webhookEvent.create({
-    data: {
-      id: `webhook_${randomId()}`,
-      eventId,
-      resourceType: 'PAYMENT',
-      resourceId: input.paymentId,
-      resourceVersion: input.resourceVersion,
-      eventType: input.eventType,
-      eventVersion: 'v2',
-      rawBody: JSON.stringify({
-        id: eventId,
-        type: input.eventType,
-        version: 'v2',
-        resource: {
-          id: input.paymentId,
-          status: input.status,
-          amount_atomic: input.amountAtomic.toString(),
-          denomination_id: input.denominationId,
-        },
-      }),
+  await enqueueWebhookEvent(transaction, {
+    accountId: input.accountId,
+    resourceType: 'PAYMENT',
+    resourceId: input.paymentId,
+    resourceVersion: input.resourceVersion,
+    eventType: input.eventType,
+    resource: {
+      id: input.paymentId,
+      status: input.status,
+      amount_atomic: input.amountAtomic.toString(),
+      denomination_id: input.denominationId,
     },
   })
-  const subscriptions = await transaction.webhookSubscription.findMany({
-    where: { accountId: input.accountId, status: 'ACTIVE' },
-  })
-  for (const subscription of subscriptions) {
-    const eventTypes = parseStringArray(
-      subscription.eventTypesJson,
-      'webhook event types',
-    )
-    if (!eventTypes.includes(input.eventType) && !eventTypes.includes('*')) continue
-    await transaction.webhookDelivery.create({
-      data: {
-        id: `delivery_${randomId()}`,
-        eventId: event.eventId,
-        subscriptionId: subscription.id,
-        deliveryNumber: 1,
-      },
-    })
-  }
 }

@@ -46,6 +46,99 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('emits durable webhook events for non-payment resources and incoming facts', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const subscriptionId = `sub_${randomUUID().replaceAll('-', '')}`
+      const recipientId = `rcpt_${randomUUID().replaceAll('-', '')}`
+      const incomingId = `in_${randomUUID().replaceAll('-', '')}`
+      let sqlConnected = false
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'webhook-integration-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.v2Operations.createWebhookSubscription({
+          id: subscriptionId,
+          accountId,
+          endpoint: 'https://merchant.example.test/webhook',
+          eventTypes: ['recipient.created', 'incoming.created'],
+          signingKeyRef: 'secret/webhook/integration',
+          signingKeyVersion: 1,
+        })
+        await database.createRecipient({
+          id: recipientId,
+          ownerAccountId: accountId,
+          displayName: 'Webhook recipient',
+          type: 'BUSINESS',
+          destination: {
+            id: `dest_${randomUUID().replaceAll('-', '')}`,
+            rail: 'SOLANA_SPL',
+            type: 'SOLANA_SPL',
+            walletAddress: 'webhook-recipient-wallet',
+          },
+        })
+        await database.createIncomingPayment({
+          id: incomingId,
+          accountId,
+          signature: `webhook-signature-${randomUUID()}`,
+          amountAtomic: 100n,
+          currency: 'USD',
+          reference: 'webhook-incoming',
+          tokenAccount: 'webhook-token-account',
+          settlementMint: 'webhook-settlement-mint',
+          confirmedAt: new Date('2026-09-18T00:00:00.000Z'),
+        })
+
+        await sql.connect()
+        sqlConnected = true
+        const result = await sql.query<{
+          event_type: string
+          resource_type: string
+          delivery_id: string
+          raw_body: string
+        }>(
+          `SELECT event.event_type, event.resource_type, delivery.id AS delivery_id,
+                  event.raw_body
+             FROM webhook_events event
+             JOIN webhook_deliveries delivery ON delivery.event_id = event.event_id
+             JOIN webhook_subscriptions subscription
+               ON subscription.id = delivery.subscription_id
+            WHERE subscription.account_id = $1
+            ORDER BY event.created_at, event.event_id`,
+          [accountId],
+        )
+
+        expect(result.rows.map((row) => row.event_type)).toEqual([
+          'recipient.created',
+          'incoming.created',
+        ])
+        expect(result.rows.map((row) => row.resource_type)).toEqual([
+          'RECIPIENT',
+          'INCOMING_PAYMENT',
+        ])
+        expect(new Set(result.rows.map((row) => row.delivery_id)).size).toBe(2)
+        expect(JSON.parse(result.rows[1]?.raw_body ?? '{}')).toMatchObject({
+          type: 'incoming.created',
+          version: 'v2',
+          resource: { id: incomingId, receive_request_id: null },
+        })
+      } finally {
+        if (sqlConnected) await sql.end()
+        await database.disconnect()
+      }
+    })
+
     it('allows only one concurrent credential rotation to revoke the active source', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`

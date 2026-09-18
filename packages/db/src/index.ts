@@ -17,6 +17,7 @@ import {
   createV2OperationsRepository,
   type V2OperationsRepository,
 } from './v2-operations.js'
+import { enqueueWebhookEvent } from './webhook-events.js'
 
 const MAX_INCOMING_ISSUE_RETRIES = 8
 export { createV2DatabaseRepository } from './v2.js'
@@ -25,6 +26,7 @@ export {
   assertSafeWebhookEndpoint,
   createV2OperationsRepository,
 } from './v2-operations.js'
+export { enqueueWebhookEvent } from './webhook-events.js'
 export type {
   V2AccountRecord,
   V2AdminRepository,
@@ -822,6 +824,14 @@ async function matchIncomingPaymentInTransaction(
   if (requestResult.count !== 1) {
     throw new ConflictError('Receive request was claimed concurrently')
   }
+  const matchedIncoming = await transaction.incomingPayment.findUniqueOrThrow({
+    where: { id: input.incomingPaymentId },
+  })
+  const matchedRequest = await transaction.receiveRequest.findUniqueOrThrow({
+    where: { id: requestId },
+  })
+  await enqueueIncomingPaymentWebhookEvent(transaction, matchedIncoming, 'updated', 2)
+  await enqueueReceiveRequestWebhookEvent(transaction, matchedRequest, 'updated', 2)
   return requestId
 }
 
@@ -1026,31 +1036,48 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       return account?.solanaPublicKey ?? null
     },
     async createRecipient(input): Promise<RecipientRecord> {
-      const recipient = await prisma.recipient.create({
-        data: {
-          id: input.id,
-          ownerAccountId: input.ownerAccountId,
-          displayName: input.displayName,
-          type: input.type,
-          ...(input.managedAccountId === undefined
-            ? {}
-            : { managedAccountId: input.managedAccountId }),
-          destinations: {
-            create: {
-              id: input.destination.id,
-              rail: input.destination.rail,
-              type: input.destination.type,
-              walletAddress: input.destination.walletAddress,
-              ...(input.destination.network === undefined
-                ? {}
-                : { network: input.destination.network }),
-              ...(input.destination.assetReference === undefined
-                ? {}
-                : { assetReference: input.destination.assetReference }),
+      const recipient = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.recipient.create({
+          data: {
+            id: input.id,
+            ownerAccountId: input.ownerAccountId,
+            displayName: input.displayName,
+            type: input.type,
+            ...(input.managedAccountId === undefined
+              ? {}
+              : { managedAccountId: input.managedAccountId }),
+            destinations: {
+              create: {
+                id: input.destination.id,
+                rail: input.destination.rail,
+                type: input.destination.type,
+                walletAddress: input.destination.walletAddress,
+                ...(input.destination.network === undefined
+                  ? {}
+                  : { network: input.destination.network }),
+                ...(input.destination.assetReference === undefined
+                  ? {}
+                  : { assetReference: input.destination.assetReference }),
+              },
             },
           },
-        },
-        include: { destinations: true, ownerAccount: { select: { status: true } } },
+          include: { destinations: true, ownerAccount: { select: { status: true } } },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: created.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: created.id,
+          resourceVersion: created.rowVersion,
+          eventType: 'recipient.created',
+          resource: {
+            id: created.id,
+            account_id: created.ownerAccountId,
+            display_name: created.displayName,
+            type: created.type,
+            managed_account_id: created.managedAccountId,
+          },
+        })
+        return created
       })
       return toRecipientRecord(recipient)
     },
@@ -1156,7 +1183,22 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ownerAccount: { select: { status: true } },
           },
         })
-        return recipient === null ? null : toRecipientRecord(recipient)
+        if (recipient === null) return null
+        await enqueueWebhookEvent(transaction, {
+          accountId: recipient.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: recipient.id,
+          resourceVersion: recipient.rowVersion ?? 1,
+          eventType: 'recipient.updated',
+          resource: {
+            id: recipient.id,
+            account_id: recipient.ownerAccountId,
+            display_name: recipient.displayName,
+            type: recipient.type,
+            managed_account_id: recipient.managedAccountId,
+          },
+        })
+        return toRecipientRecord(recipient)
       })
     },
     async createPaymentWithReservation(
@@ -1876,24 +1918,28 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     },
     async createReceiveRequest(input): Promise<ReceiveRequestRecord> {
       try {
-        const request = await prisma.receiveRequest.create({
-          data: {
-            id: input.id,
-            accountId: input.accountId,
-            ...(input.amountAtomic === undefined
-              ? {}
-              : { amountAtomic: input.amountAtomic }),
-            ...(input.denominationId === undefined
-              ? {}
-              : { denominationId: input.denominationId }),
-            ...(input.amountScale === undefined
-              ? {}
-              : { amountScale: input.amountScale }),
-            currency: input.currency,
-            reference: input.reference,
-            ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
-            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-          },
+        const request = await prisma.$transaction(async (transaction) => {
+          const created = await transaction.receiveRequest.create({
+            data: {
+              id: input.id,
+              accountId: input.accountId,
+              ...(input.amountAtomic === undefined
+                ? {}
+                : { amountAtomic: input.amountAtomic }),
+              ...(input.denominationId === undefined
+                ? {}
+                : { denominationId: input.denominationId }),
+              ...(input.amountScale === undefined
+                ? {}
+                : { amountScale: input.amountScale }),
+              currency: input.currency,
+              reference: input.reference,
+              ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
+              ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+            },
+          })
+          await enqueueReceiveRequestWebhookEvent(transaction, created, 'created', 1)
+          return created
         })
         return toReceiveRequestRecord(request)
       } catch (error) {
@@ -1935,24 +1981,48 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       return requests.map(toReceiveRequestRecord)
     },
     async expireOpenReceiveRequests(accountId, now) {
-      await prisma.receiveRequest.updateMany({
-        where: { accountId, status: 'OPEN', expiresAt: { lte: now } },
-        data: { status: 'EXPIRED' },
+      await prisma.$transaction(async (transaction) => {
+        const expiring = await transaction.receiveRequest.findMany({
+          where: { accountId, status: 'OPEN', expiresAt: { lte: now } },
+          select: { id: true },
+        })
+        for (const request of expiring) {
+          const updated = await transaction.receiveRequest.updateMany({
+            where: { id: request.id, status: 'OPEN' },
+            data: { status: 'EXPIRED' },
+          })
+          if (updated.count !== 1) continue
+          await enqueueReceiveRequestWebhookEvent(
+            transaction,
+            await transaction.receiveRequest.findUniqueOrThrow({
+              where: { id: request.id },
+            }),
+            'expired',
+            2,
+          )
+        }
       })
     },
     async cancelReceiveRequest(accountId, id, now = new Date()) {
-      const result = await prisma.receiveRequest.updateMany({
-        where: { id, accountId, status: 'OPEN' },
-        data: { status: 'CANCELLED', updatedAt: now },
-      })
-      if (result.count !== 1) {
-        const current = await prisma.receiveRequest.findFirst({
-          where: { id, accountId },
+      const request = await prisma.$transaction(async (transaction) => {
+        const result = await transaction.receiveRequest.updateMany({
+          where: { id, accountId, status: 'OPEN' },
+          data: { status: 'CANCELLED', updatedAt: now },
         })
-        if (current === null) throw new ValidationError('Receive request was not found')
-        throw new ConflictError('Receive request is already terminal')
-      }
-      const request = await prisma.receiveRequest.findUniqueOrThrow({ where: { id } })
+        if (result.count !== 1) {
+          const current = await transaction.receiveRequest.findFirst({
+            where: { id, accountId },
+          })
+          if (current === null)
+            throw new ValidationError('Receive request was not found')
+          throw new ConflictError('Receive request is already terminal')
+        }
+        const updated = await transaction.receiveRequest.findUniqueOrThrow({
+          where: { id },
+        })
+        await enqueueReceiveRequestWebhookEvent(transaction, updated, 'cancelled', 2)
+        return updated
+      })
       return toReceiveRequestRecord(request)
     },
     async matchIncomingPayment(input): Promise<string | null> {
@@ -2241,6 +2311,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             confirmedAt: input.confirmedAt,
           },
         })
+        await enqueueIncomingPaymentWebhookEvent(transaction, incoming, 'created', 1)
         await matchIncomingPaymentInTransaction(transaction, {
           incomingPaymentId: incoming.id,
           accountId: input.accountId,
@@ -2248,12 +2319,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           reference: input.reference ?? null,
           confirmedAt: input.confirmedAt,
         })
+        const createdPayment = await transaction.incomingPayment.findUniqueOrThrow({
+          where: { id: incoming.id },
+        })
         return {
-          payment: toIncomingPaymentRecord(
-            await transaction.incomingPayment.findUniqueOrThrow({
-              where: { id: incoming.id },
-            }),
-          ),
+          payment: toIncomingPaymentRecord(createdPayment),
           created: true,
         }
       })
@@ -2305,7 +2375,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             reference: candidate.reference,
             confirmedAt: candidate.confirmed_at,
           })
-          if (requestId !== null) matched += 1
+          if (requestId !== null) {
+            matched += 1
+          }
         }
         return matched
       })
@@ -2521,6 +2593,78 @@ function parseCredentialScopes(value: string): readonly string[] {
     throw new Error('Credential scopes are not a string array')
   }
   return parsed
+}
+
+async function enqueueReceiveRequestWebhookEvent(
+  transaction: Prisma.TransactionClient,
+  request: {
+    readonly id: string
+    readonly accountId: string
+    readonly amountAtomic: bigint | null
+    readonly denominationId: string | null
+    readonly reference: string
+    readonly status: string
+    readonly expiresAt: Date | null
+    readonly paidAt: Date | null
+    readonly matchedIncomingPaymentId: string | null
+  },
+  transition: 'created' | 'updated' | 'expired' | 'cancelled',
+  resourceVersion: number,
+): Promise<void> {
+  await enqueueWebhookEvent(transaction, {
+    accountId: request.accountId,
+    resourceType: 'RECEIVE_REQUEST',
+    resourceId: request.id,
+    resourceVersion,
+    eventType: `receive_request.${transition}`,
+    resource: {
+      id: request.id,
+      account_id: request.accountId,
+      amount_atomic: request.amountAtomic?.toString() ?? null,
+      denomination_id: request.denominationId,
+      reference: request.reference,
+      status: request.status,
+      expires_at: request.expiresAt?.toISOString() ?? null,
+      paid_at: request.paidAt?.toISOString() ?? null,
+      matched_incoming_payment_id: request.matchedIncomingPaymentId,
+    },
+  })
+}
+
+async function enqueueIncomingPaymentWebhookEvent(
+  transaction: Prisma.TransactionClient,
+  payment: {
+    readonly id: string
+    readonly accountId: string
+    readonly signature: string
+    readonly amountAtomic: bigint
+    readonly currency: string
+    readonly reference: string | null
+    readonly status: string
+    readonly confirmedAt: Date
+    readonly receiveRequestId: string | null
+  },
+  transition: 'created' | 'updated',
+  resourceVersion: number,
+): Promise<void> {
+  await enqueueWebhookEvent(transaction, {
+    accountId: payment.accountId,
+    resourceType: 'INCOMING_PAYMENT',
+    resourceId: payment.id,
+    resourceVersion,
+    eventType: `incoming.${transition}`,
+    resource: {
+      id: payment.id,
+      account_id: payment.accountId,
+      signature: payment.signature,
+      amount_atomic: payment.amountAtomic.toString(),
+      currency: payment.currency,
+      reference: payment.reference,
+      status: payment.status,
+      confirmed_at: payment.confirmedAt.toISOString(),
+      receive_request_id: payment.receiveRequestId,
+    },
+  })
 }
 
 function toPaymentRecord(payment: {
