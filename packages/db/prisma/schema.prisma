@@ -103,6 +103,17 @@ model AgentAccount {
   indexerCheckpoints      IndexerCheckpoint[]
   incomingIssues          IncomingReconciliationIssue[]
   recoveryEnvelopes       CredentialRecoveryEnvelope[]
+  spendPolicies           SpendPolicy[]
+  policyDecisions         PolicyDecision[]
+  approvedDestinations    ApprovedDestination[]
+  custodyKeyVersions      CustodyKeyVersion[]
+  operationTimelineEvents OperationTimelineEvent[]
+  platformCostRecords     PlatformCostRecord[]
+  operationalExceptions   OperationalException[]
+  webhookSubscriptions   WebhookSubscription[]
+  fundingDestinations     FundingDestination[]
+  approvals               Approval[]
+  managedRecipientPayments Payment[]             @relation("ManagedRecipientPayments")
 
   @@index([workspaceId])
   @@map("agent_accounts")
@@ -122,6 +133,9 @@ model ApiCredential {
   revokedAt     DateTime?             @map("revoked_at")
   lastUsedAt    DateTime?             @map("last_used_at")
   account       AgentAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  rotatedFrom   ApiCredential?        @relation("CredentialRotation", fields: [rotatedFromId], references: [id], onDelete: Restrict)
+  rotations     ApiCredential[]       @relation("CredentialRotation")
+  recoveryEnvelopes CredentialRecoveryEnvelope[]
 
   @@index([accountId])
   @@map("api_credentials")
@@ -138,6 +152,7 @@ model CredentialRecoveryEnvelope {
   acknowledgedAt DateTime?    @map("acknowledged_at")
   createdAt      DateTime     @default(now()) @map("created_at")
   account        AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  credential     ApiCredential @relation(fields: [credentialId], references: [id], onDelete: Restrict)
 
   @@index([accountId, expiresAt])
   @@map("credential_recovery_envelopes")
@@ -226,11 +241,21 @@ model Payment {
   recoveryCount             Int                  @default(0) @map("recovery_count")
   stuckSince                DateTime?            @map("stuck_since")
   payerAccount              AgentAccount         @relation("PayerPayments", fields: [payerAccountId], references: [id], onDelete: Restrict)
+  managedRecipientAccount   AgentAccount?        @relation("ManagedRecipientPayments", fields: [recipientManagedAccountId], references: [id], onDelete: Restrict)
   recipient                 Recipient?           @relation(fields: [recipientId], references: [id], onDelete: Restrict)
   originalPayment           Payment?             @relation("PaymentRefunds", fields: [originalPaymentId], references: [id], onDelete: Restrict)
   refunds                   Payment[]            @relation("PaymentRefunds")
   attempts                  PaymentAttempt[]
   reservation               OutgoingReservation?
+  denomination              Denomination?        @relation(fields: [denominationId], references: [id], onDelete: Restrict)
+  settlementAsset           SettlementAsset?     @relation(fields: [settlementAssetId], references: [id], onDelete: Restrict)
+  economicMapping           EconomicMapping?     @relation(fields: [economicMappingId], references: [id], onDelete: Restrict)
+  settlementRoute           SettlementRoute?     @relation(fields: [routeId], references: [id], onDelete: Restrict)
+  policyDecisionRecord      PolicyDecision?      @relation("PaymentPolicyDecision")
+  approvalRecord            Approval?            @relation("PaymentApproval")
+  evidenceRecords           EvidenceRecord[]
+  signingRequests           SigningRequest[]
+  platformCostRecords       PlatformCostRecord[]
 
   @@index([payerAccountId, createdAt])
   @@index([recipientId, createdAt])
@@ -355,6 +380,9 @@ model PaymentAttempt {
   createdAt                     DateTime             @default(now()) @map("created_at")
   updatedAt                     DateTime             @updatedAt @map("updated_at")
   payment                       Payment              @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  evidenceRecords              EvidenceRecord[]
+  signingRequest               SigningRequest?
+  platformCostRecords          PlatformCostRecord[]
 
   @@unique([paymentId, attemptNumber])
   @@index([paymentId, createdAt])
@@ -427,6 +455,9 @@ model Denomination {
   version   Int      @default(1)
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
+  spendPolicies SpendPolicy[]
+  economicMappings EconomicMapping[]
+  payments Payment[]
 
   @@unique([symbol, version])
   @@map("denominations")
@@ -443,6 +474,11 @@ model SettlementAsset {
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
 
+  economicMappings EconomicMapping[]
+  settlementRoutes SettlementRoute[]
+  payments Payment[]
+  fundingDestinations FundingDestination[]
+
   @@unique([rail, network, assetReference, version])
   @@map("settlement_assets")
 }
@@ -457,6 +493,11 @@ model EconomicMapping {
   version           Int      @default(1)
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @updatedAt @map("updated_at")
+
+  denomination      Denomination      @relation(fields: [denominationId], references: [id], onDelete: Restrict)
+  settlementAsset   SettlementAsset   @relation(fields: [settlementAssetId], references: [id], onDelete: Restrict)
+  settlementRoutes  SettlementRoute[]
+  payments          Payment[]
 
   @@index([denominationId, status])
   @@index([settlementAssetId, status])
@@ -475,6 +516,12 @@ model SettlementRoute {
   configVersion     String   @map("config_version") @db.VarChar(64)
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @updatedAt @map("updated_at")
+
+  settlementAsset     SettlementAsset       @relation(fields: [settlementAssetId], references: [id], onDelete: Restrict)
+  economicMapping     EconomicMapping       @relation(fields: [economicMappingId], references: [id], onDelete: Restrict)
+  payments            Payment[]
+  signingRequests     SigningRequest[]
+  fundingDestinations FundingDestination[]
 
   @@index([status, priority, id])
   @@map("settlement_routes")
@@ -498,6 +545,10 @@ model SpendPolicy {
   activatedAt                 DateTime? @map("activated_at")
   retiredAt                   DateTime? @map("retired_at")
 
+  account          AgentAccount  @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  denomination     Denomination @relation(fields: [denominationId], references: [id], onDelete: Restrict)
+  policyDecisions PolicyDecision[]
+
   @@unique([accountId, version])
   @@index([accountId, status])
   @@map("spend_policies")
@@ -514,6 +565,11 @@ model PolicyDecision {
   contextJson     String   @map("context_json") @db.Text
   fingerprint     String   @db.Char(64)
   createdAt       DateTime @default(now()) @map("created_at")
+
+  payment    Payment      @relation("PaymentPolicyDecision", fields: [paymentId], references: [id], onDelete: Restrict)
+  account    AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  policy     SpendPolicy  @relation(fields: [policyId], references: [id], onDelete: Restrict)
+  approvals  Approval[]
 
   @@index([accountId, createdAt])
   @@map("policy_decisions")
@@ -533,6 +589,8 @@ model ApprovedDestination {
   createdAt      DateTime  @default(now()) @map("created_at")
   revokedAt      DateTime? @map("revoked_at")
 
+  account AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
   @@unique([accountId, fingerprint])
   @@index([accountId, status])
   @@map("approved_destinations")
@@ -551,6 +609,10 @@ model Approval {
   rowVersion       Int       @default(1) @map("row_version")
   createdAt        DateTime  @default(now()) @map("created_at")
   decidedAt        DateTime? @map("decided_at")
+
+  payment       Payment        @relation("PaymentApproval", fields: [paymentId], references: [id], onDelete: Restrict)
+  account       AgentAccount   @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  policyDecision PolicyDecision @relation(fields: [policyDecisionId], references: [id], onDelete: Restrict)
 
   @@index([accountId, status, expiresAt])
   @@map("approvals")
@@ -595,6 +657,9 @@ model EvidenceRecord {
   metadataJson        String   @default("{}") @map("metadata_json") @db.Text
   createdAt           DateTime @default(now()) @map("created_at")
 
+  payment  Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt  PaymentAttempt? @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+
   @@index([paymentId, observedAt])
   @@index([attemptId, observedAt])
   @@map("evidence_records")
@@ -610,6 +675,8 @@ model CustodyKeyVersion {
   status             String    @default("ACTIVE") @db.VarChar(16)
   createdAt          DateTime  @default(now()) @map("created_at")
   retiredAt          DateTime? @map("retired_at")
+
+  account AgentAccount? @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
   @@unique([accountId, keyVersion])
   @@index([status])
@@ -633,6 +700,10 @@ model SigningRequest {
   createdAt        DateTime  @default(now()) @map("created_at")
   completedAt      DateTime? @map("completed_at")
 
+  payment        Payment         @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt        PaymentAttempt  @relation(fields: [attemptId], references: [id], onDelete: Restrict)
+  settlementRoute SettlementRoute @relation(fields: [routeId], references: [id], onDelete: Restrict)
+
   @@index([paymentId, createdAt])
   @@map("signing_requests")
 }
@@ -654,6 +725,8 @@ model OperationTimelineEvent {
   metadataJson  String   @default("{}") @map("metadata_json") @db.Text
   createdAt     DateTime @default(now()) @map("created_at")
 
+  account AgentAccount? @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
   @@index([accountId, occurredAt, id])
   @@index([resourceType, resourceId, occurredAt])
   @@map("operation_timeline_events")
@@ -671,6 +744,10 @@ model PlatformCostRecord {
   observedAt           DateTime? @map("observed_at")
   createdAt            DateTime  @default(now()) @map("created_at")
   updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  account  AgentAccount   @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  payment  Payment?       @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  attempt  PaymentAttempt? @relation(fields: [attemptId], references: [id], onDelete: Restrict)
 
   @@index([accountId, createdAt])
   @@index([paymentId])
@@ -695,6 +772,8 @@ model OperationalException {
   resolvedAt      DateTime? @map("resolved_at")
   rowVersion      Int       @default(1) @map("row_version")
 
+  account AgentAccount? @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
   @@index([status, severity, createdAt])
   @@index([resourceType, resourceId])
   @@map("operational_exceptions")
@@ -710,6 +789,7 @@ model WebhookSubscription {
   signingKeyVersion Int       @map("signing_key_version")
   createdAt         DateTime  @default(now()) @map("created_at")
   archivedAt        DateTime? @map("archived_at")
+  account           AgentAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
   @@index([accountId, status])
   @@map("webhook_subscriptions")
@@ -764,6 +844,9 @@ model FundingDestination {
   lastFailureCode       String?   @map("last_failure_code") @db.VarChar(128)
   createdAt             DateTime  @default(now()) @map("created_at")
   updatedAt             DateTime  @updatedAt @map("updated_at")
+  account               AgentAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  route                 SettlementRoute @relation(fields: [routeId], references: [id], onDelete: Restrict)
+  asset                 SettlementAsset @relation(fields: [assetId], references: [id], onDelete: Restrict)
 
   @@unique([accountId, routeId, assetId])
   @@index([accountId, readiness])
