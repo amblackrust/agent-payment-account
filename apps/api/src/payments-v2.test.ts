@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { V2PaymentService } from './payments-v2.js'
+import { V2PaymentService, type V2RouteCapabilityProvider } from './payments-v2.js'
 import type {
   AuthenticatedAccount,
   V2DatabaseRepository,
@@ -28,7 +28,10 @@ const account: AuthenticatedAccount = {
   },
 }
 
-function createHarness(destinationApproved: boolean) {
+function createHarness(
+  destinationApproved: boolean,
+  routeCapabilityProvider?: V2RouteCapabilityProvider,
+) {
   let captured: V2PaymentCreateInput | undefined
   let latestView: V2PaymentView | undefined
   let existingIdempotency: V2IdempotencyRecord | null = null
@@ -205,6 +208,7 @@ function createHarness(destinationApproved: boolean) {
       }),
     },
     settledBalanceProvider: { getSettledAtomic },
+    ...(routeCapabilityProvider === undefined ? {} : { routeCapabilityProvider }),
     now: () => new Date('2026-09-17T00:00:00.000Z'),
   })
   return {
@@ -218,6 +222,37 @@ function createHarness(destinationApproved: boolean) {
 }
 
 describe('V2 payment service', () => {
+  it('fails closed before policy and reservation work when route capability is unavailable', async () => {
+    const getCapabilities = vi.fn(async (routes: readonly { id: string }[]) =>
+      routes.map((route) => ({
+        routeId: route.id,
+        eligible: false,
+        reason: 'RPC_UNAVAILABLE',
+        observedAt: new Date('2026-09-17T00:00:00.000Z'),
+        identityVersion: 'test-capability',
+      })),
+    )
+    const harness = createHarness(true, { getCapabilities })
+
+    await expect(
+      harness.service.createPayment(
+        account,
+        {
+          kind: 'PAY',
+          recipientId: 'recipient_1',
+          amount: '1.25',
+          denominationId: 'denom_usd',
+        },
+        'capability-key',
+        'req-capability',
+      ),
+    ).rejects.toThrow('No active settlement route is eligible')
+
+    expect(getCapabilities).toHaveBeenCalledOnce()
+    expect(harness.getSettledAtomic).not.toHaveBeenCalled()
+    expect(harness.getCaptured()).toBeUndefined()
+  })
+
   it('creates an allowed payment with an atomic reservation plan', async () => {
     const harness = createHarness(true)
     const result = await harness.service.createPayment(

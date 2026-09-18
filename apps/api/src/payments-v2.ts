@@ -21,6 +21,7 @@ import {
   type Denomination,
   type EconomicMapping,
   type ExactMoney,
+  type RouteCapability,
   type SettlementAsset,
   type SettlementRoute,
   type SpendPolicy,
@@ -47,10 +48,17 @@ export interface V2SettledBalanceProvider {
   }): Promise<bigint>
 }
 
+export interface V2RouteCapabilityProvider {
+  getCapabilities(
+    routes: readonly SettlementRoute[],
+  ): Promise<readonly RouteCapability[]>
+}
+
 export interface V2PaymentServiceOptions {
   readonly repository: V2DatabaseRepository
   readonly recipientRepository: Pick<RecipientRepository, 'findRecipientForOwner'>
   readonly settledBalanceProvider: V2SettledBalanceProvider
+  readonly routeCapabilityProvider?: V2RouteCapabilityProvider
   readonly configuredDefaultRouteId?: string
   readonly approvalTtlSeconds?: number
   readonly maxPageSize?: number
@@ -151,6 +159,20 @@ export class V2PaymentService {
       return { view: existingView, created: false }
     }
     const routes = await this.options.repository.listActiveSettlementRoutes()
+    const capabilities =
+      this.options.routeCapabilityProvider === undefined
+        ? []
+        : await this.options.routeCapabilityProvider.getCapabilities(routes)
+    if (
+      this.options.routeCapabilityProvider !== undefined &&
+      routes.some(
+        (route) => !capabilities.some((capability) => capability.routeId === route.id),
+      )
+    ) {
+      throw new DependencyUnavailableError(
+        'Settlement route capabilities are unavailable',
+      )
+    }
     const routeSelection = selectSettlementRoute(
       {
         ...(input.routePreference === undefined
@@ -161,6 +183,7 @@ export class V2PaymentService {
           : { configuredDefaultRouteId: this.options.configuredDefaultRouteId }),
       },
       routes,
+      capabilities,
     )
     const route = routeSelection.route
     const target =

@@ -25,6 +25,10 @@ inside this codebase.
   versions, settlement asset and economic mapping versions, fee-payer public
   identity, and custody identity. Startup compares structured route identity,
   not only the primary rail and network strings.
+- V2 payment creation performs a fail-closed route capability preflight against
+  the configured Solana rail and durable route/asset/mapping facts before
+  policy reservation work; the transaction revalidates those facts under row
+  locks before creating the payment.
 - Legacy payment writes are routed through the V2 adapter in the production
   server path. The compatibility `PaymentService` class remains available for
   the migration window; its historical read-recovery behavior must be removed

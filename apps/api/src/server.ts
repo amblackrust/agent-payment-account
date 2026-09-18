@@ -9,6 +9,7 @@ import {
   convertFromSettlementAtomicUnits,
   DependencyUnavailableError,
   ExternalRailError,
+  type SettlementRoute,
 } from '@agent-payment/core'
 
 import { buildApp } from './app.js'
@@ -150,12 +151,67 @@ async function startServer(): Promise<void> {
   const transactionService = new TransactionService(database, {
     maxPageSize: limits.maxPageSize,
   })
+  const routeCapabilityProvider = {
+    getCapabilities: async (routes: readonly SettlementRoute[]) => {
+      try {
+        await rail.checkReadiness?.()
+      } catch {
+        throw new DependencyUnavailableError(
+          'Settlement rail capability is unavailable',
+        )
+      }
+      const observedAt = new Date()
+      return Promise.all(
+        routes.map(async (route) => {
+          const [asset, mapping] = await Promise.all([
+            database.v2.findSettlementAsset(route.settlementAssetId),
+            database.v2.findEconomicMapping(route.economicMappingId),
+          ])
+          const reasons: string[] = []
+          if (route.rail !== 'SOLANA_SPL') reasons.push('UNSUPPORTED_RAIL')
+          if (route.network !== config.solanaCluster) reasons.push('NETWORK_MISMATCH')
+          if (asset === null || asset.status !== 'ACTIVE') {
+            reasons.push('SETTLEMENT_ASSET_UNAVAILABLE')
+          } else {
+            if (asset.rail !== route.rail || asset.network !== route.network) {
+              reasons.push('SETTLEMENT_ASSET_MISMATCH')
+            }
+            if (asset.assetReference !== config.solanaSettlementMint) {
+              reasons.push('SETTLEMENT_MINT_MISMATCH')
+            }
+          }
+          if (
+            mapping === null ||
+            mapping.status !== 'ACTIVE' ||
+            mapping.settlementAssetId !== route.settlementAssetId
+          ) {
+            reasons.push('ECONOMIC_MAPPING_UNAVAILABLE')
+          }
+          return {
+            routeId: route.id,
+            eligible: reasons.length === 0,
+            ...(reasons.length === 0 ? {} : { reason: reasons.join(',') }),
+            observedAt,
+            identityVersion: [
+              config.solanaCluster,
+              config.solanaSettlementMint,
+              route.railVersion,
+              route.configVersion,
+              asset?.version ?? 'missing',
+              mapping?.version ?? 'missing',
+            ].join(':'),
+          }
+        }),
+      )
+    },
+  }
   const v2PaymentService = new V2PaymentService({
     repository: database.v2,
     recipientRepository: database,
     settledBalanceProvider: {
       getSettledAtomic: (input) => getLogicalSettledAtomic(rail, input),
     },
+    routeCapabilityProvider,
     maxPageSize: limits.maxPageSize,
   })
   const v2ManagementService = new V2ManagementService({
