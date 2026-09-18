@@ -328,6 +328,8 @@ export class V2OutgoingWorker {
         )
       } else {
         try {
+          if (!(await this.ensureActiveBeforeEffect(claim, view, attempt))) return
+          if (!(await this.ensurePreparedAttemptIsCurrent(claim, prepared))) return
           if (!(await this.acquireCapacity(claim, 'custody'))) return
           signed = await this.options.executor.sign(prepared)
         } catch (error) {
@@ -383,6 +385,13 @@ export class V2OutgoingWorker {
           errorCode: 'PAYMENT_ATTEMPT_NOT_FOUND_AFTER_SIGNING',
           errorSafe: 'Payment attempt disappeared after signing',
         })
+        return
+      }
+      if (
+        currentAttempt.id !== prepared.attemptId ||
+        currentAttempt.preparedEffectHash !== prepared.effectHash
+      ) {
+        await this.options.repository.completeWorkItem(claim.id, this.options.owner)
         return
       }
       if (!(await this.ensureActiveBeforeEffect(claim, currentView, currentAttempt)))
@@ -456,6 +465,29 @@ export class V2OutgoingWorker {
     throw new CustodyUnavailableError(
       'Account is not active for a possible-effect attempt',
     )
+  }
+
+  private async ensurePreparedAttemptIsCurrent(
+    claim: V2WorkItemClaim,
+    prepared: V2PreparedEffect,
+  ): Promise<boolean> {
+    const currentView =
+      claim.accountId === undefined
+        ? null
+        : await this.options.repository.findPaymentView(
+            claim.accountId,
+            prepared.paymentId,
+          )
+    const currentAttempt = currentView?.attempts.at(-1)
+    if (
+      currentAttempt === undefined ||
+      currentAttempt.id !== prepared.attemptId ||
+      currentAttempt.preparedEffectHash !== prepared.effectHash
+    ) {
+      await this.options.repository.completeWorkItem(claim.id, this.options.owner)
+      return false
+    }
+    return true
   }
 
   private async handleSubmissionResult(

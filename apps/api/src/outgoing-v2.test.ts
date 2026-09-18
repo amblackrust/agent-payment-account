@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
+import type { V2PaymentAttemptSnapshot } from '@agent-payment/db'
 import type { V2PaymentView } from '@agent-payment/db'
 import type { V2SigningRequestRecord } from '@agent-payment/db'
 import { WalletSecretCipher } from './custody.js'
@@ -125,6 +127,7 @@ describe('V2 outgoing worker', () => {
     const costEstimates: unknown[] = []
     const reconciledCosts: unknown[] = []
     const baseView = view()
+    let latestAttempt = baseView.attempts[0]
     const signingRequest: V2SigningRequestRecord = {
       id: 'signing_attempt_1',
       paymentId: 'pay_1',
@@ -161,8 +164,34 @@ describe('V2 outgoing worker', () => {
             : null
         return claim
       },
-      findPaymentView: async () => baseView,
-      updateAttemptOutcome: async () => baseView.attempts[0],
+      findPaymentView: async () => ({ ...baseView, attempts: [latestAttempt] }),
+      updateAttemptOutcome: async (input: {
+        preparedEffectHash?: string
+        preparedEffectJson?: string | null
+        signedPayloadHash?: string
+        expectedExternalId?: string
+        signedPayloadEncrypted?: string
+      }) => {
+        latestAttempt = {
+          ...latestAttempt,
+          ...(input.preparedEffectHash === undefined
+            ? {}
+            : { preparedEffectHash: input.preparedEffectHash }),
+          ...(input.preparedEffectJson === undefined
+            ? {}
+            : { preparedEffectJson: input.preparedEffectJson }),
+          ...(input.signedPayloadHash === undefined
+            ? {}
+            : { signedPayloadHash: input.signedPayloadHash }),
+          ...(input.expectedExternalId === undefined
+            ? {}
+            : { expectedExternalId: input.expectedExternalId }),
+          ...(input.signedPayloadEncrypted === undefined
+            ? {}
+            : { signedPayloadEncrypted: input.signedPayloadEncrypted }),
+        } as V2PaymentAttemptSnapshot
+        return latestAttempt
+      },
       updatePaymentExecution: async () => baseView.payment,
       finalizeV2Payment: async (input: Record<string, unknown>) => {
         finalized = true
@@ -244,12 +273,132 @@ describe('V2 outgoing worker', () => {
     expect(signCount).toBe(1)
     expect(finalized).toBe(true)
     expect(finalizedInput?.expectedExternalId).toBe('external-1')
-    expect(finalizedInput?.payloadHash).toBe('a'.repeat(64))
+    expect(finalizedInput?.payloadHash).toBe(
+      createHash('sha256')
+        .update(new Uint8Array([1, 2, 3]))
+        .digest('hex'),
+    )
     expect(finalizedInput?.metadataJson).toContain('prepared_payload_hash')
     expect(costEstimates).toHaveLength(1)
     expect(reconciledCosts).toHaveLength(1)
     expect((reconciledCosts[0] as { actualAmount: bigint }).actualAmount).toBe(4n)
     expect(completed).toBe(true)
+  })
+
+  it('does not sign after an account becomes disabled after preparation', async () => {
+    const preparedEffect = {
+      accountId: 'acct_1',
+      paymentId: 'pay_1',
+      attemptId: 'attempt_1',
+      effectHash: 'a'.repeat(64),
+      routeId: 'route_1',
+      network: 'localnet',
+      assetReference: 'asset_1',
+      destination: 'destination_1',
+      amountAtomic: '100',
+      feePayerIdentity: 'fee-payer-1',
+      keyVersion: 1,
+      payloadHash: 'a'.repeat(64),
+      preparedPayload: '{}',
+    }
+    const preparedView = {
+      ...view(),
+      attempts: [
+        {
+          ...view().attempts[0],
+          status: 'PREPARED',
+          preparedEffectHash: preparedEffect.effectHash,
+          preparedEffectJson: JSON.stringify(preparedEffect),
+        },
+      ],
+    }
+    let claims = 0
+    let statusCalls = 0
+    let aborted = false
+    let completed = false
+    let signed = false
+    const cipher = new WalletSecretCipher(
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    )
+    const signingRequest: V2SigningRequestRecord = {
+      id: 'signing_attempt_1',
+      paymentId: 'pay_1',
+      attemptId: 'attempt_1',
+      effectHash: preparedEffect.effectHash,
+      routeId: 'route_1',
+      network: 'localnet',
+      assetReference: 'asset_1',
+      destination: 'destination_1',
+      amountAtomic: 100n,
+      feePayerIdentity: 'fee-payer-1',
+      keyVersion: 1,
+      status: 'PENDING',
+      serviceIdentity: 'worker-1',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      completedAt: null,
+    }
+    const worker = new V2OutgoingWorker({
+      repository: {
+        claimWorkItem: async () =>
+          claims++ === 0
+            ? {
+                id: 'work_1',
+                kind: 'OUTGOING_PAYMENT_ATTEMPT',
+                resourceType: 'PAYMENT_ATTEMPT',
+                resourceId: 'attempt_1',
+                attemptCount: 1,
+                payloadJson: JSON.stringify({ payment_id: 'pay_1' }),
+                accountId: 'acct_1',
+              }
+            : null,
+        findPaymentView: async () => preparedView,
+        abortPreEffectPayment: async () => {
+          aborted = true
+          return preparedView
+        },
+        completeWorkItem: async () => {
+          completed = true
+        },
+      } as never,
+      accountStatusProvider: {
+        getStatus: async () => {
+          statusCalls += 1
+          return statusCalls === 1 ? 'ACTIVE' : 'DISABLED'
+        },
+      },
+      custody: {
+        findActiveCustodyKeyVersion: async () => ({
+          id: 'key_1',
+          accountId: 'acct_1',
+          keyVersion: 1,
+          backendIdentity: 'test',
+          keyReference: 'key-ref-1',
+          rootKeyFingerprint: 'b'.repeat(64),
+          status: 'ACTIVE',
+        }),
+        findSigningRequest: async () => signingRequest,
+        createSigningRequest: async () => signingRequest,
+        completeSigningRequest: async () => ({ ...signingRequest, status: 'SIGNED' }),
+      },
+      signedPayloadCipher: cipher,
+      executor: {
+        prepare: async () => {
+          throw new Error('durable prepared effect should be restored')
+        },
+        sign: async () => {
+          signed = true
+          throw new Error('must not sign a disabled account')
+        },
+        submit: async () => ({ status: 'UNKNOWN' as const }),
+      },
+      owner: 'worker-1',
+    })
+
+    await worker.runOnce()
+
+    expect(aborted).toBe(true)
+    expect(completed).toBe(true)
+    expect(signed).toBe(false)
   })
 
   it('keeps reconciliation work on the dedicated reconciliation role', async () => {
