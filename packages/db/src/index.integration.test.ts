@@ -4,6 +4,7 @@ import { Client } from 'pg'
 
 import {
   ConflictError,
+  IdempotencyConflictError,
   IdempotencyKeyReusedError,
   NotFoundError,
   RecipientResolutionError,
@@ -334,6 +335,55 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           account: { id: accountId, status: 'ACTIVE' },
           credential: { id: delegatedCredentialId, status: 'ACTIVE' },
         })
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('serializes account provisioning by the global idempotency key', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const idempotencyKey = `account-provision-${randomUUID()}`
+      const requestHash = 'e'.repeat(64)
+      const input = (suffix: string) => {
+        const accountId = `acct_${suffix}_${randomUUID().replaceAll('-', '')}`
+        return {
+          idempotencyKey,
+          requestHash,
+          accountId,
+          name: 'concurrent-provisioned-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: `ciphertext-${suffix}`,
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${suffix}_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: `apa_${suffix}`,
+          scopes: ['payments:read'],
+          recoveryCiphertext: `recovery-${suffix}`,
+          recoveryNonce: 'bm9uY2U=',
+          recoveryAuthTag: 'dGFn',
+          recoveryExpiresAt: new Date('2026-09-19T00:00:00.000Z'),
+          receiveRequestId: `recv_${suffix}_${randomUUID().replaceAll('-', '')}`,
+          receiveReference: `account:${accountId}`,
+        }
+      }
+
+      try {
+        const results = await Promise.all([
+          database.v2Admin.provisionAccount(input('one')),
+          database.v2Admin.provisionAccount(input('two')),
+        ])
+
+        expect(results.filter((result) => result.created)).toHaveLength(1)
+        expect(results[0]?.account.id).toBe(results[1]?.account.id)
+        expect(results[0]?.credential.id).toBe(results[1]?.credential.id)
+
+        await expect(
+          database.v2Admin.provisionAccount({
+            ...input('conflict'),
+            requestHash: 'f'.repeat(64),
+          }),
+        ).rejects.toBeInstanceOf(IdempotencyConflictError)
       } finally {
         await database.disconnect()
       }

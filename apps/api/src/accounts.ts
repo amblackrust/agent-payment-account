@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import {
+  ConflictError,
   DependencyUnavailableError,
   ValidationError,
   DEFAULT_AGENT_CREDENTIAL_SCOPES,
@@ -120,40 +121,12 @@ export class AccountService {
       requestHash,
     })
     if (replay !== null) {
-      const existingAccount = await this.v2Admin.findAccount(replay.accountId)
-      if (existingAccount === null)
-        throw new Error('Provisioned account is unavailable')
-      await this.finishV2Provisioning(
-        existingAccount.id,
-        existingAccount.solanaPublicKey,
-      )
-      const envelope = await this.v2Admin.consumeRecoveryEnvelope(
+      return this.recoverV2ProvisionedAccount(
         replay.accountId,
+        replay.credentialId,
         idempotencyKey,
         now,
       )
-      if (envelope === null) {
-        throw new ValidationError('Credential recovery window has expired')
-      }
-      const apiKey = decodeOneTimeSecret(this.recoveryCipher.decrypt(envelope))
-      const account = await this.v2Admin.findAccount(replay.accountId)
-      if (account === null) throw new Error('Provisioned account is unavailable')
-      const requests = await this.repository.listReceiveRequests(account.id)
-      const receiveRequest = requests.find(
-        (request) => request.reference === `account:${account.id}`,
-      )
-      if (receiveRequest === undefined) {
-        throw new Error('Provisioned receive request is unavailable')
-      }
-      return {
-        id: account.id,
-        name: account.name,
-        status: 'ACTIVE',
-        apiKey,
-        credentialId: replay.credentialId,
-        receiveId: receiveRequest.id,
-        destination: await this.rail.getReceiveDestination(account.solanaPublicKey),
-      }
     }
 
     const wallet = await generateManagedWallet()
@@ -167,7 +140,7 @@ export class AccountService {
       )
       const accountId = createAccountId()
       const receiveId = createReceiveId()
-      await this.v2Admin.provisionAccount({
+      const stored = await this.v2Admin.provisionAccount({
         idempotencyKey,
         requestHash,
         accountId,
@@ -189,7 +162,15 @@ export class AccountService {
         receiveRequestId: receiveId,
         receiveReference: `account:${accountId}`,
       })
-      await this.finishV2Provisioning(accountId, wallet.publicKey)
+      await this.finishV2Provisioning(stored.account.id, stored.account.solanaPublicKey)
+      if (!stored.created) {
+        return this.recoverV2ProvisionedAccount(
+          stored.account.id,
+          stored.credential.id,
+          idempotencyKey,
+          now,
+        )
+      }
       return {
         id: accountId,
         name: normalizedName,
@@ -201,6 +182,49 @@ export class AccountService {
       }
     } finally {
       wallet.secretKey.fill(0)
+    }
+  }
+
+  private async recoverV2ProvisionedAccount(
+    accountId: string,
+    credentialId: string,
+    idempotencyKey: string,
+    now: Date,
+  ): Promise<CreatedAccountResponse> {
+    if (this.v2Admin === undefined || this.recoveryCipher === undefined) {
+      throw new DependencyUnavailableError('V2 account provisioning is unavailable')
+    }
+    const existingAccount = await this.v2Admin.findAccount(accountId)
+    if (existingAccount === null) {
+      throw new Error('Provisioned account is unavailable')
+    }
+    await this.finishV2Provisioning(existingAccount.id, existingAccount.solanaPublicKey)
+    const envelope = await this.v2Admin.consumeRecoveryEnvelope(
+      accountId,
+      idempotencyKey,
+      now,
+    )
+    if (envelope === null) {
+      throw new ValidationError('Credential recovery window has expired')
+    }
+    const apiKey = decodeOneTimeSecret(this.recoveryCipher.decrypt(envelope))
+    const account = await this.v2Admin.findAccount(accountId)
+    if (account === null) throw new Error('Provisioned account is unavailable')
+    const requests = await this.repository.listReceiveRequests(account.id)
+    const receiveRequest = requests.find(
+      (request) => request.reference === `account:${account.id}`,
+    )
+    if (receiveRequest === undefined) {
+      throw new Error('Provisioned receive request is unavailable')
+    }
+    return {
+      id: account.id,
+      name: account.name,
+      status: 'ACTIVE',
+      apiKey,
+      credentialId,
+      receiveId: receiveRequest.id,
+      destination: await this.rail.getReceiveDestination(account.solanaPublicKey),
     }
   }
 
@@ -234,6 +258,10 @@ export class AccountService {
       await this.v2FundingProvisioner.provision({ accountId, owner })
       const current = await this.v2Admin.findAccount(accountId)
       if (current === null) throw new Error('Provisioned account is unavailable')
+      if (current.status === 'ACTIVE') return
+      if (current.status !== 'PROVISIONING') {
+        throw new ValidationError('Account is not in a resumable provisioning state')
+      }
       await this.v2Admin.transitionAccount({
         accountId,
         currentStatus: 'PROVISIONING',
@@ -242,6 +270,9 @@ export class AccountService {
       })
     } catch (error) {
       const current = await this.v2Admin.findAccount(accountId)
+      if (current?.status === 'ACTIVE' && error instanceof ConflictError) {
+        return
+      }
       if (current !== null && current.status === 'PROVISIONING') {
         await this.v2Admin.transitionAccount({
           accountId,
