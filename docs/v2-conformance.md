@@ -26,6 +26,10 @@ inside this codebase.
   reassociation, and the durable `money_worker_gate` are implemented. The
   platform-neutral deployment and restore procedure is documented in
   [deployment.md](./deployment.md) and [operations.md](./operations.md).
+- V2 delegated credential issuance uses a durable request fingerprint and
+  account-scoped idempotency record, stores only a verification hash plus an
+  encrypted short-lived recovery envelope, and exposes an idempotent recovery
+  acknowledgement command.
 
 ## Evidence currently available
 
@@ -40,21 +44,19 @@ release record rather than being inferred from source inspection.
 The following items are concrete repository findings, not silently accepted
 scope reductions:
 
-- V2 exposes credential listing, rotation, and revocation, but no delegated
-  credential-creation endpoint. The persistence primitive exists, while the
-  public request, idempotency, and one-time recovery contract remains
-  unspecified by the implementation plan.
 - `packages/contracts` contains canonical Zod contracts, but Fastify response
   schemas are still maintained separately. Generated schema output and an
   automated HTTP/SDK/webhook parity check are not yet present.
-- The direct API and worker entrypoints still import `dotenv/config`. Production
-  startup therefore needs an explicit secret-loading boundary before it can
-  satisfy the requirement that production secrets do not come from an
-  unmanaged `.env` file.
-- The production dependency audit currently reports two high-severity and one
-  moderate transitive Prisma/MySQL findings. Remediation needs a deliberate
-  supported Prisma/dependency decision rather than an untested release-candidate
-  upgrade.
+
+## Scoped dependency security remediation
+
+The production audit findings were addressed without changing Prisma's major
+version: the Prisma tooling transitive `deepmerge-ts` dependency is pinned to
+the patched 8.0.0 release, and `mysql2` is pinned to patched 3.23.1. The former
+is a major transitive override, so it is recorded separately from application
+feature work and is guarded by Prisma schema validation, client generation,
+typechecking, and the full test suite. Prisma itself remains on stable 7.10.0;
+no release-candidate or unrelated major upgrade was introduced.
 
 ## Gated or external evidence
 

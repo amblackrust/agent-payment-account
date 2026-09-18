@@ -7,3 +7,6 @@ allowBuilds:
   esbuild: true
   prisma: true
 storeDir: /tmp/agent-payment-account-pnpm-store
+overrides:
+  deepmerge-ts: 8.0.0
+  mysql2: 3.23.1
