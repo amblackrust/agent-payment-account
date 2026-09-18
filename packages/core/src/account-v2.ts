@@ -33,6 +33,28 @@ export const AGENT_CREDENTIAL_SCOPES = {
 export type AgentCredentialScope =
   (typeof AGENT_CREDENTIAL_SCOPES)[keyof typeof AGENT_CREDENTIAL_SCOPES]
 
+const AGENT_CREDENTIAL_SCOPE_VALUES = new Set<AgentCredentialScope>(
+  Object.values(AGENT_CREDENTIAL_SCOPES),
+)
+
+export function normalizeAgentCredentialScopes(
+  scopes: readonly string[],
+): readonly AgentCredentialScope[] {
+  if (scopes.length === 0) {
+    throw new ValidationError('Credential scopes must contain at least one scope')
+  }
+  const normalized = [...scopes].sort()
+  if (new Set(normalized).size !== normalized.length) {
+    throw new ValidationError('Credential scopes must be unique')
+  }
+  for (const scope of normalized) {
+    if (!AGENT_CREDENTIAL_SCOPE_VALUES.has(scope as AgentCredentialScope)) {
+      throw new ValidationError(`Unsupported credential scope: ${scope}`)
+    }
+  }
+  return normalized as AgentCredentialScope[]
+}
+
 export const DEFAULT_AGENT_CREDENTIAL_SCOPES: readonly AgentCredentialScope[] = [
   AGENT_CREDENTIAL_SCOPES.PAYMENTS_CREATE,
   AGENT_CREDENTIAL_SCOPES.PAYMENTS_READ,

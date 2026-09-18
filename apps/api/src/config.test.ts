@@ -28,6 +28,7 @@ describe('configuration', () => {
     expect(config.limits?.requestBurstWindowSeconds).toBe(1)
     expect(config.limits?.requestBurstLimit).toBe(30)
     expect(config.limits?.receiveRateLimitPerWindow).toBe(120)
+    expect(config.limits?.credentialRecoveryTtlSeconds).toBe(900)
   })
 
   it('loads bounded worker, capacity, and pagination limits', () => {
@@ -44,6 +45,7 @@ describe('configuration', () => {
       RECEIVE_RATE_LIMIT_PER_WINDOW: '9',
       CAPACITY_WINDOW_SECONDS: '2',
       RPC_CAPACITY_PER_WINDOW: '11',
+      CREDENTIAL_RECOVERY_TTL_SECONDS: '1800',
       MAX_PAGE_SIZE: '25',
       CUSTODY_BACKEND_IDENTITY: 'local-test-custody',
       CUSTODY_BACKEND_MODE: 'LOCAL_TEST',
@@ -61,6 +63,7 @@ describe('configuration', () => {
       receiveRateLimitPerWindow: 9,
       capacityWindowSeconds: 2,
       rpcCapacityPerWindow: 11,
+      credentialRecoveryTtlSeconds: 1800,
       maxPageSize: 25,
     })
   })

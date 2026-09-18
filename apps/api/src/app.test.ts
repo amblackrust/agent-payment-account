@@ -323,4 +323,88 @@ describe('API foundation', () => {
     )
     await app.close()
   })
+
+  it('issues an idempotent delegated credential and exposes idempotent recovery acknowledgement', async () => {
+    const createCredential = vi
+      .fn()
+      .mockResolvedValueOnce({
+        created: true,
+        credential_id: 'cred_issued',
+        account_id: 'acct_1',
+        api_key: 'apa_issued_secret',
+        key_prefix: 'apa_issued',
+        scopes: ['payments:read'],
+        expires_at: null,
+      })
+      .mockResolvedValueOnce({
+        created: false,
+        credential_id: 'cred_issued',
+        account_id: 'acct_1',
+        api_key: null,
+        key_prefix: 'apa_issued',
+        scopes: ['payments:read'],
+        expires_at: null,
+      })
+    const acknowledgeCredentialRecovery = vi.fn(async () => undefined)
+    const app = buildApp({
+      config: testConfig,
+      readinessDependency: { checkReadiness: async () => undefined },
+      accountRepository: {} as never,
+      accountService: {} as never,
+      solanaRail: {} as never,
+      v2ManagementService: {
+        createCredential,
+        acknowledgeCredentialRecovery,
+      } as never,
+    })
+
+    const headers = {
+      'x-admin-api-key': testConfig.adminApiKey,
+      'idempotency-key': 'issue-key',
+    }
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v2/accounts/acct_1/credentials',
+      headers,
+      payload: { scopes: ['payments:read'] },
+    })
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/v2/accounts/acct_1/credentials',
+      headers,
+      payload: { scopes: ['payments:read'] },
+    })
+    const acknowledged = await app.inject({
+      method: 'POST',
+      url: '/v2/accounts/acct_1/credentials/recovery/acknowledge',
+      headers,
+    })
+    const acknowledgedAgain = await app.inject({
+      method: 'POST',
+      url: '/v2/accounts/acct_1/credentials/recovery/acknowledge',
+      headers,
+    })
+
+    expect(first.statusCode).toBe(201)
+    expect(first.json()).toMatchObject({ api_key: 'apa_issued_secret' })
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json()).toMatchObject({
+      credential_id: 'cred_issued',
+      api_key: null,
+    })
+    expect(acknowledged.statusCode).toBe(200)
+    expect(acknowledged.json()).toEqual({ status: 'ACKNOWLEDGED' })
+    expect(acknowledgedAgain.statusCode).toBe(200)
+    expect(createCredential).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        accountId: 'acct_1',
+        scopes: ['payments:read'],
+        idempotencyKey: 'issue-key',
+        actorId: expect.stringMatching(/^platform-operator:/u),
+      }),
+    )
+    expect(acknowledgeCredentialRecovery).toHaveBeenCalledTimes(2)
+    await app.close()
+  })
 })

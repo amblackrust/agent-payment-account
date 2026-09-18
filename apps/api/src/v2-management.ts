@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   createDenomination,
   createCredentialId,
@@ -8,7 +8,9 @@ import {
   exactMoneyFromAtomicUnits,
   formatExactMoney,
   IdempotencyConflictError,
+  IdempotencyKeyReusedError,
   InvalidStateError,
+  normalizeAgentCredentialScopes,
   NotFoundError,
   parseExactMoney,
   selectSettlementRoute,
@@ -30,10 +32,10 @@ import type {
   V2SpendPolicyAdminRecord,
 } from '@agent-payment/db'
 import { generateApiCredential } from './auth.js'
+import { DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS } from './config.js'
 import type { RecoveryEnvelopeCipher } from './custody.js'
 import type { V2SettledBalanceProvider } from './payments-v2.js'
 
-const RECOVERY_TTL_MS = 15 * 60 * 1000
 const DEFAULT_MAX_PAGE_SIZE = 100
 
 export interface V2ManagementServiceOptions {
@@ -41,6 +43,7 @@ export interface V2ManagementServiceOptions {
   readonly financialRepository: V2DatabaseRepository
   readonly settledBalanceProvider?: V2SettledBalanceProvider
   readonly recoveryCipher?: RecoveryEnvelopeCipher
+  readonly credentialRecoveryTtlSeconds?: number
   readonly maxPageSize?: number
   readonly now?: () => Date
 }
@@ -48,12 +51,21 @@ export interface V2ManagementServiceOptions {
 export class V2ManagementService {
   private readonly now: () => Date
   private readonly maxPageSize: number
+  private readonly credentialRecoveryTtlSeconds: number
 
   public constructor(private readonly options: V2ManagementServiceOptions) {
     this.now = options.now ?? (() => new Date())
     this.maxPageSize = options.maxPageSize ?? DEFAULT_MAX_PAGE_SIZE
+    this.credentialRecoveryTtlSeconds =
+      options.credentialRecoveryTtlSeconds ?? DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS
     if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
       throw new InvalidStateError('Maximum page size must be a positive integer')
+    }
+    if (
+      !Number.isInteger(this.credentialRecoveryTtlSeconds) ||
+      this.credentialRecoveryTtlSeconds < 1
+    ) {
+      throw new InvalidStateError('Credential recovery TTL must be a positive integer')
     }
   }
 
@@ -111,6 +123,104 @@ export class V2ManagementService {
     }))
   }
 
+  public async createCredential(input: {
+    readonly accountId: string
+    readonly scopes: readonly string[]
+    readonly expiresAt?: string
+    readonly idempotencyKey: string
+    readonly actorId: string
+  }) {
+    if (this.options.recoveryCipher === undefined) {
+      throw new DependencyUnavailableError('Credential recovery is unavailable')
+    }
+    const account = await this.requireAccount(input.accountId)
+    if (account.status !== 'ACTIVE') {
+      throw new InvalidStateError('Agent account is not active')
+    }
+    const requestFingerprint = fingerprintCredentialRequest(
+      input.scopes,
+      input.expiresAt,
+    )
+    const existing = await this.options.repository.findCredentialIdempotency({
+      accountId: input.accountId,
+      idempotencyKey: input.idempotencyKey,
+    })
+    if (existing !== null) {
+      if (
+        existing.requestHash !== requestFingerprint ||
+        existing.fingerprint !== requestFingerprint
+      ) {
+        throw new IdempotencyKeyReusedError()
+      }
+      const recovered = await this.recoverIssuedCredential(
+        input.accountId,
+        credentialRecoveryKey(input.accountId, input.idempotencyKey),
+        existing.credential,
+      )
+      return {
+        created: false,
+        ...serializeIssuedCredential(existing.credential, recovered),
+      }
+    }
+    const scopes = normalizeAgentCredentialScopes(input.scopes)
+    const expiresAt = parseCredentialExpiry(input.expiresAt, this.now())
+    const fingerprint = requestFingerprint
+    const credential = generateApiCredential()
+    const recoveryIdempotencyKey = credentialRecoveryKey(
+      input.accountId,
+      input.idempotencyKey,
+    )
+    const recovery = this.options.recoveryCipher.encrypt(
+      new TextEncoder().encode(credential.rawKey),
+    )
+    const stored = await this.options.repository.createCredential({
+      accountId: input.accountId,
+      idempotencyKey: input.idempotencyKey,
+      requestHash: fingerprint,
+      fingerprint,
+      credentialId: createCredentialId(),
+      keyHash: credential.keyHash,
+      keyPrefix: credential.keyPrefix,
+      scopes,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      recoveryCiphertext: recovery.ciphertext,
+      recoveryNonce: recovery.nonce,
+      recoveryAuthTag: recovery.authTag,
+      recoveryIdempotencyKey,
+      recoveryExpiresAt: new Date(
+        this.now().getTime() + this.credentialRecoveryTtlSeconds * 1000,
+      ),
+      actorId: input.actorId,
+    })
+    if (stored.created) {
+      return {
+        created: true,
+        ...serializeIssuedCredential(stored.credential, credential.rawKey),
+      }
+    }
+
+    const recovered = await this.recoverIssuedCredential(
+      input.accountId,
+      recoveryIdempotencyKey,
+      stored.credential,
+    )
+    return {
+      created: false,
+      ...serializeIssuedCredential(stored.credential, recovered),
+    }
+  }
+
+  public async acknowledgeCredentialRecovery(
+    accountId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
+    await this.requireAccount(accountId)
+    await this.options.repository.acknowledgeRecoveryEnvelope(
+      accountId,
+      credentialRecoveryKey(accountId, idempotencyKey),
+    )
+  }
+
   public async rotateCredential(
     accountId: string,
     oldCredentialId: string,
@@ -151,7 +261,9 @@ export class V2ManagementService {
         recoveryNonce: recovery.nonce,
         recoveryAuthTag: recovery.authTag,
         recoveryIdempotencyKey,
-        recoveryExpiresAt: new Date(this.now().getTime() + RECOVERY_TTL_MS),
+        recoveryExpiresAt: new Date(
+          this.now().getTime() + this.credentialRecoveryTtlSeconds * 1000,
+        ),
       })
       return serializeRotatedCredential(stored, credential.rawKey, credential.keyPrefix)
     } catch (error) {
@@ -198,6 +310,28 @@ export class V2ManagementService {
     })
     const rawKey = decodeOneTimeSecret(secret)
     return serializeRotatedCredential(recoveredCredential, rawKey, rawKey.slice(0, 12))
+  }
+
+  private async recoverIssuedCredential(
+    accountId: string,
+    recoveryIdempotencyKey: string,
+    credential: V2CredentialRecord,
+  ): Promise<string | null> {
+    const envelope = await this.options.repository.consumeRecoveryEnvelope(
+      accountId,
+      recoveryIdempotencyKey,
+      this.now(),
+    )
+    if (envelope === null) return null
+    if (envelope.credentialId !== credential.id) {
+      throw new InvalidStateError('Recovered credential does not match request')
+    }
+    const secret = this.options.recoveryCipher!.decrypt({
+      ciphertext: envelope.ciphertext,
+      nonce: envelope.nonce,
+      authTag: envelope.authTag,
+    })
+    return decodeOneTimeSecret(secret)
   }
 
   public async revokeCredential(
@@ -658,6 +792,60 @@ function serializeRotatedCredential(
     scopes: [...credential.scopes],
     expires_at: credential.expiresAt?.toISOString() ?? null,
   }
+}
+
+function serializeIssuedCredential(
+  credential: V2CredentialRecord,
+  rawKey: string | null,
+) {
+  return {
+    credential_id: credential.id,
+    account_id: credential.accountId,
+    api_key: rawKey,
+    key_prefix: credential.keyPrefix,
+    scopes: [...credential.scopes],
+    expires_at: credential.expiresAt?.toISOString() ?? null,
+  }
+}
+
+function parseCredentialExpiry(value: string | undefined, now: Date): Date | undefined {
+  if (value === undefined) return undefined
+  const expiresAt = new Date(value)
+  if (Number.isNaN(expiresAt.getTime())) {
+    throw new ValidationError('Credential expires_at must be a valid timestamp')
+  }
+  if (expiresAt <= now) {
+    throw new ValidationError('Credential expires_at must be in the future')
+  }
+  return expiresAt
+}
+
+function hashCredentialRequest(input: {
+  readonly scopes: readonly string[]
+  readonly expires_at: string | null
+}): string {
+  return createHash('sha256').update(JSON.stringify(input), 'utf8').digest('hex')
+}
+
+function fingerprintCredentialRequest(
+  scopes: readonly string[],
+  expiresAt: string | undefined,
+): string {
+  const parsedExpiry = expiresAt === undefined ? undefined : new Date(expiresAt)
+  return hashCredentialRequest({
+    scopes: [...scopes].sort(),
+    expires_at:
+      parsedExpiry === undefined
+        ? null
+        : Number.isNaN(parsedExpiry.getTime())
+          ? (expiresAt ?? null)
+          : parsedExpiry.toISOString(),
+  })
+}
+
+function credentialRecoveryKey(accountId: string, idempotencyKey: string): string {
+  const keyHash = createHash('sha256').update(idempotencyKey, 'utf8').digest('hex')
+  return `CREDENTIAL_CREATE:${accountId}:${keyHash}`
 }
 
 function sameScopes(left: readonly string[], right: readonly string[]): boolean {

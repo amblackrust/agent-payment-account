@@ -4,6 +4,7 @@ import { Client } from 'pg'
 
 import {
   ConflictError,
+  IdempotencyKeyReusedError,
   NotFoundError,
   RecipientResolutionError,
 } from '@agent-payment/core'
@@ -194,6 +195,82 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(envelope?.credentialId).toBe(
           credentials.find((item) => item.status === 'ACTIVE')?.id,
         )
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('creates one delegated credential per idempotency key and removes its recovery envelope', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const requestHash = 'a'.repeat(64)
+      const recoveryIdempotencyKey = `CREDENTIAL_CREATE:${accountId}:recovery`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'credential-issuance-integration-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+
+        const createInput = (suffix: string) => ({
+          accountId,
+          idempotencyKey: 'delegated-credential-key',
+          requestHash,
+          fingerprint: requestHash,
+          credentialId: `cred_${suffix}_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_${suffix}_hash`,
+          keyPrefix: `apa_${suffix}`,
+          scopes: ['history:read', 'payments:read'],
+          recoveryCiphertext: `ciphertext-${suffix}`,
+          recoveryNonce: 'bm9uY2U=',
+          recoveryAuthTag: 'dGFn',
+          recoveryIdempotencyKey,
+          recoveryExpiresAt: new Date('2026-09-19T00:00:00.000Z'),
+          actorId: 'platform-operator:integration',
+        })
+
+        const results = await Promise.all([
+          database.v2Admin.createCredential(createInput('one')),
+          database.v2Admin.createCredential(createInput('two')),
+        ])
+
+        expect(results.filter((result) => result.created)).toHaveLength(1)
+        expect(results[0]?.credential.id).toBe(results[1]?.credential.id)
+        expect(await database.v2Admin.listCredentials(accountId)).toHaveLength(2)
+
+        await expect(
+          database.v2Admin.createCredential({
+            ...createInput('conflict'),
+            requestHash: 'b'.repeat(64),
+            fingerprint: 'b'.repeat(64),
+          }),
+        ).rejects.toBeInstanceOf(IdempotencyKeyReusedError)
+
+        const envelope = await database.v2Admin.consumeRecoveryEnvelope(
+          accountId,
+          recoveryIdempotencyKey,
+          new Date('2026-09-18T00:00:00.000Z'),
+        )
+        expect(envelope?.credentialId).toBe(results[0]?.credential.id)
+        await database.v2Admin.acknowledgeRecoveryEnvelope(
+          accountId,
+          recoveryIdempotencyKey,
+        )
+        await expect(
+          database.v2Admin.consumeRecoveryEnvelope(
+            accountId,
+            recoveryIdempotencyKey,
+            new Date('2026-09-18T00:00:00.000Z'),
+          ),
+        ).resolves.toBeNull()
       } finally {
         await database.disconnect()
       }

@@ -37,6 +37,7 @@ export const v2ErrorCodeSchema = z.enum([
   'NOT_FOUND',
   'CONFLICT',
   'IDEMPOTENCY_CONFLICT',
+  'IDEMPOTENCY_KEY_REUSED',
   'INSUFFICIENT_FUNDS',
   'POLICY_DENIED',
   'APPROVAL_REQUIRED',
@@ -155,6 +156,35 @@ export const v2CredentialResponseSchema = z
     revoked_at: z.string().nullable(),
   })
   .strict()
+
+export const v2CredentialIssuanceRequestSchema = z
+  .object({
+    scopes: z.array(z.string().min(1)).min(1),
+    expires_at: z.string().min(1).optional(),
+  })
+  .strict()
+
+export const v2CredentialIssuanceResponseSchema = z
+  .object({
+    credential_id: z.string().min(1),
+    account_id: z.string().min(1),
+    api_key: z.string().min(1).nullable(),
+    key_prefix: z.string().min(1),
+    scopes: z.array(z.string().min(1)),
+    expires_at: z.string().min(1).nullable(),
+  })
+  .strict()
+
+/** Draft-07 output consumed by Fastify/Ajv; the Zod schemas remain canonical. */
+export const v2CredentialIssuanceRequestJsonSchema = z.toJSONSchema(
+  v2CredentialIssuanceRequestSchema,
+  { target: 'draft-07' },
+)
+
+export const v2CredentialIssuanceResponseJsonSchema = z.toJSONSchema(
+  v2CredentialIssuanceResponseSchema,
+  { target: 'draft-07' },
+)
 
 export const v2PolicyResponseSchema = z
   .object({
@@ -304,6 +334,12 @@ export type V2BalanceResponse = z.infer<typeof v2BalanceResponseSchema>
 export type V2PaymentListResponse = z.infer<typeof v2PaymentListResponseSchema>
 export type V2AccountResponse = z.infer<typeof v2AccountResponseSchema>
 export type V2CredentialResponse = z.infer<typeof v2CredentialResponseSchema>
+export type V2CredentialIssuanceRequest = z.infer<
+  typeof v2CredentialIssuanceRequestSchema
+>
+export type V2CredentialIssuanceResponse = z.infer<
+  typeof v2CredentialIssuanceResponseSchema
+>
 export type V2PolicyResponse = z.infer<typeof v2PolicyResponseSchema>
 export type V2ApprovalResponse = z.infer<typeof v2ApprovalResponseSchema>
 export type V2FundingDestinationResponse = z.infer<

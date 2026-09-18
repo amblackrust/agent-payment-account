@@ -11,6 +11,7 @@ import type { AccountRepository, ReceiveRepository } from '@agent-payment/db'
 import type { V2AdminRepository } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 import { generateApiCredential } from './auth.js'
+import { DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS } from './config.js'
 import type { RecoveryEnvelopeCipher, WalletSecretCipher } from './custody.js'
 import { generateManagedWallet } from '@agent-payment/solana-rail'
 
@@ -39,6 +40,7 @@ export class AccountService {
     private readonly v2Admin?: V2AdminRepository,
     private readonly recoveryCipher?: RecoveryEnvelopeCipher,
     private readonly v2FundingProvisioner?: V2FundingProvisioner,
+    private readonly credentialRecoveryTtlSeconds = DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS,
   ) {}
 
   public async createAccount(name: string): Promise<CreatedAccountResponse> {
@@ -181,7 +183,9 @@ export class AccountService {
         recoveryCiphertext: recovery.ciphertext,
         recoveryNonce: recovery.nonce,
         recoveryAuthTag: recovery.authTag,
-        recoveryExpiresAt: new Date(now.getTime() + 15 * 60 * 1000),
+        recoveryExpiresAt: new Date(
+          now.getTime() + this.credentialRecoveryTtlSeconds * 1000,
+        ),
         receiveRequestId: receiveId,
         receiveReference: `account:${accountId}`,
       })

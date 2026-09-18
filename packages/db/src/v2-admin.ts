@@ -3,6 +3,7 @@ import {
   assertAgentAccountTransition,
   ConflictError,
   IdempotencyConflictError,
+  IdempotencyKeyReusedError,
   InsufficientFundsError,
   InvalidStateError,
   NotFoundError,
@@ -29,6 +30,7 @@ export interface V2AccountRecord {
 export interface V2CredentialRecord {
   readonly id: string
   readonly accountId: string
+  readonly keyPrefix: string
   readonly status: string
   readonly scopes: readonly string[]
   readonly expiresAt: Date | null
@@ -50,6 +52,11 @@ export interface V2ProvisionedAccount {
     readonly authTag: string
     readonly expiresAt: Date
   }
+  readonly created: boolean
+}
+
+export interface V2CredentialIssuanceResult {
+  readonly credential: V2CredentialRecord
   readonly created: boolean
 }
 
@@ -195,11 +202,37 @@ export interface V2AdminRepository {
     readonly receiveRequestId?: string
     readonly receiveReference?: string
   }): Promise<V2ProvisionedAccount>
+  findCredentialIdempotency(input: {
+    readonly accountId: string
+    readonly idempotencyKey: string
+  }): Promise<{
+    readonly requestHash: string
+    readonly fingerprint: string
+    readonly credential: V2CredentialRecord
+  } | null>
+  createCredential(input: {
+    readonly accountId: string
+    readonly idempotencyKey: string
+    readonly requestHash: string
+    readonly fingerprint: string
+    readonly credentialId: string
+    readonly keyHash: string
+    readonly keyPrefix: string
+    readonly scopes: readonly string[]
+    readonly expiresAt?: Date
+    readonly recoveryCiphertext: string
+    readonly recoveryNonce: string
+    readonly recoveryAuthTag: string
+    readonly recoveryIdempotencyKey: string
+    readonly recoveryExpiresAt: Date
+    readonly actorId: string
+  }): Promise<V2CredentialIssuanceResult>
   consumeRecoveryEnvelope(
     accountId: string,
     idempotencyKey: string,
     now?: Date,
   ): Promise<V2ProvisionedAccount['recoveryEnvelope'] | null>
+  acknowledgeRecoveryEnvelope(accountId: string, idempotencyKey: string): Promise<void>
   findAccount(accountId: string): Promise<V2AccountRecord | null>
   listCredentials(accountId: string): Promise<readonly V2CredentialRecord[]>
   transitionAccount(input: {
@@ -497,6 +530,144 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
       })
     },
 
+    async createCredential(input) {
+      return prisma.$transaction(async (transaction) => {
+        const accountRows = await transaction.$queryRaw<Array<{ status: string }>>`
+          SELECT status
+          FROM "agent_accounts"
+          WHERE id = ${input.accountId}
+          FOR UPDATE
+        `
+        const account = accountRows[0]
+        if (account === undefined) {
+          throw new NotFoundError('Agent account was not found')
+        }
+        if (account.status !== 'ACTIVE') {
+          throw new InvalidStateError('Agent account is not active')
+        }
+
+        const existing = await transaction.idempotencyRecord.findUnique({
+          where: {
+            ownerAccountId_operation_key: {
+              ownerAccountId: input.accountId,
+              operation: 'V2_CREDENTIAL_CREATE',
+              key: input.idempotencyKey,
+            },
+          },
+        })
+        if (existing !== null) {
+          if (
+            existing.requestHash !== input.requestHash ||
+            existing.fingerprint !== input.fingerprint
+          ) {
+            throw new IdempotencyKeyReusedError()
+          }
+          const credential = await transaction.apiCredential.findUnique({
+            where: { id: existing.resourceId },
+          })
+          if (credential === null || credential.accountId !== input.accountId) {
+            throw new InvalidStateError(
+              'Credential idempotency resource is unavailable',
+            )
+          }
+          return { credential: toCredentialRecord(credential), created: false }
+        }
+
+        const credential = await transaction.apiCredential.create({
+          data: {
+            id: input.credentialId,
+            accountId: input.accountId,
+            keyHash: input.keyHash,
+            keyPrefix: input.keyPrefix,
+            scopes: JSON.stringify([...input.scopes]),
+            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+          },
+        })
+        await transaction.credentialRecoveryEnvelope.create({
+          data: {
+            idempotencyKey: input.recoveryIdempotencyKey,
+            accountId: input.accountId,
+            credentialId: credential.id,
+            ciphertext: input.recoveryCiphertext,
+            nonce: input.recoveryNonce,
+            authTag: input.recoveryAuthTag,
+            expiresAt: input.recoveryExpiresAt,
+          },
+        })
+        await transaction.operationTimelineEvent.create({
+          data: {
+            id: createId('timeline'),
+            accountId: input.accountId,
+            resourceType: 'CREDENTIAL',
+            resourceId: credential.id,
+            eventType: 'CREDENTIAL_CREATED',
+            actorType: 'OPERATOR',
+            actorId: input.actorId,
+            source: 'V2_CREDENTIAL_ISSUANCE',
+            occurredAt: new Date(),
+            newStateJson: JSON.stringify({
+              account_id: credential.accountId,
+              status: credential.status,
+              scopes: input.scopes,
+              expires_at: credential.expiresAt?.toISOString() ?? null,
+            }),
+          },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: credential.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          resourceVersion: credential.rowVersion,
+          eventType: 'credential.created',
+          resource: {
+            id: credential.id,
+            account_id: credential.accountId,
+            status: credential.status,
+            scopes: input.scopes,
+            expires_at: credential.expiresAt?.toISOString() ?? null,
+          },
+        })
+        await transaction.idempotencyRecord.create({
+          data: {
+            id: createId('idem'),
+            ownerAccountId: input.accountId,
+            operation: 'V2_CREDENTIAL_CREATE',
+            key: input.idempotencyKey,
+            requestHash: input.requestHash,
+            fingerprint: input.fingerprint,
+            resourceId: credential.id,
+            responseSnapshot: JSON.stringify({ credential_id: credential.id }),
+            expiresAt: input.recoveryExpiresAt,
+          },
+        })
+        return { credential: toCredentialRecord(credential), created: true }
+      })
+    },
+
+    async findCredentialIdempotency(input) {
+      const record = await prisma.idempotencyRecord.findUnique({
+        where: {
+          ownerAccountId_operation_key: {
+            ownerAccountId: input.accountId,
+            operation: 'V2_CREDENTIAL_CREATE',
+            key: input.idempotencyKey,
+          },
+        },
+      })
+      if (record === null) return null
+      const credential = await prisma.apiCredential.findUnique({
+        where: { id: record.resourceId },
+      })
+      if (credential === null || credential.accountId !== input.accountId) {
+        throw new InvalidStateError('Credential idempotency resource is unavailable')
+      }
+      return {
+        requestHash: record.requestHash,
+        fingerprint: record.fingerprint ?? record.requestHash,
+        credential: toCredentialRecord(credential),
+      }
+    },
+
     async findProvisioningReplay(input) {
       const record = await prisma.idempotencyRecord.findFirst({
         where: { operation: 'ACCOUNT_PROVISION', key: input.idempotencyKey },
@@ -595,6 +766,12 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           where: { idempotencyKey, acknowledgedAt: null },
         })
         return deleted.count === 1 ? toRecoveryEnvelope(envelope) : null
+      })
+    },
+
+    async acknowledgeRecoveryEnvelope(accountId, idempotencyKey) {
+      await prisma.credentialRecoveryEnvelope.deleteMany({
+        where: { accountId, idempotencyKey },
       })
     },
 
@@ -1519,6 +1696,7 @@ function parseScopes(value: string): readonly string[] {
 function toCredentialRecord(credential: {
   id: string
   accountId: string
+  keyPrefix: string
   status: string
   scopes: string
   expiresAt: Date | null

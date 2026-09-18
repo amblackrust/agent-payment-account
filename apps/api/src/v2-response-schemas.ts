@@ -1,3 +1,8 @@
+import {
+  v2CredentialIssuanceRequestJsonSchema,
+  v2CredentialIssuanceResponseJsonSchema,
+} from '@agent-payment/contracts'
+
 const exactAmountSchema = {
   type: 'string',
   pattern: '^\\d+(?:\\.\\d+)?$',
@@ -167,6 +172,9 @@ export const v2RotatedCredentialResponseSchema = {
     'expires_at',
   ],
 } as const
+
+export const v2CredentialIssuanceResponseSchema = v2CredentialIssuanceResponseJsonSchema
+export const v2CredentialIssuanceRequestSchema = v2CredentialIssuanceRequestJsonSchema
 
 export const v2PolicyResponseSchema = {
   type: 'object',

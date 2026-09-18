@@ -44,6 +44,8 @@ import {
   v2ApprovedDestinationResponseSchema,
   v2BalanceResponseSchema,
   v2CredentialListResponseSchema,
+  v2CredentialIssuanceResponseSchema,
+  v2CredentialIssuanceRequestSchema,
   v2FundingDestinationResponseSchema,
   v2HistoryResponseSchema,
   v2LifecycleResponseSchema,
@@ -129,6 +131,7 @@ function getErrorStatusCode(error: ErrorWithCode): number {
       return 503
     case 'INVALID_STATE':
     case 'IDEMPOTENCY_CONFLICT':
+    case 'IDEMPOTENCY_KEY_REUSED':
       return 409
     case 'INSUFFICIENT_FUNDS':
     case 'CONFLICT':
@@ -1634,6 +1637,67 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           return {
             credentials: await management.listCredentials(request.params.accountId),
           }
+        },
+      )
+
+      app.post<{
+        Params: { accountId: string }
+        Body: { scopes: string[]; expires_at?: string }
+      }>(
+        '/v2/accounts/:accountId/credentials',
+        {
+          schema: {
+            params: accountParams,
+            headers: {
+              type: 'object',
+              properties: {
+                'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+              },
+              required: ['idempotency-key'],
+            },
+            body: v2CredentialIssuanceRequestSchema,
+            response: {
+              200: v2CredentialIssuanceResponseSchema,
+              201: v2CredentialIssuanceResponseSchema,
+            },
+          },
+        },
+        async (request, reply) => {
+          const result = await management.createCredential({
+            accountId: request.params.accountId,
+            scopes: request.body.scopes,
+            ...(request.body.expires_at === undefined
+              ? {}
+              : { expiresAt: request.body.expires_at }),
+            idempotencyKey: getIdempotencyKey(request),
+            actorId: getAdminOperatorId(request, options.config.adminApiKey),
+          })
+          const { created: _created, ...response } = result
+          return reply.code(result.created ? 201 : 200).send(response)
+        },
+      )
+
+      app.post<{ Params: { accountId: string } }>(
+        '/v2/accounts/:accountId/credentials/recovery/acknowledge',
+        {
+          schema: {
+            params: accountParams,
+            headers: {
+              type: 'object',
+              properties: {
+                'idempotency-key': { type: 'string', minLength: 1, maxLength: 255 },
+              },
+              required: ['idempotency-key'],
+            },
+            response: { 200: v2StatusResponseSchema },
+          },
+        },
+        async (request) => {
+          await management.acknowledgeCredentialRecovery(
+            request.params.accountId,
+            getIdempotencyKey(request),
+          )
+          return { status: 'ACKNOWLEDGED' }
         },
       )
 

@@ -9,6 +9,7 @@ export {
   DomainError,
   ExternalRailError,
   IdempotencyConflictError,
+  IdempotencyKeyReusedError,
   InvalidStateError,
   InsufficientFundsError,
   InternalError,
@@ -121,6 +122,7 @@ export type {
 export {
   AGENT_CREDENTIAL_SCOPES,
   DEFAULT_AGENT_CREDENTIAL_SCOPES,
+  normalizeAgentCredentialScopes,
   AgentAccountLifecycleStatus,
   AgentCredentialStatus,
   assertAccountCanStartMoneyOperation,

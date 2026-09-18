@@ -11,6 +11,7 @@ export const DOMAIN_ERROR_CODES = {
   INTERNAL: 'INTERNAL_ERROR',
   AUTHORIZATION: 'AUTHORIZATION_ERROR',
   IDEMPOTENCY_CONFLICT: 'IDEMPOTENCY_CONFLICT',
+  IDEMPOTENCY_KEY_REUSED: 'IDEMPOTENCY_KEY_REUSED',
   POLICY_DENIED: 'POLICY_DENIED',
   APPROVAL_REQUIRED: 'APPROVAL_REQUIRED',
   REVIEW_REQUIRED: 'REVIEW_REQUIRED',
@@ -86,6 +87,12 @@ export class AuthorizationError extends DomainError {
 export class IdempotencyConflictError extends DomainError {
   public constructor(message = 'Idempotency key was already used for another request') {
     super(DOMAIN_ERROR_CODES.IDEMPOTENCY_CONFLICT, message)
+  }
+}
+
+export class IdempotencyKeyReusedError extends DomainError {
+  public constructor(message = 'Idempotency key was already used for another request') {
+    super(DOMAIN_ERROR_CODES.IDEMPOTENCY_KEY_REUSED, message)
   }
 }
 

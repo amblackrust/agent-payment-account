@@ -1,5 +1,3 @@
-import 'dotenv/config'
-
 import { createDatabaseClient } from '@agent-payment/db'
 import {
   createSolanaIncomingReader,
@@ -150,6 +148,7 @@ async function startServer(): Promise<void> {
     database.v2Admin,
     recoveryCipher,
     fundingProvisioner,
+    limits.credentialRecoveryTtlSeconds,
   )
   const recipientService = new RecipientService(database, {
     maxPageSize: limits.maxPageSize,
@@ -181,6 +180,7 @@ async function startServer(): Promise<void> {
       getSettledAtomic: (input) => getLogicalSettledAtomic(rail, input),
     },
     recoveryCipher,
+    credentialRecoveryTtlSeconds: limits.credentialRecoveryTtlSeconds,
     maxPageSize: limits.maxPageSize,
   })
   const v2OperationsService = new V2OperationsService(database.v2Operations, {

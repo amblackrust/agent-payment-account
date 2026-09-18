@@ -3,6 +3,8 @@ import { z } from 'zod'
 const positiveInt = (defaultValue: number, maximum: number) =>
   z.coerce.number().int().min(1).max(maximum).default(defaultValue)
 
+export const DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS = 15 * 60
+
 export interface RuntimeLimits {
   readonly workerBatchSize: number
   readonly workerIntervalMs: number
@@ -25,6 +27,7 @@ export interface RuntimeLimits {
   readonly webhookLeaseSeconds: number
   readonly webhookMaxAttempts: number
   readonly webhookTimeoutMs: number
+  readonly credentialRecoveryTtlSeconds: number
   readonly maxPageSize: number
 }
 
@@ -50,6 +53,7 @@ export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = {
   webhookLeaseSeconds: 30,
   webhookMaxAttempts: 12,
   webhookTimeoutMs: 5_000,
+  credentialRecoveryTtlSeconds: DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS,
   maxPageSize: 100,
 }
 
@@ -154,6 +158,10 @@ const configSchema = z.object({
   WEBHOOK_LEASE_SECONDS: positiveInt(DEFAULT_RUNTIME_LIMITS.webhookLeaseSeconds, 3_600),
   WEBHOOK_MAX_ATTEMPTS: positiveInt(DEFAULT_RUNTIME_LIMITS.webhookMaxAttempts, 100),
   WEBHOOK_TIMEOUT_MS: positiveInt(DEFAULT_RUNTIME_LIMITS.webhookTimeoutMs, 120_000),
+  CREDENTIAL_RECOVERY_TTL_SECONDS: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.credentialRecoveryTtlSeconds,
+    86_400,
+  ),
   MAX_PAGE_SIZE: positiveInt(DEFAULT_RUNTIME_LIMITS.maxPageSize, 1_000),
   ALLOW_MAINNET: z.preprocess((value: unknown) => {
     if (value === undefined) {
@@ -395,6 +403,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       webhookLeaseSeconds: result.data.WEBHOOK_LEASE_SECONDS,
       webhookMaxAttempts: result.data.WEBHOOK_MAX_ATTEMPTS,
       webhookTimeoutMs: result.data.WEBHOOK_TIMEOUT_MS,
+      credentialRecoveryTtlSeconds: result.data.CREDENTIAL_RECOVERY_TTL_SECONDS,
       maxPageSize: result.data.MAX_PAGE_SIZE,
     },
   }

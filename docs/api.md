@@ -79,8 +79,17 @@ Admin-authenticated V2 routes manage account lifecycle and credentials,
 policies, approvals, approved destinations, and the operator exception inbox:
 
 - `POST /v2/accounts` provisions an account with an idempotent request.
-- `/v2/accounts/:accountId/credentials` lists credentials; lifecycle,
-  revoke, and rotate routes apply the corresponding guarded commands.
+- `GET /v2/accounts/:accountId/credentials` lists credentials.
+- `POST /v2/accounts/:accountId/credentials` creates an independent delegated
+  credential. The JSON body requires a non-empty `scopes` array and may include
+  `expires_at`; the `Idempotency-Key` header is required. The recognized scopes
+  are `payments:create`, `payments:read`, `contacts:manage`, `receive:manage`,
+  `balance:read`, `history:read`, and `webhooks:manage`.
+- `/v2/accounts/:accountId/credentials/:credentialId` lifecycle, revoke, and
+  rotate routes apply the corresponding guarded commands.
+- `POST /v2/accounts/:accountId/credentials/recovery/acknowledge` explicitly
+  deletes the short-lived recovery envelope for the issuance identified by the
+  `Idempotency-Key` header. Repeating the acknowledgement is safe.
 - `GET|PUT /v2/accounts/:accountId/policy`,
   `/v2/accounts/:accountId/policies`, `/v2/policies/:policyId/activate`, and
   `/v2/accounts/:accountId/approvals` manage versioned policy and approval
@@ -177,6 +186,43 @@ Requires admin authentication. Returns `{ "accounts": [...] }` with account iden
 `POST /v1/accounts/:accountId/credentials`
 
 Requires admin authentication. Returns `201` with `credential_id`, `account_id`, the one-time `api_key`, `key_prefix`, and `created_at`.
+
+### Create a delegated V2 credential
+
+`POST /v2/accounts/:accountId/credentials`
+
+Requires admin authentication and an `Idempotency-Key` header. A successful
+first request returns `201` and creates one independent credential. The same
+key with the same normalized request fingerprint returns the same credential;
+while its recovery envelope is alive, the replay may return the same `api_key`.
+The same key with a different fingerprint returns `409`
+`IDEMPOTENCY_KEY_REUSED`, and never creates a second credential.
+
+The plaintext key is not stored as credential state. Only its verification
+hash and an encrypted recovery envelope are persisted. The recovery envelope
+TTL is controlled by `CREDENTIAL_RECOVERY_TTL_SECONDS` and defaults to 900
+seconds. Once it is consumed, acknowledged, or expired, a replay returns the
+same credential with `api_key: null`; issue or rotate a new credential to get a
+new secret.
+
+Example request:
+
+```http
+POST /v2/accounts/acct_123/credentials
+Idempotency-Key: issue-2026-09-18-001
+X-Admin-Api-Key: <ADMIN_API_KEY>
+Content-Type: application/json
+
+{"scopes":["payments:read","history:read"],"expires_at":"2026-10-01T00:00:00Z"}
+```
+
+The recovery acknowledgement uses the same issuance idempotency key:
+
+```http
+POST /v2/accounts/acct_123/credentials/recovery/acknowledge
+Idempotency-Key: issue-2026-09-18-001
+X-Admin-Api-Key: <ADMIN_API_KEY>
+```
 
 ### Revoke a credential
 
