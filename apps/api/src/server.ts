@@ -200,16 +200,22 @@ async function startServer(): Promise<void> {
       checkDomainHealth: async () => {
         const health = await database.v2Operations.getDomainHealth?.()
         if (health === undefined) return { status: 'ok', checks: {} }
+        let dependencyDegraded = false
+        try {
+          await rail.checkReadiness?.()
+        } catch {
+          dependencyDegraded = true
+        }
         const alerts = evaluateDomainAlerts({
           reviewRequiredPayments: health.reviewRequiredPayments,
           oldestReviewRequiredAgeSeconds: health.oldestReviewRequiredAgeSeconds ?? null,
           exhaustedIncomingIssues: health.exhaustedIncomingIssues,
           custodyFailures: 0,
-          noProgressSeconds: null,
+          noProgressSeconds: health.oldestWorkItemAgeSeconds ?? null,
           databaseSaturationRatio: null,
-          dependencyDegraded: false,
+          dependencyDegraded,
           pendingWebhookDeliveries: health.pendingWebhookDeliveries,
-          restoreVerificationFailed: false,
+          restoreVerificationFailed: health.restoreVerificationFailed ?? false,
           runtimeIdentityMismatch: false,
         })
         const checks = {
@@ -225,6 +231,15 @@ async function startServer(): Promise<void> {
             health.pendingWebhookDeliveries === 0
               ? ('ok' as const)
               : ('degraded' as const),
+          no_progress: alerts.some((alert) => alert.name === 'NO_PROGRESS')
+            ? ('degraded' as const)
+            : ('ok' as const),
+          dependency: alerts.some((alert) => alert.name === 'DEPENDENCY_DEGRADED')
+            ? ('degraded' as const)
+            : ('ok' as const),
+          restore: alerts.some((alert) => alert.name === 'RESTORE_VERIFICATION_FAILED')
+            ? ('degraded' as const)
+            : ('ok' as const),
         }
         return {
           status: Object.values(checks).includes('degraded')

@@ -20,11 +20,17 @@ describe('V2 operations domain health', () => {
     }
     const prisma = {
       payment,
+      durableWorkItem: {
+        findFirst: vi.fn(async () => null),
+      },
       incomingReconciliationIssue: {
         count: vi.fn(async () => 0),
       },
       webhookDelivery: {
         count: vi.fn(async () => 0),
+      },
+      backupRestoreVerification: {
+        findFirst: vi.fn(async () => null),
       },
     }
 
@@ -35,8 +41,10 @@ describe('V2 operations domain health', () => {
     expect(health).toMatchObject({
       reviewRequiredPayments: 2,
       oldestReviewRequiredAgeSeconds: 600,
+      oldestWorkItemAgeSeconds: null,
       exhaustedIncomingIssues: 0,
       pendingWebhookDeliveries: 0,
+      restoreVerificationFailed: false,
     })
     expect(payment.findFirst).toHaveBeenCalledWith({
       where: { status: 'REVIEW_REQUIRED' },
@@ -52,8 +60,10 @@ describe('V2 operations domain health', () => {
     }
     const prisma = {
       payment,
+      durableWorkItem: { findFirst: vi.fn(async () => null) },
       incomingReconciliationIssue: { count: vi.fn(async () => 0) },
       webhookDelivery: { count: vi.fn(async () => 0) },
+      backupRestoreVerification: { findFirst: vi.fn(async () => null) },
     }
 
     const health = await createV2OperationsRepository(
@@ -61,5 +71,7 @@ describe('V2 operations domain health', () => {
     ).getDomainHealth?.()
 
     expect(health?.oldestReviewRequiredAgeSeconds).toBeNull()
+    expect(health?.oldestWorkItemAgeSeconds).toBeNull()
+    expect(health?.restoreVerificationFailed).toBe(false)
   })
 })

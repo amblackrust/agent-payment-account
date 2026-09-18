@@ -89,8 +89,10 @@ export interface V2DomainHealthRecord {
    * updated. Optional so existing repository test doubles remain compatible.
    */
   readonly oldestReviewRequiredAgeSeconds?: number | null
+  readonly oldestWorkItemAgeSeconds?: number | null
   readonly exhaustedIncomingIssues: number
   readonly pendingWebhookDeliveries: number
+  readonly restoreVerificationFailed?: boolean
 }
 
 export interface V2BackupRestoreVerificationRecord {
@@ -227,8 +229,10 @@ export function createV2OperationsRepository(
       const [
         reviewRequiredPayments,
         oldestReviewRequiredPayment,
+        oldestActiveWorkItem,
         exhaustedIncomingIssues,
         pendingWebhookDeliveries,
+        latestBackupVerification,
       ] = await Promise.all([
         prisma.payment.count({ where: { status: 'REVIEW_REQUIRED' } }),
         prisma.payment.findFirst({
@@ -236,25 +240,35 @@ export function createV2OperationsRepository(
           orderBy: { updatedAt: 'asc' },
           select: { updatedAt: true },
         }),
+        prisma.durableWorkItem.findFirst({
+          where: { status: { in: ['AVAILABLE', 'CLAIMED', 'RETRY_WAIT'] } },
+          orderBy: { updatedAt: 'asc' },
+          select: { updatedAt: true },
+        }),
         prisma.incomingReconciliationIssue.count({ where: { status: 'EXHAUSTED' } }),
         prisma.webhookDelivery.count({
           where: { status: { in: ['AVAILABLE', 'RETRY_WAIT', 'CLAIMED'] } },
         }),
+        prisma.backupRestoreVerification.findFirst({
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          select: { status: true },
+        }),
       ])
-      const oldestReviewRequiredAgeSeconds =
-        oldestReviewRequiredPayment === null
+      const ageSeconds = (timestamp: Date | undefined): number | null =>
+        timestamp === undefined
           ? null
-          : Math.max(
-              0,
-              Math.floor(
-                (Date.now() - oldestReviewRequiredPayment.updatedAt.getTime()) / 1_000,
-              ),
-            )
+          : Math.max(0, Math.floor((Date.now() - timestamp.getTime()) / 1_000))
+      const oldestReviewRequiredAgeSeconds = ageSeconds(
+        oldestReviewRequiredPayment?.updatedAt,
+      )
+      const oldestWorkItemAgeSeconds = ageSeconds(oldestActiveWorkItem?.updatedAt)
       return {
         reviewRequiredPayments,
         oldestReviewRequiredAgeSeconds,
+        oldestWorkItemAgeSeconds,
         exhaustedIncomingIssues,
         pendingWebhookDeliveries,
+        restoreVerificationFailed: latestBackupVerification?.status === 'FAILED',
       }
     },
 
