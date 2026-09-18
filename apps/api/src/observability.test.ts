@@ -72,6 +72,27 @@ describe('MetricsRegistry', () => {
     ])
   })
 
+  it('uses explicitly supplied thresholds for domain health evaluation', () => {
+    const snapshot = createDomainHealthSnapshot({
+      health: {
+        reviewRequiredPayments: 2,
+        oldestReviewRequiredAgeSeconds: 120,
+        exhaustedIncomingIssues: 0,
+        pendingWebhookDeliveries: 2,
+      },
+      dependencyDegraded: false,
+      thresholds: {
+        reviewRequiredBacklog: 3,
+        reviewRequiredAgeSeconds: 300,
+        noProgressSeconds: 300,
+        databaseSaturationRatio: 0.9,
+        webhookBacklog: 3,
+      },
+    })
+
+    expect(snapshot.alerts).toEqual([])
+  })
+
   it('projects durable health data into checks without dropping alert categories', () => {
     const snapshot = createDomainHealthSnapshot({
       health: {

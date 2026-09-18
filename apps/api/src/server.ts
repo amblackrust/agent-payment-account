@@ -225,7 +225,11 @@ async function startServer(): Promise<void> {
         } catch {
           dependencyDegraded = true
         }
-        return createDomainHealthSnapshot({ health, dependencyDegraded })
+        return createDomainHealthSnapshot({
+          health,
+          dependencyDegraded,
+          thresholds: limits.domainAlertThresholds,
+        })
       },
     },
   })

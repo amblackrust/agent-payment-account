@@ -72,7 +72,8 @@ operations requested by the implementation plan:
   selected here.
 - TASK-030: `apps/api/src/observability.ts` and `apps/api/src/app.ts` provide
   redacted structured request logging, low-cardinality metrics, fixed-cardinality
-  domain alert gauges, deployable Prometheus rules, and separate
+  domain alert gauges with validated runtime-configurable thresholds, deployable
+  Prometheus rules, and separate
   liveness/readiness/domain endpoints. Payment correlation is persisted through
   durable work, worker/custody/rail execution, timeline, webhook, and operator
   resolution events. Production alert-rule reload and failure-campaign evidence

@@ -44,6 +44,13 @@ claims to expire and be recovered by another worker.
   [`ops/prometheus/mux-v2-alerts.yml`](../ops/prometheus/mux-v2-alerts.yml).
   The rules use the fixed-cardinality `mux_domain_alert_active` gauges and
   keep workflow/resource IDs out of labels.
+- Alert thresholds are runtime configuration rather than metric labels:
+  `REVIEW_REQUIRED_BACKLOG_ALERT_THRESHOLD`,
+  `REVIEW_REQUIRED_AGE_ALERT_SECONDS`, `NO_PROGRESS_ALERT_SECONDS`,
+  `DATABASE_SATURATION_ALERT_RATIO`, and
+  `WEBHOOK_BACKLOG_ALERT_THRESHOLD`. The defaults are documented in
+  [`.env.example`](../.env.example); production should inject them through
+  the deployment configuration or secret/config backend.
 
 ## Encrypted backup and verified restore
 

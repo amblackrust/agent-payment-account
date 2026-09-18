@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { DomainAlertThresholds } from './observability.js'
 
 const positiveInt = (defaultValue: number, maximum: number) =>
   z.coerce.number().int().min(1).max(maximum).default(defaultValue)
@@ -30,6 +31,7 @@ export interface RuntimeLimits {
   readonly webhookTimeoutMs: number
   readonly credentialRecoveryTtlSeconds: number
   readonly maxPageSize: number
+  readonly domainAlertThresholds: DomainAlertThresholds
 }
 
 export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = {
@@ -56,6 +58,13 @@ export const DEFAULT_RUNTIME_LIMITS: RuntimeLimits = {
   webhookTimeoutMs: 5_000,
   credentialRecoveryTtlSeconds: DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS,
   maxPageSize: 100,
+  domainAlertThresholds: {
+    reviewRequiredBacklog: 1,
+    reviewRequiredAgeSeconds: 300,
+    noProgressSeconds: 300,
+    databaseSaturationRatio: 0.9,
+    webhookBacklog: 1,
+  },
 }
 
 const configSchema = z.object({
@@ -171,6 +180,27 @@ const configSchema = z.object({
     86_400,
   ),
   MAX_PAGE_SIZE: positiveInt(DEFAULT_RUNTIME_LIMITS.maxPageSize, 1_000),
+  REVIEW_REQUIRED_BACKLOG_ALERT_THRESHOLD: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.domainAlertThresholds.reviewRequiredBacklog,
+    1_000_000,
+  ),
+  REVIEW_REQUIRED_AGE_ALERT_SECONDS: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.domainAlertThresholds.reviewRequiredAgeSeconds,
+    31_536_000,
+  ),
+  NO_PROGRESS_ALERT_SECONDS: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.domainAlertThresholds.noProgressSeconds,
+    31_536_000,
+  ),
+  DATABASE_SATURATION_ALERT_RATIO: z.coerce
+    .number()
+    .gt(0)
+    .lte(1)
+    .default(DEFAULT_RUNTIME_LIMITS.domainAlertThresholds.databaseSaturationRatio),
+  WEBHOOK_BACKLOG_ALERT_THRESHOLD: positiveInt(
+    DEFAULT_RUNTIME_LIMITS.domainAlertThresholds.webhookBacklog,
+    1_000_000,
+  ),
   ALLOW_MAINNET: z.preprocess((value: unknown) => {
     if (value === undefined) {
       return false
@@ -456,6 +486,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       webhookTimeoutMs: result.data.WEBHOOK_TIMEOUT_MS,
       credentialRecoveryTtlSeconds: result.data.CREDENTIAL_RECOVERY_TTL_SECONDS,
       maxPageSize: result.data.MAX_PAGE_SIZE,
+      domainAlertThresholds: {
+        reviewRequiredBacklog: result.data.REVIEW_REQUIRED_BACKLOG_ALERT_THRESHOLD,
+        reviewRequiredAgeSeconds: result.data.REVIEW_REQUIRED_AGE_ALERT_SECONDS,
+        noProgressSeconds: result.data.NO_PROGRESS_ALERT_SECONDS,
+        databaseSaturationRatio: result.data.DATABASE_SATURATION_ALERT_RATIO,
+        webhookBacklog: result.data.WEBHOOK_BACKLOG_ALERT_THRESHOLD,
+      },
     },
   }
 }

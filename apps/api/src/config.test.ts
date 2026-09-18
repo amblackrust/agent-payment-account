@@ -30,6 +30,13 @@ describe('configuration', () => {
     expect(config.limits?.requestBurstLimit).toBe(30)
     expect(config.limits?.receiveRateLimitPerWindow).toBe(120)
     expect(config.limits?.credentialRecoveryTtlSeconds).toBe(900)
+    expect(config.limits?.domainAlertThresholds).toEqual({
+      reviewRequiredBacklog: 1,
+      reviewRequiredAgeSeconds: 300,
+      noProgressSeconds: 300,
+      databaseSaturationRatio: 0.9,
+      webhookBacklog: 1,
+    })
   })
 
   it('loads bounded worker, capacity, and pagination limits', () => {
@@ -48,6 +55,11 @@ describe('configuration', () => {
       RPC_CAPACITY_PER_WINDOW: '11',
       CREDENTIAL_RECOVERY_TTL_SECONDS: '1800',
       MAX_PAGE_SIZE: '25',
+      REVIEW_REQUIRED_BACKLOG_ALERT_THRESHOLD: '4',
+      REVIEW_REQUIRED_AGE_ALERT_SECONDS: '900',
+      NO_PROGRESS_ALERT_SECONDS: '1200',
+      DATABASE_SATURATION_ALERT_RATIO: '0.85',
+      WEBHOOK_BACKLOG_ALERT_THRESHOLD: '7',
       CUSTODY_BACKEND_IDENTITY: 'local-test-custody',
       CUSTODY_BACKEND_MODE: 'LOCAL_TEST',
     })
@@ -66,6 +78,13 @@ describe('configuration', () => {
       rpcCapacityPerWindow: 11,
       credentialRecoveryTtlSeconds: 1800,
       maxPageSize: 25,
+      domainAlertThresholds: {
+        reviewRequiredBacklog: 4,
+        reviewRequiredAgeSeconds: 900,
+        noProgressSeconds: 1200,
+        databaseSaturationRatio: 0.85,
+        webhookBacklog: 7,
+      },
     })
   })
 

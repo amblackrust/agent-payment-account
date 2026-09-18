@@ -113,20 +113,25 @@ export interface DomainHealthData {
 export function createDomainHealthSnapshot(input: {
   readonly health: DomainHealthData
   readonly dependencyDegraded: boolean
+  readonly thresholds?: DomainAlertThresholds
   readonly workerError?: string
 }): DomainHealthSnapshot {
-  const alerts = evaluateDomainAlerts({
-    reviewRequiredPayments: input.health.reviewRequiredPayments,
-    oldestReviewRequiredAgeSeconds: input.health.oldestReviewRequiredAgeSeconds ?? null,
-    exhaustedIncomingIssues: input.health.exhaustedIncomingIssues,
-    custodyFailures: input.health.custodyFailures ?? 0,
-    noProgressSeconds: input.health.oldestWorkItemAgeSeconds ?? null,
-    databaseSaturationRatio: input.health.databaseSaturationRatio ?? null,
-    dependencyDegraded: input.dependencyDegraded,
-    pendingWebhookDeliveries: input.health.pendingWebhookDeliveries,
-    restoreVerificationFailed: input.health.restoreVerificationFailed ?? false,
-    runtimeIdentityMismatch: input.health.runtimeIdentityMismatch ?? false,
-  })
+  const alerts = evaluateDomainAlerts(
+    {
+      reviewRequiredPayments: input.health.reviewRequiredPayments,
+      oldestReviewRequiredAgeSeconds:
+        input.health.oldestReviewRequiredAgeSeconds ?? null,
+      exhaustedIncomingIssues: input.health.exhaustedIncomingIssues,
+      custodyFailures: input.health.custodyFailures ?? 0,
+      noProgressSeconds: input.health.oldestWorkItemAgeSeconds ?? null,
+      databaseSaturationRatio: input.health.databaseSaturationRatio ?? null,
+      dependencyDegraded: input.dependencyDegraded,
+      pendingWebhookDeliveries: input.health.pendingWebhookDeliveries,
+      restoreVerificationFailed: input.health.restoreVerificationFailed ?? false,
+      runtimeIdentityMismatch: input.health.runtimeIdentityMismatch ?? false,
+    },
+    input.thresholds,
+  )
   const alertNames = new Set(alerts.map((alert) => alert.name))
   const checks: Record<string, 'ok' | 'degraded'> = {
     review_required: input.health.reviewRequiredPayments === 0 ? 'ok' : 'degraded',

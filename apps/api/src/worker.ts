@@ -275,6 +275,7 @@ async function startWorker(): Promise<void> {
         return createDomainHealthSnapshot({
           health,
           dependencyDegraded,
+          thresholds: limits.domainAlertThresholds,
           ...(lastWorkerError === undefined ? {} : { workerError: lastWorkerError }),
         })
       },
