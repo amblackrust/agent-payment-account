@@ -1,8 +1,13 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
+
+import {
+  assertDistinctDatabaseIdentity,
+  assertFreshRuntimeAuthority,
+} from './restore-safety.mjs'
 
 const command = process.argv[2]
 
@@ -26,6 +31,7 @@ function createBackup(outputArgument) {
   const dumpPath = path.join(temporaryDirectory, 'database.dump')
 
   try {
+    mkdirSync(path.dirname(output), { recursive: true, mode: 0o700 })
     run('pg_dump', [
       '--format=custom',
       '--no-owner',
@@ -54,11 +60,10 @@ function verifyBackup(inputArgument) {
   if (environment === 'production') {
     throw new Error('Backup verification must target a non-production environment')
   }
-  if (targetDatabaseUrl === sourceDatabaseUrl) {
-    throw new Error(
-      'Backup verification target must be isolated from the source database',
-    )
-  }
+  const sourceDatabaseIdentity = readDatabaseIdentity(sourceDatabaseUrl)
+  const targetDatabaseIdentity = readDatabaseIdentity(targetDatabaseUrl)
+  assertDistinctDatabaseIdentity(sourceDatabaseIdentity, targetDatabaseIdentity)
+  const sourceRuntimeAuthority = readRuntimeAuthority(sourceDatabaseUrl)
 
   const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), 'mux-restore-'))
   const dumpPath = path.join(temporaryDirectory, 'database.dump')
@@ -77,6 +82,12 @@ function verifyBackup(inputArgument) {
       targetDatabaseUrl,
       dumpPath,
     ])
+    const restoredRuntimeAuthority = readRuntimeAuthority(targetDatabaseUrl)
+    assertFreshRuntimeAuthority(
+      sourceRuntimeAuthority,
+      restoredRuntimeAuthority,
+      runtimeAuthorityId,
+    )
     runSql(targetDatabaseUrl, setRestoredRuntimePendingSql(), {
       runtime_authority: runtimeAuthorityId,
     })
@@ -342,6 +353,28 @@ function runSql(databaseUrl, sql, variables = {}) {
     args.push('--variable', `${key}=${value}`)
   args.push('--command', sql)
   return run('psql', args).trim()
+}
+
+function readDatabaseIdentity(databaseUrl) {
+  return runSql(
+    databaseUrl,
+    `SELECT current_database() || E'\\t' ||
+      COALESCE(inet_server_addr()::TEXT, 'local') || E'\\t' ||
+      COALESCE(inet_server_port()::TEXT, current_setting('port'));`,
+  )
+}
+
+function readRuntimeAuthority(databaseUrl) {
+  const authority = runSql(
+    databaseUrl,
+    `SELECT "value"
+       FROM "RuntimeMetadata"
+      WHERE "key" = 'runtime_authority';`,
+  )
+  if (authority.length === 0) {
+    throw new Error('Database has no persisted runtime authority')
+  }
+  return authority
 }
 
 function run(commandName, args) {

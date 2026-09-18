@@ -79,18 +79,9 @@ async function startServer(): Promise<void> {
       validateLegacyWalletCustody(walletCipher, custody),
     )
   } else {
-    await database.checkRuntimeIdentity({
-      rail: runtimeIdentity.rail,
-      version: runtimeIdentity.version,
-      cluster: runtimeIdentity.cluster,
-      settlementMint: runtimeIdentity.settlementMint,
-      ...(runtimeIdentity.custodyBackendIdentity === undefined
-        ? {}
-        : { custodyBackendIdentity: runtimeIdentity.custodyBackendIdentity }),
-      ...(runtimeIdentity.custodyBackendMode === undefined
-        ? {}
-        : { custodyBackendMode: runtimeIdentity.custodyBackendMode }),
-    })
+    // The dedicated API does not validate legacy signer plaintext, but it must
+    // still fail closed when the persisted financial identity is absent or stale.
+    await database.initializeRuntimeIdentity(runtimeIdentity)
   }
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)

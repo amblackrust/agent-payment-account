@@ -64,6 +64,11 @@ close the database and let durable leases expire for recovery by another
 worker; no recovery-critical state may exist only in memory. The claim cadence
 is controlled by `WORKER_INTERVAL_MS` (default `5000`).
 
+The `maintenance` role has a separate required `BACKUP_INTERVAL_SECONDS`.
+There is no implicit backup frequency: the maintenance worker only creates and
+verifies one backup per configured interval, and it requires the isolated
+verification database and age identity at startup.
+
 ## Promotion and restore gate
 
 1. Apply an additive migration and verify its status before starting a new

@@ -4,6 +4,7 @@ const positiveInt = (defaultValue: number, maximum: number) =>
   z.coerce.number().int().min(1).max(maximum).default(defaultValue)
 
 export const DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS = 15 * 60
+const MAX_BACKUP_INTERVAL_SECONDS = 365 * 24 * 60 * 60
 
 export interface RuntimeLimits {
   readonly workerBatchSize: number
@@ -99,6 +100,12 @@ const configSchema = z.object({
   BACKUP_AGE_IDENTITY: z.string().min(1).optional(),
   BACKUP_VERIFY_DATABASE_URL: z.string().trim().min(1).optional(),
   BACKUP_OUTPUT_DIRECTORY: z.string().trim().min(1).optional(),
+  BACKUP_INTERVAL_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_BACKUP_INTERVAL_SECONDS)
+    .optional(),
   CUSTODY_BACKEND_IDENTITY: z.string().trim().min(1).optional(),
   CUSTODY_BACKEND_MODE: z.enum(['EXTERNAL', 'LOCAL_TEST']).optional(),
   WORKER_BATCH_SIZE: positiveInt(DEFAULT_RUNTIME_LIMITS.workerBatchSize, 1_000),
@@ -201,6 +208,7 @@ export type AppConfig = {
   readonly backupAgeIdentity?: string
   readonly backupVerifyDatabaseUrl?: string
   readonly backupOutputDirectory?: string
+  readonly backupIntervalSeconds?: number
   readonly custodyBackendIdentity?: string
   readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
   readonly allowMainnet: boolean
@@ -298,6 +306,19 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       'BACKUP_OUTPUT_DIRECTORY is required for the maintenance runtime role',
     )
   }
+  if (runtimeRole === 'maintenance' && result.data.BACKUP_AGE_RECIPIENT === undefined) {
+    throw new ConfigurationError(
+      'BACKUP_AGE_RECIPIENT is required for the maintenance runtime role',
+    )
+  }
+  if (
+    runtimeRole === 'maintenance' &&
+    result.data.BACKUP_INTERVAL_SECONDS === undefined
+  ) {
+    throw new ConfigurationError(
+      'BACKUP_INTERVAL_SECONDS is required for the maintenance runtime role',
+    )
+  }
   if (
     (result.data.BACKUP_AGE_IDENTITY === undefined) !==
     (result.data.BACKUP_VERIFY_DATABASE_URL === undefined)
@@ -328,7 +349,15 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   }
   if (
     runtimeRole === 'maintenance' &&
-    result.data.BACKUP_AGE_IDENTITY !== undefined &&
+    (result.data.BACKUP_AGE_IDENTITY === undefined ||
+      result.data.BACKUP_VERIFY_DATABASE_URL === undefined)
+  ) {
+    throw new ConfigurationError(
+      'BACKUP_AGE_IDENTITY and BACKUP_VERIFY_DATABASE_URL are required for the maintenance runtime role',
+    )
+  }
+  if (
+    runtimeRole === 'maintenance' &&
     (result.data.RUNTIME_AUTHORITY_ID === undefined ||
       result.data.CUSTODY_BACKEND_IDENTITY === undefined)
   ) {
@@ -374,6 +403,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     ...(result.data.BACKUP_OUTPUT_DIRECTORY === undefined
       ? {}
       : { backupOutputDirectory: result.data.BACKUP_OUTPUT_DIRECTORY }),
+    ...(result.data.BACKUP_INTERVAL_SECONDS === undefined
+      ? {}
+      : { backupIntervalSeconds: result.data.BACKUP_INTERVAL_SECONDS }),
     ...(result.data.CUSTODY_BACKEND_IDENTITY === undefined
       ? {}
       : { custodyBackendIdentity: result.data.CUSTODY_BACKEND_IDENTITY }),

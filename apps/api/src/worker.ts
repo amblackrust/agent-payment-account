@@ -17,6 +17,7 @@ import {
   getRuntimeLimits,
   loadConfig,
   redactConfig,
+  type AppConfig,
   type RuntimeLimits,
 } from './config.js'
 import { DurableCapacityController } from './capacity.js'
@@ -28,6 +29,7 @@ import {
   WalletSecretCipher,
 } from './custody.js'
 import { createDomainHealthSnapshot } from './observability.js'
+import { MaintenanceSchedule } from './maintenance-schedule.js'
 import type { V2OutgoingWorker } from './outgoing-v2.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { waitForShutdown } from './lifecycle.js'
@@ -91,6 +93,7 @@ class EnvironmentWebhookSigningKeyProvider implements WebhookSigningKeyProvider 
 class MaintenanceWorker implements RuntimeWorker {
   private stopped = false
   private currentRun: Promise<void> | undefined
+  private readonly schedule: MaintenanceSchedule
 
   public constructor(
     private readonly outputDirectory: string,
@@ -99,7 +102,9 @@ class MaintenanceWorker implements RuntimeWorker {
     private readonly verifyDatabaseUrl: string | undefined,
     private readonly runtimeAuthorityId: string | undefined,
     private readonly custodyIdentity: string | undefined,
+    backupIntervalSeconds: number,
   ) {
+    this.schedule = new MaintenanceSchedule(backupIntervalSeconds * 1_000)
     if (recipient === undefined) {
       throw new ConfigurationError(
         'BACKUP_AGE_RECIPIENT is required for the maintenance runtime role',
@@ -115,6 +120,7 @@ class MaintenanceWorker implements RuntimeWorker {
   public runOnce(): Promise<void> {
     if (this.stopped) return Promise.resolve()
     if (this.currentRun !== undefined) return this.currentRun
+    if (!this.schedule.claim()) return Promise.resolve()
     const run = this.createAndVerifyBackup()
     let tracked: Promise<void>
     tracked = run.finally(() => {
@@ -319,6 +325,9 @@ async function startWorker(): Promise<void> {
           ...(config.backupVerifyDatabaseUrl === undefined
             ? {}
             : { backupVerifyDatabaseUrl: config.backupVerifyDatabaseUrl }),
+          ...(config.backupIntervalSeconds === undefined
+            ? {}
+            : { backupIntervalSeconds: config.backupIntervalSeconds }),
           ...(config.runtimeAuthorityId === undefined
             ? {}
             : { runtimeAuthorityId: config.runtimeAuthorityId }),
@@ -380,7 +389,8 @@ async function startWorker(): Promise<void> {
     await v2OutgoingRuntime?.checkReadiness()
     await app.listen({ host: '0.0.0.0', port: config.port })
     runWorker()
-    timer = setInterval(runWorker, limits.workerIntervalMs)
+    const intervalMs = getWorkerIntervalMs(config, limits.workerIntervalMs)
+    timer = setInterval(runWorker, intervalMs)
     app.log.info(
       { config: redactConfig(config), role: config.runtimeRole },
       'Worker started',
@@ -395,6 +405,16 @@ async function startWorker(): Promise<void> {
   }
 }
 
+function getWorkerIntervalMs(config: AppConfig, defaultIntervalMs: number): number {
+  if (config.runtimeRole !== 'maintenance') return defaultIntervalMs
+  if (config.backupIntervalSeconds === undefined) {
+    throw new ConfigurationError(
+      'BACKUP_INTERVAL_SECONDS is required for the maintenance runtime role',
+    )
+  }
+  return config.backupIntervalSeconds * 1_000
+}
+
 function createWorker(input: {
   readonly role: 'outgoing' | 'reconcile' | 'incoming' | 'webhook' | 'maintenance'
   readonly database: ReturnType<typeof createDatabaseClient>
@@ -405,6 +425,7 @@ function createWorker(input: {
   readonly backupAgeRecipient?: string
   readonly backupAgeIdentity?: string
   readonly backupVerifyDatabaseUrl?: string
+  readonly backupIntervalSeconds?: number
   readonly runtimeAuthorityId?: string
   readonly custodyIdentity?: string
   readonly limits: RuntimeLimits
@@ -454,6 +475,9 @@ function createWorker(input: {
   if (input.backupOutputDirectory === undefined) {
     throw new ConfigurationError('Backup output directory is unavailable')
   }
+  if (input.backupIntervalSeconds === undefined) {
+    throw new ConfigurationError('Backup interval is unavailable')
+  }
   return new MaintenanceWorker(
     input.backupOutputDirectory,
     input.backupAgeRecipient,
@@ -461,6 +485,7 @@ function createWorker(input: {
     input.backupVerifyDatabaseUrl,
     input.runtimeAuthorityId,
     input.custodyIdentity,
+    input.backupIntervalSeconds,
   )
 }
 

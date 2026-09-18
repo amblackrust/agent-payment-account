@@ -149,6 +149,43 @@ describe('configuration', () => {
     expect(config.runtimeAuthorityId).toBe('runtime-restore-1')
   })
 
+  it('requires an explicit verified maintenance backup schedule', () => {
+    const maintenanceEnvironment = {
+      ...validEnvironment,
+      RUNTIME_ROLE: 'maintenance',
+      SOLANA_FEE_PAYER_SECRET: undefined,
+      WALLET_MASTER_KEY: undefined,
+      RECOVERY_ENVELOPE_KEY: undefined,
+      BACKUP_OUTPUT_DIRECTORY: '/var/lib/mux/backups',
+      BACKUP_AGE_RECIPIENT: 'age1maintenance',
+      BACKUP_AGE_IDENTITY: '/secure/restore/age-key.txt',
+      BACKUP_VERIFY_DATABASE_URL:
+        'postgresql://postgres:postgres@127.0.0.1:5433/mux_restore',
+      BACKUP_INTERVAL_SECONDS: '3600',
+      RUNTIME_AUTHORITY_ID: 'maintenance-restore-authority',
+      CUSTODY_BACKEND_IDENTITY: 'custody-reference',
+    }
+
+    const config = loadConfig(maintenanceEnvironment)
+
+    expect(config.backupIntervalSeconds).toBe(3600)
+    expect(config.backupAgeIdentity).toBe('/secure/restore/age-key.txt')
+    expect(config.backupVerifyDatabaseUrl).toContain('mux_restore')
+
+    const { BACKUP_INTERVAL_SECONDS: _interval, ...withoutInterval } =
+      maintenanceEnvironment
+    expect(() => loadConfig(withoutInterval)).toThrow('BACKUP_INTERVAL_SECONDS')
+
+    const {
+      BACKUP_AGE_IDENTITY: _identity,
+      BACKUP_VERIFY_DATABASE_URL: _verifyDatabaseUrl,
+      ...withoutVerification
+    } = maintenanceEnvironment
+    expect(() => loadConfig(withoutVerification)).toThrow(
+      'BACKUP_AGE_IDENTITY and BACKUP_VERIFY_DATABASE_URL',
+    )
+  })
+
   it('redacts secrets from the serialized configuration', () => {
     const config = loadConfig({
       ...validEnvironment,

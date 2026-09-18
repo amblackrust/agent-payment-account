@@ -86,3 +86,9 @@ Start incoming reconciliation first, inspect the durable
 The original authority must be fenced before promotion; a restored copy never
 reuses its source authority ID.
 Exact RPO/RTO and retention values remain workload/risk decisions (OD-008).
+
+The maintenance role additionally requires `BACKUP_INTERVAL_SECONDS`,
+`BACKUP_AGE_IDENTITY`, and `BACKUP_VERIFY_DATABASE_URL`; its backup cadence is
+independent from the worker claim loop. The restore command rejects a target
+that resolves to the same PostgreSQL backend as the source and rejects reusing
+the source or restored snapshot's runtime authority.
