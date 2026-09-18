@@ -69,7 +69,7 @@ scope reductions:
   such as the maximum page size; those wrappers must not redefine money,
   status, error, or credential semantics.
 
-## TASK-029..035 and TASK-039 audit
+## TASK-029..035 audit and TASK-039 pre-gate status
 
 The following evidence is scoped to the Solana rail boundary and the runtime
 operations requested by the implementation plan:
@@ -110,9 +110,11 @@ operations requested by the implementation plan:
   record restore verification/reconciliation events in the append-only timeline.
   A real restore drill and OD-008 RPO/RTO/retention values still require
   controlled infrastructure.
-- TASK-035/TASK-039: repository regression commands and the exact changed-file
-  evidence are recorded at handoff. Worker-kill, DB-restart, real custody, and
-  paid external proof cannot be represented by unit tests in this workspace.
+- TASK-035: repository regression commands and the exact changed-file evidence
+  are recorded at handoff. Worker-kill, DB-restart, and real custody evidence
+  cannot be represented by unit tests in this workspace.
+- TASK-039 is not complete before TASK-038: the paid external proof and its
+  artifacts must be supplied through the selected authorized service gate.
 
 ## Scoped dependency security remediation
 
