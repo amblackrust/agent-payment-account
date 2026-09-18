@@ -964,6 +964,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             description: { type: 'string', minLength: 1, maxLength: 500 },
             external_reference: { type: 'string', minLength: 1, maxLength: 255 },
             route_preference: { type: 'string', minLength: 1, maxLength: 64 },
+            metadata: { type: 'object', additionalProperties: true },
           },
           required: ['recipient_id', 'amount', 'denomination_id'],
         },
@@ -984,6 +985,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           denomination_id: string
           description?: string
           external_reference?: string
+          metadata?: Record<string, unknown>
           route_preference?: string
         }
       }>(
@@ -1017,6 +1019,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             ...(request.body.external_reference === undefined
               ? {}
               : { externalReference: request.body.external_reference }),
+            ...(request.body.metadata === undefined
+              ? {}
+              : { metadata: request.body.metadata }),
             ...(request.body.route_preference === undefined
               ? {}
               : { routePreference: request.body.route_preference }),
@@ -1142,6 +1147,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
           denomination_id: string
           description?: string
           external_reference?: string
+          metadata?: Record<string, unknown>
           route_preference?: string
         }
       }>(
@@ -1172,6 +1178,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
                 denomination_id: { type: 'string', minLength: 1, maxLength: 64 },
                 description: { type: 'string', minLength: 1, maxLength: 500 },
                 external_reference: { type: 'string', minLength: 1, maxLength: 255 },
+                metadata: { type: 'object', additionalProperties: true },
                 route_preference: { type: 'string', minLength: 1, maxLength: 64 },
               },
             },
@@ -1190,6 +1197,9 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
               ...(request.body.external_reference === undefined
                 ? {}
                 : { externalReference: request.body.external_reference }),
+              ...(request.body.metadata === undefined
+                ? {}
+                : { metadata: request.body.metadata }),
               ...(request.body.route_preference === undefined
                 ? {}
                 : { routePreference: request.body.route_preference }),

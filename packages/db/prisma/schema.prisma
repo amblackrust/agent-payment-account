@@ -194,6 +194,7 @@ model Payment {
   status                    PaymentStatus        @default(CREATED)
   description               String?              @db.Text
   externalReference         String?              @map("external_reference") @db.VarChar(255)
+  metadataJson              String               @default("{}") @map("metadata_json") @db.Text
   route                     String?              @db.VarChar(64)
   routeId                   String?              @map("route_id") @db.VarChar(64)
   routeSelectionReason      String?              @map("route_selection_reason") @db.VarChar(64)

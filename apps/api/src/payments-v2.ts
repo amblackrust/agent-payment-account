@@ -36,6 +36,7 @@ import type {
 
 const DEFAULT_APPROVAL_TTL_SECONDS = 15 * 60
 const MAX_PAGE_SIZE = 100
+const MAX_PAYMENT_METADATA_BYTES = 16 * 1024
 
 export interface V2SettledBalanceProvider {
   getSettledAtomic(input: {
@@ -63,6 +64,7 @@ export interface V2CreatePaymentInput {
   readonly denominationId: string
   readonly description?: string
   readonly externalReference?: string
+  readonly metadata?: Readonly<Record<string, unknown>>
   readonly routePreference?: string
   readonly originalPaymentId?: string
   readonly target?: V2PaymentTarget
@@ -113,6 +115,7 @@ export class V2PaymentService {
     if (amount.atomicUnits <= 0n) {
       throw new ValidationError('Payment amount must be positive')
     }
+    const metadataJson = serializePaymentMetadata(input.metadata)
     const fingerprint = hashJson({
       kind: input.kind,
       recipient_id: input.recipientId,
@@ -120,6 +123,7 @@ export class V2PaymentService {
       denomination_id: denomination.id,
       description: input.description ?? null,
       external_reference: input.externalReference ?? null,
+      metadata_json: metadataJson ?? null,
       route_preference: input.routePreference ?? null,
       original_payment_id: input.originalPaymentId ?? null,
     })
@@ -359,6 +363,7 @@ export class V2PaymentService {
         ...(input.externalReference === undefined
           ? {}
           : { externalReference: input.externalReference }),
+        ...(metadataJson === undefined ? {} : { metadataJson }),
         route: policyDecision.decision === 'DENY' ? null : route,
         routeSelectionReason:
           policyDecision.decision === 'DENY' ? null : routeSelection.reason,
@@ -615,6 +620,81 @@ function fingerprintDestination(input: {
   return hashJson(input)
 }
 
+function serializePaymentMetadata(
+  metadata: Readonly<Record<string, unknown>> | undefined,
+): string | undefined {
+  if (metadata === undefined) return undefined
+  let normalized: unknown
+  try {
+    normalized = normalizeJsonValue(metadata, new WeakSet<object>())
+  } catch (error: unknown) {
+    if (error instanceof ValidationError) throw error
+    throw new ValidationError('Payment metadata must be valid JSON')
+  }
+  const serialized = JSON.stringify(normalized)
+  if (serialized === undefined) {
+    throw new ValidationError('Payment metadata must be a JSON object')
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_PAYMENT_METADATA_BYTES) {
+    throw new ValidationError(
+      `Payment metadata must not exceed ${MAX_PAYMENT_METADATA_BYTES} bytes`,
+    )
+  }
+  return serialized
+}
+
+function normalizeJsonValue(value: unknown, ancestors: WeakSet<object>): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return value
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value))
+      throw new ValidationError('Payment metadata has an invalid number')
+    return value
+  }
+  if (typeof value !== 'object') {
+    throw new ValidationError('Payment metadata must contain only JSON values')
+  }
+  if (ancestors.has(value)) {
+    throw new ValidationError('Payment metadata must not contain circular references')
+  }
+  ancestors.add(value)
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => normalizeJsonValue(item, ancestors))
+    }
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new ValidationError('Payment metadata must contain only JSON values')
+    }
+    const normalized: Record<string, unknown> = {}
+    for (const key of Object.keys(value)) {
+      normalized[key] = normalizeJsonValue(
+        (value as Record<string, unknown>)[key],
+        ancestors,
+      )
+    }
+    return Object.fromEntries(
+      Object.entries(normalized).sort(([left], [right]) => left.localeCompare(right)),
+    )
+  } finally {
+    ancestors.delete(value)
+  }
+}
+
+function parsePaymentMetadata(serialized: string | undefined): Record<string, unknown> {
+  if (serialized === undefined) return {}
+  try {
+    const parsed: unknown = JSON.parse(serialized)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('metadata is not an object')
+    }
+    return parsed as Record<string, unknown>
+  } catch {
+    throw new InvalidStateError('Payment metadata is corrupt')
+  }
+}
+
 function hashJson(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex')
 }
@@ -667,6 +747,7 @@ export function serializeV2PaymentView(
     recipient_id: view.payment.recipientId,
     description: view.payment.description,
     external_reference: view.payment.externalReference,
+    metadata: parsePaymentMetadata(view.payment.metadataJson),
     amount: formatExactMoney(
       exactMoneyFromAtomicUnits(view.payment.amountAtomic, denomination),
     ),

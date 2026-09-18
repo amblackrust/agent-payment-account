@@ -120,6 +120,7 @@ export interface V2Payment {
   readonly recipientId: string | null
   readonly description: string | null
   readonly externalReference: string | null
+  readonly metadata: Readonly<Record<string, unknown>>
   readonly amount: string
   readonly denominationId: string
   readonly denominationSymbol: string
@@ -151,6 +152,7 @@ export interface V2PaymentInput {
   readonly denominationId: string
   readonly description?: string
   readonly externalReference?: string
+  readonly metadata?: Readonly<Record<string, unknown>>
   readonly routePreference?: string
 }
 
@@ -164,6 +166,7 @@ export interface V2RefundInput {
   readonly denominationId: string
   readonly description?: string
   readonly externalReference?: string
+  readonly metadata?: Readonly<Record<string, unknown>>
   readonly routePreference?: string
 }
 
@@ -662,6 +665,7 @@ function parseV2Payment(value: unknown): V2Payment {
     recipientId: response.recipient_id,
     description: response.description,
     externalReference: response.external_reference,
+    metadata: response.metadata ?? {},
     amount: response.amount,
     denominationId: response.denomination_id,
     denominationSymbol: response.denomination_symbol,
@@ -914,6 +918,7 @@ function toApiV2PaymentInput(input: V2PaymentInput): V2PaymentCreateRequest {
     ...(input.externalReference === undefined
       ? {}
       : { external_reference: input.externalReference }),
+    ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
     ...(input.routePreference === undefined
       ? {}
       : { route_preference: input.routePreference }),
@@ -1222,6 +1227,7 @@ export class AgentPaymentAccount {
       ...(input.externalReference === undefined
         ? {}
         : { external_reference: input.externalReference }),
+      ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
       ...(input.routePreference === undefined
         ? {}
         : { route_preference: input.routePreference }),

@@ -70,6 +70,7 @@ export const v2PaymentCreateRequestSchema = z
     description: z.string().min(1).max(500).optional(),
     external_reference: z.string().min(1).max(255).optional(),
     route_preference: z.string().min(1).max(64).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()
 
@@ -80,6 +81,7 @@ export const v2PaymentResponseSchema = z
     recipient_id: z.string().nullable(),
     description: z.string().nullable(),
     external_reference: z.string().nullable(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
     amount: exactAmountSchema,
     denomination_id: z.string().min(1),
     denomination_symbol: z.string().min(1),

@@ -85,6 +85,7 @@ export interface V2PaymentSnapshot {
   readonly kind: string
   readonly description: string | null
   readonly externalReference: string | null
+  readonly metadataJson?: string
   readonly amountAtomic: bigint
   readonly amountScale: number | null
   readonly denominationId: string | null
@@ -171,6 +172,7 @@ export interface V2PaymentCreateInput {
   readonly currency: string
   readonly description?: string
   readonly externalReference?: string
+  readonly metadataJson?: string
   readonly originalPaymentId?: string
   readonly route: SettlementRoute | null
   readonly routeSelectionReason: string | null
@@ -1068,6 +1070,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             ...(input.externalReference === undefined
               ? {}
               : { externalReference: input.externalReference }),
+            metadataJson: input.metadataJson ?? '{}',
             ...(input.originalPaymentId === undefined
               ? {}
               : { originalPaymentId: input.originalPaymentId }),
@@ -2002,6 +2005,7 @@ function toV2PaymentSnapshot(payment: {
   kind: string
   description: string | null
   externalReference: string | null
+  metadataJson?: string
   amountAtomic: bigint
   amountScale: number | null
   denominationId: string | null

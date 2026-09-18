@@ -118,6 +118,7 @@ function createHarness(destinationApproved: boolean) {
           kind: input.operation,
           description: input.description ?? null,
           externalReference: input.externalReference ?? null,
+          metadataJson: input.metadataJson ?? '{}',
           amountAtomic: input.amountAtomic,
           amountScale: input.amountScale,
           denominationId: input.denominationId,
@@ -294,5 +295,28 @@ describe('V2 payment service', () => {
     expect(second.created).toBe(false)
     expect(second.view.payment.id).toBe(first.view.payment.id)
     expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
+  })
+
+  it('canonicalizes and round-trips bounded payment metadata', async () => {
+    const harness = createHarness(true)
+    const result = await harness.service.createPayment(
+      account,
+      {
+        kind: 'PAY',
+        recipientId: 'recipient_1',
+        amount: '1.25',
+        denominationId: 'denom_usd',
+        metadata: { z: 'last', nested: { b: 2, a: 1 } },
+      },
+      'idem_metadata',
+      'req_metadata',
+    )
+
+    expect(harness.getCaptured()?.metadataJson).toBe(
+      '{"nested":{"a":1,"b":2},"z":"last"}',
+    )
+    await expect(harness.service.serialize(result.view)).resolves.toMatchObject({
+      metadata: { nested: { a: 1, b: 2 }, z: 'last' },
+    })
   })
 })

@@ -217,10 +217,45 @@ const v2Balance = {
   degraded: false,
 }
 
+const v2Payment = {
+  id: 'pay_v2_test',
+  kind: 'PAY',
+  recipient_id: 'rcpt_test',
+  description: null,
+  external_reference: null,
+  metadata: {},
+  amount: '1.250',
+  denomination_id: 'usd',
+  denomination_symbol: 'USD',
+  status: 'ROUTING',
+  policy_decision: 'ALLOW',
+  policy_reason_codes: [],
+  approval_state: 'NOT_REQUIRED',
+  attempt_count: 1,
+  reservation_status: 'HELD',
+  route_id: 'route_solana',
+  route_selection_reason: 'configured_default',
+  settlement_asset_id: 'asset_usdc',
+  execution_state: 'QUEUED',
+  settlement_state: 'NOT_SUBMITTED',
+  outcome_state: 'NONE',
+  created_at: '2026-09-06T00:00:00.000Z',
+  updated_at: '2026-09-06T00:00:00.000Z',
+  confirmed_at: null,
+  failure_code: null,
+  failure_message: null,
+  original_payment_id: null,
+}
+
 async function createLocalV2Api(balance = v2Balance) {
   const app = Fastify()
   app.get('/v2/accounts/:accountId', async () => v2Account)
   app.get('/v2/balance', async () => balance)
+  app.post('/v2/payments', async (request) => ({
+    ...v2Payment,
+    metadata:
+      (request.body as { metadata?: Readonly<Record<string, unknown>> }).metadata ?? {},
+  }))
   app.post('/v2/recipients', async () => v2Recipient)
   app.get('/v2/recipients', async () => ({
     recipients: [v2Recipient],
@@ -261,6 +296,20 @@ describe('AgentPaymentAccount SDK', () => {
         accountId: 'acct_test',
         settled: '10.00',
         spendable: '8.80',
+      })
+      await expect(
+        account.createPaymentV2(
+          {
+            recipientId: 'rcpt_test',
+            amount: '1.250',
+            denominationId: 'usd',
+            metadata: { source: 'sdk', attempt: 1 },
+          },
+          { idempotencyKey: 'payment-v2-key' },
+        ),
+      ).resolves.toMatchObject({
+        id: 'pay_v2_test',
+        metadata: { source: 'sdk', attempt: 1 },
       })
       await expect(
         account.createRecipientV2({

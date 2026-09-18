@@ -70,6 +70,11 @@ and failure dimensions; `status` is a deterministic projection and is not a
 second source of truth. `RECONCILING`, `REVIEW_REQUIRED`, and
 `CLOSED_UNRESOLVED` are not ordinary failures.
 
+V2 payment and refund requests may include a JSON-object `metadata` field. It
+is persisted with the payment, included in the idempotency fingerprint, and
+returned unchanged in payment responses. Metadata is limited to 16 KiB after
+canonical JSON serialization.
+
 Admin-authenticated V2 routes manage account lifecycle and credentials,
 policies, approvals, approved destinations, and the operator exception inbox:
 
