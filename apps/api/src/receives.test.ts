@@ -126,4 +126,17 @@ describe('V2ReceiveService', () => {
       ),
     ).rejects.toThrow('Receive reference must not be blank')
   })
+
+  it('requires receive expiration to be a future RFC3339 instant', async () => {
+    const { service } = createService()
+
+    await expect(
+      service.createReceiveRequest(
+        'acct_1',
+        'owner-address',
+        { denominationId: 'usd', expiresAt: '2026-09-19' },
+        'receive-key',
+      ),
+    ).rejects.toThrow('Receive expiration must be a valid date')
+  })
 })

@@ -183,7 +183,9 @@ export class V2ReceiveService {
       input.expiresAt === undefined ? undefined : new Date(input.expiresAt)
     if (
       expiresAt !== undefined &&
-      (Number.isNaN(expiresAt.getTime()) || expiresAt <= this.now())
+      (!isCanonicalRfc3339Instant(input.expiresAt!) ||
+        Number.isNaN(expiresAt.getTime()) ||
+        expiresAt <= this.now())
     ) {
       throw new ValidationError('Receive expiration must be a valid date')
     }
