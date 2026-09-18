@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "pnpm --filter @agent-payment/api... build && tsx watch src/server.ts",
-    "dev:worker": "pnpm --filter @agent-payment/api... build && tsx watch src/worker.ts",
+    "dev": "pnpm --filter @agent-payment/api... build && node ../../scripts/run-with-root-env.mjs pnpm --filter @agent-payment/api exec tsx watch src/server.ts",
+    "dev:worker": "pnpm --filter @agent-payment/api... build && node ../../scripts/run-with-root-env.mjs pnpm --filter @agent-payment/api exec tsx watch src/worker.ts",
     "start": "node dist/server.js",
     "start:worker": "node dist/worker.js",
     "typecheck": "tsc --noEmit -p tsconfig.json"
@@ -17,7 +17,6 @@
     "@agent-payment/db": "workspace:*",
     "@agent-payment/solana-rail": "workspace:*",
     "@solana/kit": "8.2.0",
-    "dotenv": "17.4.2",
     "fastify": "5.12.3",
     "zod": "4.5.4"
   },
