@@ -94,10 +94,11 @@ operations requested by the implementation plan:
   Production-sized snapshot/backfill evidence is still an operational gate.
 - TASK-034: `scripts/backup-verify.mjs`, `restore-safety.mjs`, and the
   maintenance runtime now require an explicit backup cadence and isolated
-  verification material, create missing output directories, compare actual
-  PostgreSQL backend identities, and reject reusing the source/restored runtime
-  authority. A real restore drill and OD-008 RPO/RTO/retention values still
-  require controlled infrastructure.
+  verification material, create missing output directories, validate restored
+  payment/reservation/evidence/credential metadata, compare actual PostgreSQL
+  backend identities, and reject reusing the source/restored runtime authority.
+  A real restore drill and OD-008 RPO/RTO/retention values still require
+  controlled infrastructure.
 - TASK-035/TASK-039: repository regression commands and the exact changed-file
   evidence are recorded at handoff. Worker-kill, DB-restart, real custody, and
   paid external proof cannot be represented by unit tests in this workspace.

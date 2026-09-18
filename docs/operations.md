@@ -66,8 +66,8 @@ BACKUP_AGE_RECIPIENT='age1...' \
 ```
 
 Restore into an isolated PostgreSQL database and validate required tables,
-runtime identity, payment-attempt links, and the no-terminal-held-reservation
-invariant:
+runtime identity, payment/credential metadata, evidence and reservation links,
+payment-attempt links, and the no-terminal-held-reservation invariant:
 
 ```bash
 BACKUP_AGE_IDENTITY=/secure/restore/age-key.txt \

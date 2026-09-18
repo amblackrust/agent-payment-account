@@ -97,14 +97,15 @@ function verifyBackup(inputArgument) {
     })
     const values = summary.split('\t').map((value) => Number(value))
     if (
-      values.length !== 6 ||
+      values.length !== 15 ||
       values.some((value) => !Number.isInteger(value) || value < 0) ||
       values[0] < 10 ||
       values[1] !== 0 ||
       values[2] !== 0 ||
       values[3] !== 1 ||
       values[4] !== 1 ||
-      values[5] !== 1
+      values[5] !== 1 ||
+      values.slice(10).some((value) => value !== 0)
     ) {
       throw new Error(`Restore invariant validation failed: ${summary}`)
     }
@@ -115,6 +116,15 @@ function verifyBackup(inputArgument) {
       runtime_identity_rows: values[3],
       runtime_authority_rows: values[4],
       custody_identity_rows: values[5],
+      payment_rows: values[6],
+      reservation_rows: values[7],
+      evidence_rows: values[8],
+      credential_rows: values[9],
+      invalid_payment_metadata: values[10],
+      invalid_reservation_links: values[11],
+      invalid_evidence_metadata: values[12],
+      invalid_credential_metadata: values[13],
+      invalid_recovery_envelopes: values[14],
     })
     runSql(
       targetDatabaseUrl,
@@ -323,7 +333,36 @@ function restoreInvariantQuery() {
       WHERE "key" = 'runtime_authority' AND "value" = :'runtime_authority') AS runtime_authority_rows,
     (SELECT count(*) FROM "RuntimeMetadata"
       WHERE "key" = 'runtime_identity'
-        AND "value"::jsonb ->> 'custodyBackendIdentity' = :'custody_identity') AS custody_identity_rows;`
+        AND "value"::jsonb ->> 'custodyBackendIdentity' = :'custody_identity') AS custody_identity_rows,
+    (SELECT count(*) FROM payments) AS payment_rows,
+    (SELECT count(*) FROM outgoing_reservations) AS reservation_rows,
+    (SELECT count(*) FROM evidence_records) AS evidence_rows,
+    (SELECT count(*) FROM api_credentials) AS credential_rows,
+    (SELECT count(*) FROM payments
+      WHERE amount_atomic < 0
+        OR currency = ''
+        OR jsonb_typeof(metadata_json::jsonb) <> 'object') AS invalid_payment_metadata,
+    (SELECT count(*) FROM outgoing_reservations r
+      LEFT JOIN payments p ON p.id = r.payment_id
+      WHERE p.id IS NULL OR r.owner_account_id <> p.payer_account_id) AS invalid_reservation_links,
+    (SELECT count(*) FROM evidence_records e
+      LEFT JOIN payments p ON p.id = e.payment_id
+      LEFT JOIN payment_attempts a ON a.id = e.attempt_id
+      WHERE p.id IS NULL
+        OR (e.attempt_id IS NOT NULL AND a.id IS NULL)
+        OR (a.id IS NOT NULL AND a.payment_id <> e.payment_id)
+        OR jsonb_typeof(e.metadata_json::jsonb) <> 'object') AS invalid_evidence_metadata,
+    (SELECT count(*) FROM api_credentials
+      WHERE key_hash = ''
+        OR key_prefix = ''
+        OR jsonb_typeof(scopes::jsonb) <> 'array') AS invalid_credential_metadata,
+    (SELECT count(*) FROM credential_recovery_envelopes e
+      LEFT JOIN api_credentials c ON c.id = e.credential_id
+      WHERE c.id IS NULL
+        OR c.account_id <> e.account_id
+        OR e.ciphertext = ''
+        OR e.nonce = ''
+        OR e.auth_tag = '') AS invalid_recovery_envelopes;`
 }
 
 function setRestoredRuntimePendingSql() {
