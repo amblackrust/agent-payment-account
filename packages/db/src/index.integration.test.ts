@@ -340,11 +340,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         await sql.connect()
         sqlConnected = true
         const result = await sql.query<{
+          id: string
           event_type: string
           new_state_json: string | null
           event_count: string
         }>(
-          `SELECT event_type, new_state_json,
+          `SELECT id, event_type, new_state_json,
                   COUNT(*) OVER (PARTITION BY event_type) AS event_count
              FROM operation_timeline_events
             WHERE account_id = $1
@@ -369,6 +370,21 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(
           result.rows.map((row) => row.new_state_json ?? '').join('\n'),
         ).not.toContain('timeline-recovery-ciphertext')
+        const acknowledgement = result.rows.find(
+          (row) => row.event_type === 'CREDENTIAL_RECOVERY_ACKNOWLEDGED',
+        )
+        expect(acknowledgement).toBeDefined()
+        await expect(
+          sql.query(
+            'UPDATE operation_timeline_events SET metadata_json = $1 WHERE id = $2',
+            ['{"tampered":true}', acknowledgement?.id],
+          ),
+        ).rejects.toThrow('operation timeline events are append-only')
+        await expect(
+          sql.query('DELETE FROM operation_timeline_events WHERE id = $1', [
+            acknowledgement?.id,
+          ]),
+        ).rejects.toThrow('operation timeline events are append-only')
       } finally {
         if (sqlConnected) await sql.end()
         await database.disconnect()
