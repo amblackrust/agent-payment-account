@@ -194,6 +194,7 @@ export interface V2OperationsRepository {
     readonly resourceVersion: number
     readonly eventType: string
     readonly eventVersion: string
+    readonly correlationId?: string
     readonly rawBody: string
   }): Promise<{ readonly eventId: string; readonly created: boolean }>
   claimWebhookDeliveries(input: {
@@ -377,25 +378,45 @@ export function createV2OperationsRepository(
     },
 
     async acknowledgeException(input) {
-      const updated = await prisma.operationalException.updateMany({
-        where: {
-          id: input.id,
-          rowVersion: input.rowVersion,
-          status: { in: ['OPEN', 'ACKNOWLEDGED'] },
-        },
-        data: {
-          status: 'ACKNOWLEDGED',
-          assignedTo: input.operatorId,
-          acknowledgedAt: new Date(),
-          rowVersion: { increment: 1 },
-        },
+      return prisma.$transaction(async (transaction) => {
+        const exception = await lockException(transaction, input.id, input.rowVersion)
+        const payment = await findExceptionPayment(transaction, exception)
+        const now = new Date()
+        const updated = await transaction.operationalException.update({
+          where: { id: exception.id },
+          data: {
+            status: 'ACKNOWLEDGED',
+            assignedTo: input.operatorId,
+            acknowledgedAt: now,
+            rowVersion: { increment: 1 },
+          },
+        })
+        await transaction.operationTimelineEvent.create({
+          data: {
+            id: `timeline_${randomId()}`,
+            ...(exception.accountId === null ? {} : { accountId: exception.accountId }),
+            resourceType: exception.resourceType,
+            resourceId: exception.resourceId,
+            eventType: 'EXCEPTION_ACKNOWLEDGED',
+            actorType: 'OPERATOR',
+            actorId: input.operatorId,
+            ...(payment?.correlationId === null || payment?.correlationId === undefined
+              ? {}
+              : { correlationId: payment.correlationId }),
+            oldStateJson: JSON.stringify({
+              status: exception.status,
+              row_version: exception.rowVersion,
+            }),
+            newStateJson: JSON.stringify({
+              status: updated.status,
+              row_version: updated.rowVersion,
+            }),
+            source: 'V2_OPERATOR_CONTROL_PLANE',
+            occurredAt: now,
+          },
+        })
+        return toExceptionRecord(updated)
       })
-      if (updated.count !== 1) throw new ConflictError('Exception changed concurrently')
-      return toExceptionRecord(
-        await prisma.operationalException.findUniqueOrThrow({
-          where: { id: input.id },
-        }),
-      )
     },
 
     async resolveConfirmedException(input) {
@@ -432,6 +453,7 @@ export function createV2OperationsRepository(
             'PAYMENT_CLOSED_UNRESOLVED',
             input.operatorId,
             now,
+            payment.correlationId,
           )
         }
         const updated = await transaction.operationalException.update({
@@ -581,6 +603,9 @@ export function createV2OperationsRepository(
             resourceVersion: input.resourceVersion,
             eventType: input.eventType,
             eventVersion: input.eventVersion,
+            ...(input.correlationId === undefined
+              ? {}
+              : { correlationId: input.correlationId }),
             rawBody: input.rawBody,
           },
         })
@@ -964,6 +989,7 @@ async function resolveExceptionWithEvidence(
       `PAYMENT_RESOLVED_${outcome}`,
       input.operatorId,
       now,
+      payment.correlationId,
     )
     const updated = await transaction.operationalException.update({
       where: { id: exception.id },
@@ -1026,11 +1052,16 @@ async function findExceptionPayment(
   if (locked.length === 0) return null
   const payment = await transaction.payment.findUnique({
     where: { id: paymentId },
-    select: { id: true, payerAccountId: true, status: true },
+    select: { id: true, payerAccountId: true, status: true, correlationId: true },
   })
   return payment === null
     ? null
-    : { id: payment.id, accountId: payment.payerAccountId, status: payment.status }
+    : {
+        id: payment.id,
+        accountId: payment.payerAccountId,
+        status: payment.status,
+        correlationId: payment.correlationId,
+      }
 }
 
 async function appendOperatorTimeline(
@@ -1040,6 +1071,7 @@ async function appendOperatorTimeline(
   eventType: string,
   operatorId: string,
   occurredAt: Date,
+  correlationId?: string | null,
 ): Promise<void> {
   await transaction.operationTimelineEvent.create({
     data: {
@@ -1052,6 +1084,9 @@ async function appendOperatorTimeline(
       actorId: operatorId,
       source: 'V2_OPERATOR_CONTROL_PLANE',
       occurredAt,
+      ...(correlationId === undefined || correlationId === null
+        ? {}
+        : { correlationId }),
     },
   })
 }

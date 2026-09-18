@@ -329,6 +329,7 @@ function writeLocalEnvironment(existing, generated) {
     ADMIN_API_KEY: adminApiKey,
     SOLANA_SETTLEMENT_MINT: generated.mintAddress,
     SOLANA_FEE_PAYER_SECRET: generated.feePayerSecret,
+    SOLANA_FEE_PAYER_IDENTITY: generated.feePayerAddress,
     WALLET_MASTER_KEY: walletMasterKey,
     RECOVERY_ENVELOPE_KEY: recoveryEnvelopeKey,
   }
@@ -641,6 +642,7 @@ async function setup() {
   const mintAddress = ensureMintKeypair(existingEnvironment.values)
   const environment = writeLocalEnvironment(existingEnvironment, {
     feePayerSecret,
+    feePayerAddress,
     mintAddress,
   })
   console.log('✓ Platform fee payer ready')

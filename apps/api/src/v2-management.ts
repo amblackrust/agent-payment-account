@@ -134,9 +134,6 @@ export class V2ManagementService {
       throw new DependencyUnavailableError('Credential recovery is unavailable')
     }
     const account = await this.requireAccount(input.accountId)
-    if (account.status !== 'ACTIVE') {
-      throw new InvalidStateError('Agent account is not active')
-    }
     const requestFingerprint = fingerprintCredentialRequest(
       input.scopes,
       input.expiresAt,
@@ -161,6 +158,9 @@ export class V2ManagementService {
         created: false,
         ...serializeIssuedCredential(existing.credential, recovered),
       }
+    }
+    if (account.status !== 'ACTIVE') {
+      throw new InvalidStateError('Agent account is not active')
     }
     const scopes = normalizeAgentCredentialScopes(input.scopes)
     const expiresAt = parseCredentialExpiry(input.expiresAt, this.now())

@@ -339,6 +339,38 @@ describe('V2ManagementService credential issuance', () => {
     })
   })
 
+  it('replays the existing resource when the account is disabled after issuance', async () => {
+    const requestFingerprint = createHash('sha256')
+      .update(JSON.stringify({ scopes: ['payments:read'], expires_at: null }), 'utf8')
+      .digest('hex')
+    const repository = {
+      findAccount: async () => ({ ...account, status: 'DISABLED' as const }),
+      findCredentialIdempotency: async () => ({
+        requestHash: requestFingerprint,
+        fingerprint: requestFingerprint,
+        credential: issuedCredential,
+      }),
+      consumeRecoveryEnvelope: async () => null,
+    } as unknown as V2AdminRepository
+    const service = new V2ManagementService({
+      repository,
+      financialRepository: {} as never,
+      recoveryCipher: new RecoveryEnvelopeCipher(recoveryKey),
+    })
+
+    await expect(
+      service.createCredential({
+        accountId: account.id,
+        scopes: ['payments:read'],
+        idempotencyKey: 'issue-key',
+        actorId: 'operator-1',
+      }),
+    ).resolves.toMatchObject({
+      credential_id: issuedCredential.id,
+      api_key: null,
+    })
+  })
+
   it('rejects a reused idempotency key when the request fingerprint changes', async () => {
     let storedFingerprint: string | undefined
     const createCredential = vi.fn(async (input: { readonly fingerprint: string }) => {

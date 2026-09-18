@@ -542,9 +542,6 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
         if (account === undefined) {
           throw new NotFoundError('Agent account was not found')
         }
-        if (account.status !== 'ACTIVE') {
-          throw new InvalidStateError('Agent account is not active')
-        }
 
         const existing = await transaction.idempotencyRecord.findUnique({
           where: {
@@ -571,6 +568,9 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
             )
           }
           return { credential: toCredentialRecord(credential), created: false }
+        }
+        if (account.status !== 'ACTIVE') {
+          throw new InvalidStateError('Agent account is not active')
         }
 
         const credential = await transaction.apiCredential.create({

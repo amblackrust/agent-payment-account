@@ -725,22 +725,52 @@ export interface DatabaseClient
 }
 
 export interface RuntimeIdentity {
+  readonly environment?: string
   readonly rail: string
   readonly version: string
+  readonly railVersion?: string
   readonly cluster: string
   readonly settlementMint: string
-  readonly custodyKeyFingerprint: string
+  readonly feePayerIdentity?: string
+  readonly routeId?: string
+  readonly routeConfigVersion?: string
+  readonly settlementAssetId?: string
+  readonly settlementAssetVersion?: number
+  readonly economicMappingId?: string
+  readonly economicMappingVersion?: number
+  readonly routes?: readonly RuntimeRouteIdentity[]
+  readonly custodyKeyFingerprint?: string
   readonly custodyBackendIdentity?: string
   readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
 }
 
 export interface RuntimeIdentityCompatibility {
+  readonly environment?: string
   readonly rail: string
   readonly version: string
+  readonly railVersion?: string
   readonly cluster: string
   readonly settlementMint: string
+  readonly feePayerIdentity?: string
+  readonly routeId?: string
+  readonly routeConfigVersion?: string
+  readonly settlementAssetId?: string
+  readonly settlementAssetVersion?: number
+  readonly economicMappingId?: string
+  readonly economicMappingVersion?: number
+  readonly routes?: readonly RuntimeRouteIdentity[]
   readonly custodyBackendIdentity?: string
   readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
+}
+
+export interface RuntimeRouteIdentity {
+  readonly id: string
+  readonly railVersion: string
+  readonly configVersion: string
+  readonly settlementAssetId: string
+  readonly settlementAssetVersion: number
+  readonly economicMappingId: string
+  readonly economicMappingVersion: number
 }
 
 async function matchIncomingPaymentInTransaction(
@@ -2487,15 +2517,30 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         throw new Error('Persisted runtime financial identity is invalid JSON')
       }
       const record = parsed as Record<string, unknown>
+      const expectedFields: ReadonlyArray<readonly [string, unknown]> = [
+        ['environment', input.environment],
+        ['rail', input.rail],
+        ['version', input.version],
+        ['railVersion', input.railVersion],
+        ['cluster', input.cluster],
+        ['settlementMint', input.settlementMint],
+        ['feePayerIdentity', input.feePayerIdentity],
+        ['routeId', input.routeId],
+        ['routeConfigVersion', input.routeConfigVersion],
+        ['settlementAssetId', input.settlementAssetId],
+        ['settlementAssetVersion', input.settlementAssetVersion],
+        ['economicMappingId', input.economicMappingId],
+        ['economicMappingVersion', input.economicMappingVersion],
+        ['routes', input.routes],
+        ['custodyBackendIdentity', input.custodyBackendIdentity],
+        ['custodyBackendMode', input.custodyBackendMode],
+      ]
       if (
-        record.rail !== input.rail ||
-        record.version !== input.version ||
-        record.cluster !== input.cluster ||
-        record.settlementMint !== input.settlementMint ||
-        (input.custodyBackendIdentity !== undefined &&
-          record.custodyBackendIdentity !== input.custodyBackendIdentity) ||
-        (input.custodyBackendMode !== undefined &&
-          record.custodyBackendMode !== input.custodyBackendMode)
+        expectedFields.some(
+          ([field, expected]) =>
+            expected !== undefined &&
+            JSON.stringify(record[field]) !== JSON.stringify(expected),
+        )
       ) {
         throw new Error(
           'Runtime financial identity mismatch; configured rail, cluster, settlement mint, or custody backend differs from the database',

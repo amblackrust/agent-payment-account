@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -5,6 +6,7 @@ import {
   evaluateDomainAlerts,
   MetricsRegistry,
   normalizeCorrelationId,
+  recordDomainHealthMetrics,
 } from './observability.js'
 
 describe('MetricsRegistry', () => {
@@ -99,5 +101,53 @@ describe('MetricsRegistry', () => {
       'DATABASE_SATURATION',
       'RUNTIME_IDENTITY_MISMATCH',
     ])
+  })
+
+  it('exports fixed-cardinality domain alert gauges for deployment rules', () => {
+    const metrics = new MetricsRegistry()
+    const snapshot = createDomainHealthSnapshot({
+      health: {
+        reviewRequiredPayments: 1,
+        oldestReviewRequiredAgeSeconds: null,
+        exhaustedIncomingIssues: 0,
+        pendingWebhookDeliveries: 0,
+      },
+      dependencyDegraded: false,
+    })
+
+    recordDomainHealthMetrics(metrics, snapshot)
+
+    const output = metrics.renderPrometheus()
+    expect(output).toContain('mux_domain_health_status 0')
+    expect(output).toContain(
+      'mux_domain_alert_active{alert="REVIEW_REQUIRED_BACKLOG"} 1',
+    )
+    expect(output).toContain(
+      'mux_domain_alert_active{alert="RUNTIME_IDENTITY_MISMATCH"} 0',
+    )
+  })
+
+  it('keeps the deployable alert rules aligned with fixed-cardinality domain alerts', () => {
+    const rules = readFileSync(
+      new URL('../../../ops/prometheus/mux-v2-alerts.yml', import.meta.url),
+      'utf8',
+    )
+    const alertNames = [
+      'REVIEW_REQUIRED_BACKLOG',
+      'REVIEW_REQUIRED_AGE',
+      'INCOMING_ISSUES_EXHAUSTED',
+      'CUSTODY_FAILURES',
+      'NO_PROGRESS',
+      'DATABASE_SATURATION',
+      'DEPENDENCY_DEGRADED',
+      'WEBHOOK_BACKLOG',
+      'RESTORE_VERIFICATION_FAILED',
+      'RUNTIME_IDENTITY_MISMATCH',
+    ] as const
+
+    for (const name of alertNames) {
+      expect(rules).toContain(`alert="${name}"`)
+    }
+    expect(rules).not.toMatch(/(?:payment|account|resource)_id/u)
   })
 })

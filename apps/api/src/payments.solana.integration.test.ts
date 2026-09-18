@@ -293,12 +293,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         const baseUrl = `http://127.0.0.1:${listenerAddress.port}`
         const payerBootstrap = await createAccountThroughApi(
           baseUrl,
-          testConfig.adminApiKey,
+          testConfig.adminApiKey!,
           'surfpool-payer',
         )
         const recipientBootstrap = await createAccountThroughApi(
           baseUrl,
-          testConfig.adminApiKey,
+          testConfig.adminApiKey!,
           'surfpool-recipient',
         )
         const payerId = payerBootstrap.id

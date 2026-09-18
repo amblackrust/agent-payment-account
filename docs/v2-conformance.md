@@ -15,9 +15,16 @@ inside this codebase.
   and webhook capacity budgets use a shared PostgreSQL subject so replica count
   does not multiply the configured limit.
 - API, outgoing, reconcile, incoming, webhook, and maintenance roles have
-  separate startup paths. API request correlation IDs, low-cardinality metrics,
-  domain alerts, liveness/readiness, and domain health are exposed without
-  putting resource identifiers in metric labels.
+  separate startup paths. API request correlation IDs are carried through the
+  payment, durable work item, worker, custody/rail payload, timeline, and
+  webhook paths. Low-cardinality metrics, fixed-cardinality domain alerts,
+  liveness/readiness, and domain health are exposed without putting resource
+  identifiers in metric labels. Deployable Prometheus rules live in
+  `ops/prometheus/mux-v2-alerts.yml`.
+- The persisted financial runtime identity binds environment, rail and route
+  versions, settlement asset and economic mapping versions, fee-payer public
+  identity, and custody identity. Startup compares structured route identity,
+  not only the primary rail and network strings.
 - Legacy payment writes are routed through the V2 adapter in the production
   server path. The compatibility `PaymentService` class remains available for
   the migration window; its historical read-recovery behavior must be removed
@@ -64,16 +71,18 @@ operations requested by the implementation plan:
   adapter. Production custody remains an explicit boundary; no provider is
   selected here.
 - TASK-030: `apps/api/src/observability.ts` and `apps/api/src/app.ts` provide
-  redacted structured request logging, low-cardinality metrics, health/domain
-  alerts, and separate liveness/readiness/domain endpoints. Full correlation
-  propagation into every durable timeline/worker event and a deployable alert
-  rule set remain review findings.
-- TASK-031: `apps/api/src/config.ts`, `server.ts`, and `worker.ts` enforce
-  explicit role, mainnet, secret-source, custody, and authority configuration.
-  The dedicated API now initializes the persisted financial identity without
-  decrypting legacy signer plaintext. The persisted identity still does not
-  include every plan-named runtime fact, notably the fee-payer public identity
-  and route/mapping version, so that remains a high-priority contract finding.
+  redacted structured request logging, low-cardinality metrics, fixed-cardinality
+  domain alert gauges, deployable Prometheus rules, and separate
+  liveness/readiness/domain endpoints. Payment correlation is persisted through
+  durable work, worker/custody/rail execution, timeline, webhook, and operator
+  resolution events. Production alert-rule reload and failure-campaign evidence
+  remain operational verification items.
+- TASK-031: `apps/api/src/config.ts`, `server.ts`, `worker.ts`, and
+  `runtime-identity.ts` enforce explicit role, mainnet, secret-source, custody,
+  authority, fee-payer, route, asset, and economic-mapping configuration. The
+  dedicated API initializes the persisted financial identity without decrypting
+  legacy signer plaintext; workers fail closed when their structured identity
+  differs from the durable record.
 - TASK-032: the role-specific entrypoints, durable leases, health routes, and
   shutdown handling are in `apps/api/src/server.ts` and `worker.ts`. No
   orchestration manifest or CI deployment pipeline is claimed; the repository

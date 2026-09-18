@@ -9,6 +9,7 @@ const validEnvironment = {
   SOLANA_CLUSTER: 'localnet',
   SOLANA_SETTLEMENT_MINT: 'local-mint',
   SOLANA_FEE_PAYER_SECRET: 'fee-payer-secret',
+  SOLANA_FEE_PAYER_IDENTITY: 'fee-payer-public-key',
   WALLET_MASTER_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   RECOVERY_ENVELOPE_KEY:
     'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
@@ -115,6 +116,7 @@ describe('configuration', () => {
 
   it('does not require wallet or recovery keys for read-only worker roles', () => {
     const {
+      ADMIN_API_KEY: _adminApiKey,
       WALLET_MASTER_KEY: _walletMasterKey,
       RECOVERY_ENVELOPE_KEY: _recoveryKey,
       ...environment
@@ -129,6 +131,7 @@ describe('configuration', () => {
     const config = loadConfig(environment)
 
     expect(config.runtimeRole).toBe('reconcile')
+    expect(config.adminApiKey).toBeUndefined()
     expect(config.walletMasterKey).toBeUndefined()
     expect(config.recoveryEnvelopeKey).toBeUndefined()
   })

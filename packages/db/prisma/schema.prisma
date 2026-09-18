@@ -199,6 +199,7 @@ model RecipientDestination {
 model Payment {
   id                        String               @id @db.VarChar(64)
   payerAccountId            String               @map("payer_account_id") @db.VarChar(64)
+  correlationId             String?              @map("correlation_id") @db.VarChar(128)
   payerPublicKey            String?              @map("payer_public_key") @db.VarChar(64)
   recipientId               String?              @map("recipient_id") @db.VarChar(64)
   kind                      PaymentKind
@@ -803,6 +804,7 @@ model WebhookEvent {
   resourceVersion Int      @map("resource_version")
   eventType       String   @map("event_type") @db.VarChar(128)
   eventVersion    String   @map("event_version") @db.VarChar(32)
+  correlationId   String?  @map("correlation_id") @db.VarChar(128)
   rawBody         String   @map("raw_body") @db.Text
   createdAt       DateTime @default(now()) @map("created_at")
 

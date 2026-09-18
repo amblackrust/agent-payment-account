@@ -10,6 +10,7 @@ import { DurableCapacityController } from './capacity.js'
 import { ConstrainedCustodyBoundary } from './custody.js'
 import type { ConstrainedCustodyBackend, WalletSecretCipher } from './custody.js'
 import { V2OutgoingWorker } from './outgoing-v2.js'
+import type { MetricsRegistry } from './observability.js'
 
 const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
 const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
@@ -18,6 +19,7 @@ export function createV2OutgoingWorker(input: {
   readonly config: AppConfig
   readonly database: ReturnType<typeof createDatabaseClient>
   readonly walletCipher?: WalletSecretCipher
+  readonly metrics?: MetricsRegistry
 }): {
   readonly worker: V2OutgoingWorker
   readonly checkReadiness: () => Promise<void>
@@ -120,6 +122,7 @@ export function createV2OutgoingWorker(input: {
     ...(input.walletCipher === undefined
       ? {}
       : { signedPayloadCipher: input.walletCipher }),
+    ...(input.metrics === undefined ? {} : { metrics: input.metrics }),
     executor,
     serviceIdentity: custodyIdentity,
     capacity,

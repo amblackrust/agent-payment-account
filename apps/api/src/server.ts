@@ -37,8 +37,9 @@ import { V2PaymentServiceAdapter } from './payments-v1-adapter.js'
 import { V2ManagementService } from './v2-management.js'
 import { V2OperationsService } from './v2-operations.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
-import { createDomainHealthSnapshot } from './observability.js'
+import { createDomainHealthSnapshot, MetricsRegistry } from './observability.js'
 import { waitForShutdown } from './lifecycle.js'
+import { buildRuntimeIdentity } from './runtime-identity.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
@@ -50,6 +51,7 @@ async function startServer(): Promise<void> {
   const legacyRuntimeEnabled = config.runtimeRole === 'all'
   const database = createDatabaseClient(config.databaseUrl)
   const limits = getRuntimeLimits(config)
+  const metrics = new MetricsRegistry()
   const capacity = new DurableCapacityController(database.v2Admin, limits)
   const rail = createSolanaRail({
     rpcUrl: config.solanaRpcUrl,
@@ -61,19 +63,11 @@ async function startServer(): Promise<void> {
   const recoveryEnvelopeKey = requireRecoveryEnvelopeKey(config.recoveryEnvelopeKey)
   const walletCipher = new WalletSecretCipher(walletMasterKey)
   const recoveryCipher = new RecoveryEnvelopeCipher(recoveryEnvelopeKey)
-  const runtimeIdentity = {
-    rail: 'SOLANA_SPL',
-    version: '1',
-    cluster: config.solanaCluster,
-    settlementMint: config.solanaSettlementMint,
+  const runtimeIdentity = await buildRuntimeIdentity({
+    database,
+    config,
     custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
-    ...(config.custodyBackendIdentity === undefined
-      ? {}
-      : { custodyBackendIdentity: config.custodyBackendIdentity }),
-    ...(config.custodyBackendMode === undefined
-      ? {}
-      : { custodyBackendMode: config.custodyBackendMode }),
-  } as const
+  })
   if (legacyRuntimeEnabled) {
     await database.initializeRuntimeIdentity(runtimeIdentity, (custody) =>
       validateLegacyWalletCustody(walletCipher, custody),
@@ -178,7 +172,7 @@ async function startServer(): Promise<void> {
     maxPageSize: limits.maxPageSize,
   })
   const v2OutgoingRuntime = legacyRuntimeEnabled
-    ? createV2OutgoingWorker({ config, database, walletCipher })
+    ? createV2OutgoingWorker({ config, database, walletCipher, metrics })
     : undefined
   const paymentService = new V2PaymentServiceAdapter(
     v2PaymentService,
@@ -216,6 +210,7 @@ async function startServer(): Promise<void> {
     v2ManagementService,
     v2OperationsService,
     v2AdminRepository: database.v2Admin,
+    metrics,
     domainHealthDependency: {
       checkDomainHealth: async () => {
         const health = await database.v2Operations.getDomainHealth?.({
@@ -233,6 +228,10 @@ async function startServer(): Promise<void> {
         return createDomainHealthSnapshot({ health, dependencyDegraded })
       },
     },
+  })
+  v2OutgoingRuntime?.worker.setLogger({
+    info: (data, message) => app.log.info(data, message),
+    error: (data, message) => app.log.error(data, message),
   })
   const incomingReconciliation = legacyRuntimeEnabled
     ? new IncomingReconciliationService(

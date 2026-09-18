@@ -20,6 +20,7 @@ import type {
 } from './custody.js'
 import type { CapacityDependency, CapacityResult } from './capacity.js'
 import { retryAtAfter } from './capacity.js'
+import type { MetricsRegistry } from './observability.js'
 
 const DEFAULT_LEASE_SECONDS = 30
 const DEFAULT_BATCH_SIZE = 10
@@ -93,19 +94,28 @@ export interface V2OutgoingWorkerOptions {
   readonly leaseSeconds?: number
   readonly batchSize?: number
   readonly now?: () => Date
-  readonly logger?: {
-    info(data: Readonly<Record<string, unknown>>, message: string): void
-    error?(data: Readonly<Record<string, unknown>>, message: string): void
-  }
+  readonly logger?: V2OutgoingLogger
+  readonly metrics?: MetricsRegistry
+}
+
+export interface V2OutgoingLogger {
+  info(data: Readonly<Record<string, unknown>>, message: string): void
+  error?(data: Readonly<Record<string, unknown>>, message: string): void
 }
 
 export class V2OutgoingWorker {
   private stopped = false
   private currentRun: Promise<void> | undefined
   private readonly now: () => Date
+  private logger: V2OutgoingLogger | undefined
 
   public constructor(private readonly options: V2OutgoingWorkerOptions) {
     this.now = options.now ?? (() => new Date())
+    this.logger = options.logger
+  }
+
+  public setLogger(logger: V2OutgoingLogger): void {
+    this.logger = logger
   }
 
   public runOnce(): Promise<void> {
@@ -184,6 +194,24 @@ export class V2OutgoingWorker {
         await this.options.repository.completeWorkItem(claim.id, this.options.owner)
         return
       }
+      this.options.metrics?.incrementCounter('mux_worker_claims_total', {
+        operation: claim.kind,
+      })
+      this.logger?.info(
+        {
+          worker: this.options.owner,
+          workItemId: claim.id,
+          resourceType: claim.resourceType,
+          resourceId: claim.resourceId,
+          paymentId,
+          ...(view.payment.correlationId === undefined ||
+          view.payment.correlationId === null
+            ? {}
+            : { correlationId: view.payment.correlationId }),
+          state: view.payment.status,
+        },
+        'Outgoing work item claimed',
+      )
       const attempt = view.attempts.at(-1)
       if (
         claim.resourceType === 'PAYMENT_ATTEMPT' &&
@@ -361,6 +389,20 @@ export class V2OutgoingWorker {
         return
       if (!(await this.acquireCapacity(claim, 'rail'))) return
       const result = await this.options.executor.submit({ prepared, signed })
+      this.logger?.info(
+        {
+          worker: this.options.owner,
+          paymentId: view.payment.id,
+          attemptId: attempt.id,
+          dependency: 'rail',
+          state: result.status,
+          ...(view.payment.correlationId === undefined ||
+          view.payment.correlationId === null
+            ? {}
+            : { correlationId: view.payment.correlationId }),
+        },
+        'Settlement rail submission observed',
+      )
       await this.handleSubmissionResult(
         claim,
         currentView,
@@ -699,6 +741,24 @@ export class V2OutgoingWorker {
   private async handleFailure(claim: V2WorkItemClaim, error: unknown): Promise<void> {
     const decision = classifyWorkFailure(error, 'RAIL')
     const view = await this.loadClaimView(claim)
+    this.options.metrics?.incrementCounter('mux_worker_failures_total', {
+      result: decision.classification,
+    })
+    this.logger?.error?.(
+      {
+        worker: this.options.owner,
+        workItemId: claim.id,
+        resourceType: claim.resourceType,
+        resourceId: claim.resourceId,
+        dependency: 'rail',
+        errorCode: decision.reasonCode,
+        ...(view?.payment.correlationId === undefined ||
+        view?.payment.correlationId === null
+          ? {}
+          : { correlationId: view.payment.correlationId }),
+      },
+      'Outgoing work item failed',
+    )
     const attempt = view?.attempts.at(-1)
     if (
       attempt !== undefined &&
@@ -755,6 +815,9 @@ export class V2OutgoingWorker {
     if (this.options.capacity === undefined) return true
     const result = await this.options.capacity.acquire(dependency, this.now())
     if (result.allowed) return true
+    this.options.metrics?.incrementCounter('mux_dependency_backpressure_total', {
+      dependency,
+    })
     await this.options.repository.retryWorkItem({
       id: claim.id,
       owner: this.options.owner,
@@ -788,7 +851,7 @@ export class V2OutgoingWorker {
           now: this.now(),
         })
         .catch((error: unknown) => {
-          this.options.logger?.info(
+          this.logger?.info(
             { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
             'Outgoing work-item lease renewal failed',
           )
@@ -930,7 +993,7 @@ export class V2OutgoingWorker {
     const estimate = prepared.platformCostEstimate
     if (estimate === undefined || actual === undefined) return
     if (actual.assetId !== estimate.assetId || actual.amountAtomic < 0n) {
-      this.options.logger?.error?.(
+      this.logger?.error?.(
         {
           attemptId: prepared.attemptId,
           errorCode: 'PLATFORM_COST_IDENTITY_MISMATCH',
@@ -940,7 +1003,7 @@ export class V2OutgoingWorker {
       return
     }
     if (this.options.platformCosts === undefined) {
-      this.options.logger?.error?.(
+      this.logger?.error?.(
         {
           attemptId: prepared.attemptId,
           errorCode: 'PLATFORM_COST_PERSISTENCE_UNAVAILABLE',
@@ -956,7 +1019,7 @@ export class V2OutgoingWorker {
         observedAt: this.now(),
       })
     } catch (error) {
-      this.options.logger?.error?.(
+      this.logger?.error?.(
         {
           attemptId: prepared.attemptId,
           errorCode: error instanceof Error ? error.name : 'UNKNOWN',
@@ -1049,6 +1112,7 @@ function restorePreparedEffect(
   const accountId = readRequiredString(parsed, 'accountId')
   const paymentId = readRequiredString(parsed, 'paymentId')
   const attemptId = readRequiredString(parsed, 'attemptId')
+  const correlationId = parseOptionalString(parsed.correlationId)
   const effectHash = readRequiredString(parsed, 'effectHash')
   const network = readRequiredString(parsed, 'network')
   const assetReference = readRequiredString(parsed, 'assetReference')
@@ -1076,6 +1140,7 @@ function restorePreparedEffect(
     accountId,
     paymentId,
     attemptId,
+    ...(correlationId === undefined ? {} : { correlationId }),
     effectHash,
     network,
     assetReference,
@@ -1113,6 +1178,14 @@ function readRequiredString(value: Record<string, unknown>, field: string): stri
     throw new InvalidStateError('Durable prepared effect metadata is incomplete')
   }
   return result
+}
+
+function parseOptionalString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || value.length === 0 || value.length > 128) {
+    throw new InvalidStateError('Durable trace context is invalid')
+  }
+  return value
 }
 
 function parseOptionalDate(value: unknown): Date | undefined {

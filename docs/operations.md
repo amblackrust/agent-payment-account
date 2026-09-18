@@ -8,6 +8,12 @@ load the platform fee-payer secret, submit settlement effects, or decrypt
 existing signer secrets. Development may use `RUNTIME_ROLE=all` for the local
 compatibility runtime.
 
+`ADMIN_API_KEY` is required only by the `api` (or development `all`) role;
+dedicated workers must not receive that admin secret. Production still
+requires the public `SOLANA_FEE_PAYER_IDENTITY` as part of the persisted
+financial runtime identity, while the fee-payer secret remains restricted to
+the outgoing role.
+
 The platform-neutral topology, secret boundaries, promotion sequence, and
 shutdown contract are in [deployment.md](./deployment.md).
 
@@ -34,6 +40,10 @@ claims to expire and be recovered by another worker.
   process liveness.
 - `GET /metrics` exposes low-cardinality process metrics. Resource IDs and
   secrets are intentionally excluded from metric labels.
+- Prometheus installations can load
+  [`ops/prometheus/mux-v2-alerts.yml`](../ops/prometheus/mux-v2-alerts.yml).
+  The rules use the fixed-cardinality `mux_domain_alert_active` gauges and
+  keep workflow/resource IDs out of labels.
 
 ## Encrypted backup and verified restore
 

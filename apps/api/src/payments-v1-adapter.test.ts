@@ -120,6 +120,7 @@ describe('V2 payment service adapter', () => {
       },
       'idem_1',
       'req_1',
+      'corr_1',
     )
 
     expect(harness.repository.findDenominationBySymbol).toHaveBeenCalledWith('USD')
@@ -135,6 +136,7 @@ describe('V2 payment service adapter', () => {
       },
       'idem_1',
       'req_1',
+      'corr_1',
     )
     expect(result).toMatchObject({
       created: true,

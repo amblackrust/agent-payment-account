@@ -62,7 +62,7 @@ const configSchema = z.object({
   DATABASE_URL: z.string().trim().min(1, 'DATABASE_URL is required'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3_000),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  ADMIN_API_KEY: z.string().min(1, 'ADMIN_API_KEY is required'),
+  ADMIN_API_KEY: z.string().min(1).optional(),
   SOLANA_RPC_URL: z.url().default('http://127.0.0.1:8899'),
   SOLANA_CLUSTER: z
     .enum(['localnet', 'devnet', 'testnet', 'mainnet-beta'])
@@ -70,6 +70,7 @@ const configSchema = z.object({
   SOLANA_SETTLEMENT_MINT: z.string().min(1, 'SOLANA_SETTLEMENT_MINT is required'),
   SOLANA_PLATFORM_COST_ASSET_ID: z.string().trim().min(1).optional(),
   SOLANA_FEE_PAYER_SECRET: z.string().min(1).optional(),
+  SOLANA_FEE_PAYER_IDENTITY: z.string().trim().min(1).optional(),
   WALLET_MASTER_KEY: z
     .string()
     .regex(
@@ -195,12 +196,13 @@ export type AppConfig = {
   readonly runtimeAuthorityId?: string
   readonly restoreGateRequired: boolean
   readonly restoreGateEnvironment?: string
-  readonly adminApiKey: string
+  readonly adminApiKey: string | undefined
   readonly solanaRpcUrl: string
   readonly solanaCluster: 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
   readonly solanaSettlementMint: string
   readonly solanaPlatformCostAssetId?: string
   readonly solanaFeePayerSecret: string | undefined
+  readonly solanaFeePayerIdentity?: string
   readonly walletMasterKey: string | undefined
   readonly recoveryEnvelopeKey: string | undefined
   readonly webhookSigningKeysJson?: string
@@ -245,6 +247,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     )
   }
   const runtimeRole: RuntimeRole = result.data.RUNTIME_ROLE ?? 'all'
+  if (
+    (runtimeRole === 'api' || runtimeRole === 'all') &&
+    result.data.ADMIN_API_KEY === undefined
+  ) {
+    throw new ConfigurationError('ADMIN_API_KEY is required for the API runtime role')
+  }
   if (
     (runtimeRole === 'api' || runtimeRole === 'outgoing' || runtimeRole === 'all') &&
     result.data.WALLET_MASTER_KEY === undefined
@@ -296,6 +304,14 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   ) {
     throw new ConfigurationError(
       'Production requires an explicitly configured external custody backend',
+    )
+  }
+  if (
+    result.data.NODE_ENV === 'production' &&
+    result.data.SOLANA_FEE_PAYER_IDENTITY === undefined
+  ) {
+    throw new ConfigurationError(
+      'Production requires the public SOLANA_FEE_PAYER_IDENTITY',
     )
   }
   if (
@@ -386,6 +402,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       ? {}
       : { solanaPlatformCostAssetId: result.data.SOLANA_PLATFORM_COST_ASSET_ID }),
     solanaFeePayerSecret: result.data.SOLANA_FEE_PAYER_SECRET,
+    ...(result.data.SOLANA_FEE_PAYER_IDENTITY === undefined
+      ? {}
+      : { solanaFeePayerIdentity: result.data.SOLANA_FEE_PAYER_IDENTITY }),
     walletMasterKey: result.data.WALLET_MASTER_KEY,
     recoveryEnvelopeKey: result.data.RECOVERY_ENVELOPE_KEY,
     ...(result.data.WEBHOOK_SIGNING_KEYS_JSON === undefined
@@ -485,7 +504,7 @@ export function redactConfig(config: AppConfig): RedactedConfig {
       ? {}
       : { solanaPlatformCostAssetId: config.solanaPlatformCostAssetId }),
     allowMainnet: config.allowMainnet,
-    hasAdminApiKey: config.adminApiKey.length > 0,
+    hasAdminApiKey: config.adminApiKey !== undefined,
     hasSolanaFeePayerSecret: config.solanaFeePayerSecret !== undefined,
     hasWalletMasterKey: config.walletMasterKey !== undefined,
     hasRecoveryEnvelopeKey: config.recoveryEnvelopeKey !== undefined,

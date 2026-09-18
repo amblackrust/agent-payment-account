@@ -81,6 +81,7 @@ export interface V2ApprovedDestinationRecord {
 export interface V2PaymentSnapshot {
   readonly id: string
   readonly payerAccountId: string
+  readonly correlationId?: string | null
   readonly recipientId: string | null
   readonly recipientManagedAccountId: string | null
   readonly kind: string
@@ -163,6 +164,7 @@ export interface V2PaymentCreateInput {
   readonly idempotencyKey: string
   readonly requestHash: string
   readonly requestId?: string
+  readonly correlationId?: string
   readonly fingerprint: string
   readonly payerPublicKey: string
   readonly recipientId: string | null
@@ -1051,6 +1053,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           data: {
             id: input.paymentId,
             payerAccountId: input.accountId,
+            ...(input.correlationId === undefined
+              ? {}
+              : { correlationId: input.correlationId }),
             payerPublicKey: input.payerPublicKey,
             recipientId: input.recipientId,
             ...(input.recipientManagedAccountId === undefined
@@ -1147,7 +1152,12 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               kind: 'OUTGOING_PAYMENT',
               resourceType: 'PAYMENT',
               resourceId: payment.id,
-              payloadJson: JSON.stringify({ payment_id: payment.id }),
+              payloadJson: JSON.stringify({
+                payment_id: payment.id,
+                ...(input.correlationId === undefined
+                  ? {}
+                  : { correlation_id: input.correlationId }),
+              }),
             },
           })
         }
@@ -1173,6 +1183,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             actorType: 'AGENT_CREDENTIAL',
             actorId: input.accountId,
             ...(input.requestId === undefined ? {} : { requestId: input.requestId }),
+            ...(input.correlationId === undefined
+              ? {}
+              : { correlationId: input.correlationId }),
             source: 'V2_PAYMENT_ORCHESTRATOR',
             occurredAt: payment.createdAt,
             newStateJson: JSON.stringify({ status, policy_decision: decision }),
@@ -1186,6 +1199,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           status,
           amountAtomic: payment.amountAtomic,
           denominationId: payment.denominationId,
+          ...(payment.correlationId === null
+            ? {}
+            : { correlationId: payment.correlationId }),
         })
         return { payment: toV2PaymentSnapshot(payment), created: true }
       })
@@ -1463,6 +1479,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             actorType: 'SYSTEM',
             source: 'V2_OUTGOING_WORKER',
             occurredAt: new Date(),
+            ...(payment.correlationId === null
+              ? {}
+              : { correlationId: payment.correlationId }),
             newStateJson: JSON.stringify({
               status: 'PROVED_NO_EFFECT',
               reason: input.reason,
@@ -1480,6 +1499,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           status: updated.status,
           amountAtomic: updated.amountAtomic,
           denominationId: updated.denominationId,
+          ...(updated.correlationId === null
+            ? {}
+            : { correlationId: updated.correlationId }),
         })
         const decision = await transaction.policyDecision.findUniqueOrThrow({
           where: { paymentId: payment.id },
@@ -1557,6 +1579,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             payloadJson: JSON.stringify({
               payment_id: payment.id,
               attempt_id: attempt.id,
+              ...(payment.correlationId === null
+                ? {}
+                : { correlation_id: payment.correlationId }),
             }),
           },
         })
@@ -1752,6 +1777,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               payloadJson: JSON.stringify({
                 payment_id: input.paymentId,
                 attempt_id: replacementAttempt.id,
+                ...(payment.correlationId === null
+                  ? {}
+                  : { correlation_id: payment.correlationId }),
               }),
             },
           })
@@ -1769,6 +1797,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             actorType: 'SYSTEM',
             source: input.source,
             occurredAt: new Date(),
+            ...(payment.correlationId === null
+              ? {}
+              : { correlationId: payment.correlationId }),
             oldStateJson: JSON.stringify({
               payment_status: payment.status,
               attempt_outcome: input.currentOutcome,
@@ -1793,6 +1824,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           status: updated.status,
           amountAtomic: updated.amountAtomic,
           denominationId: updated.denominationId,
+          ...(updated.correlationId === null
+            ? {}
+            : { correlationId: updated.correlationId }),
         })
         const decision = await transaction.policyDecision.findUniqueOrThrow({
           where: { paymentId: input.paymentId },
@@ -2018,6 +2052,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 function toV2PaymentSnapshot(payment: {
   id: string
   payerAccountId: string
+  correlationId: string | null
   recipientId: string | null
   recipientManagedAccountId: string | null
   kind: string
@@ -2293,6 +2328,9 @@ async function markWorkItemExhausted(
         status: updatedPayment.status,
         amountAtomic: updatedPayment.amountAtomic,
         denominationId: updatedPayment.denominationId,
+        ...(updatedPayment.correlationId === null
+          ? {}
+          : { correlationId: updatedPayment.correlationId }),
       })
       await transaction.operationTimelineEvent.create({
         data: {
@@ -2304,6 +2342,9 @@ async function markWorkItemExhausted(
           actorType: 'SYSTEM',
           source: 'V2_WORK_ITEM',
           occurredAt: new Date(),
+          ...(payment.correlationId === null
+            ? {}
+            : { correlationId: payment.correlationId }),
           newStateJson: JSON.stringify({ reason: errorCode }),
         },
       })
@@ -2354,20 +2395,30 @@ async function findWorkPayment(
   readonly id: string
   readonly accountId: string
   readonly status: string
+  readonly correlationId: string | null
 } | null> {
   if (resourceType === 'PAYMENT') {
     const payment = await transaction.payment.findUnique({
       where: { id: resourceId },
-      select: { id: true, payerAccountId: true, status: true },
+      select: { id: true, payerAccountId: true, status: true, correlationId: true },
     })
     return payment === null
       ? null
-      : { id: payment.id, accountId: payment.payerAccountId, status: payment.status }
+      : {
+          id: payment.id,
+          accountId: payment.payerAccountId,
+          status: payment.status,
+          correlationId: payment.correlationId,
+        }
   }
   if (resourceType === 'PAYMENT_ATTEMPT') {
     const attempt = await transaction.paymentAttempt.findUnique({
       where: { id: resourceId },
-      select: { payment: { select: { id: true, payerAccountId: true, status: true } } },
+      select: {
+        payment: {
+          select: { id: true, payerAccountId: true, status: true, correlationId: true },
+        },
+      },
     })
     return attempt === null
       ? null
@@ -2375,6 +2426,7 @@ async function findWorkPayment(
           id: attempt.payment.id,
           accountId: attempt.payment.payerAccountId,
           status: attempt.payment.status,
+          correlationId: attempt.payment.correlationId,
         }
   }
   return null
@@ -2390,6 +2442,7 @@ async function enqueuePaymentWebhookEvent(
     readonly status: string
     readonly amountAtomic: bigint
     readonly denominationId: string | null
+    readonly correlationId?: string
   },
 ): Promise<void> {
   await enqueueWebhookEvent(transaction, {
@@ -2403,6 +2456,12 @@ async function enqueuePaymentWebhookEvent(
       status: input.status,
       amount_atomic: input.amountAtomic.toString(),
       denomination_id: input.denominationId,
+      ...(input.correlationId === undefined
+        ? {}
+        : { correlation_id: input.correlationId }),
     },
+    ...(input.correlationId === undefined
+      ? {}
+      : { correlationId: input.correlationId }),
   })
 }

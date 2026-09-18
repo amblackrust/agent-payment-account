@@ -30,8 +30,11 @@ export function hashApiKey(rawKey: string): string {
   return createHash('sha256').update(rawKey, 'utf8').digest('hex')
 }
 
-export function isApiKeyMatch(provided: string | undefined, expected: string): boolean {
-  if (provided === undefined) {
+export function isApiKeyMatch(
+  provided: string | undefined,
+  expected: string | undefined,
+): boolean {
+  if (provided === undefined || expected === undefined) {
     return false
   }
   const providedBytes = Buffer.from(provided, 'utf8')
@@ -101,7 +104,10 @@ export async function authenticateAgentWithScope(
   return account
 }
 
-export function assertAdminApiKey(request: FastifyRequest, expected: string): void {
+export function assertAdminApiKey(
+  request: FastifyRequest,
+  expected: string | undefined,
+): void {
   const provided = request.headers[ADMIN_API_KEY_HEADER]
   const value = Array.isArray(provided) ? provided[0] : provided
   if (!isApiKeyMatch(value, expected)) {
@@ -113,8 +119,12 @@ export function assertAdminApiKey(request: FastifyRequest, expected: string): vo
  * Returns the durable audit identity for the authenticated platform operator.
  * The raw credential is intentionally never persisted or exposed.
  */
-export function getAdminOperatorId(request: FastifyRequest, expected: string): string {
+export function getAdminOperatorId(
+  request: FastifyRequest,
+  expected: string | undefined,
+): string {
   assertAdminApiKey(request, expected)
+  if (expected === undefined) throw new AuthenticationError()
   return `platform-operator:${hashApiKey(expected).slice(0, 24)}`
 }
 

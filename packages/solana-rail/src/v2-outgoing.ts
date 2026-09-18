@@ -55,6 +55,7 @@ export interface SolanaV2PaymentView {
   readonly payment: {
     readonly id: string
     readonly payerAccountId: string
+    readonly correlationId?: string | null
     readonly recipientManagedAccountId: string | null
     readonly externalReference: string | null
     readonly amountAtomic: bigint
@@ -79,6 +80,7 @@ export interface SolanaV2SigningRequest {
   readonly accountId: string
   readonly paymentId: string
   readonly attemptId: string
+  readonly correlationId?: string
   readonly effectHash: string
   readonly network: string
   readonly assetReference: string
@@ -593,6 +595,9 @@ export function createSolanaV2OutgoingExecutor(
       accountId: payment.payerAccountId,
       paymentId: payment.id,
       attemptId: input.attempt.id,
+      ...(payment.correlationId === null
+        ? {}
+        : { correlationId: payment.correlationId }),
       effectHash,
       network: route.network,
       assetReference: asset.assetReference,

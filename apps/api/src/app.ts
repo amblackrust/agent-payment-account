@@ -66,6 +66,7 @@ import {
   CORRELATION_ID_HEADER,
   MetricsRegistry,
   normalizeCorrelationId,
+  recordDomainHealthMetrics,
   type DomainHealthDependency,
   type DomainHealthSnapshot,
 } from './observability.js'
@@ -317,12 +318,22 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
         options.domainHealthDependency === undefined
           ? { status: 'ok', checks: {} }
           : await options.domainHealthDependency.checkDomainHealth()
+      recordDomainHealthMetrics(metrics, snapshot)
       if (snapshot.status === 'degraded') return reply.code(503).send(snapshot)
       return snapshot
     },
   )
 
   app.get('/metrics', async (_request, reply) => {
+    if (options.domainHealthDependency !== undefined) {
+      try {
+        const snapshot = await options.domainHealthDependency.checkDomainHealth()
+        recordDomainHealthMetrics(metrics, snapshot)
+      } catch {
+        metrics.setGauge('mux_domain_health_status', 0)
+        metrics.setGauge('mux_domain_dependency_check_failed', 1)
+      }
+    }
     reply.type('text/plain; version=0.0.4')
     return metrics.renderPrometheus()
   })
@@ -809,6 +820,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             toPaymentRequest(request.body),
             getIdempotencyKey(request),
             request.id,
+            normalizeCorrelationId(request.headers[CORRELATION_ID_HEADER], request.id),
           )
           logPaymentResult(
             request,
@@ -853,6 +865,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             },
             getIdempotencyKey(request),
             request.id,
+            normalizeCorrelationId(request.headers[CORRELATION_ID_HEADER], request.id),
           )
           logPaymentResult(
             request,
@@ -880,6 +893,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             toPaymentRequest(request.body),
             getIdempotencyKey(request),
             request.id,
+            normalizeCorrelationId(request.headers[CORRELATION_ID_HEADER], request.id),
           )
           logPaymentResult(
             request,
@@ -1061,6 +1075,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             body,
             getIdempotencyKey(request),
             request.id,
+            normalizeCorrelationId(request.headers[CORRELATION_ID_HEADER], request.id),
           )
           const response = await v2PaymentService.serialize(result.view)
           if (result.view.policyDecision === 'DENY') {
@@ -1242,6 +1257,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
             },
             getIdempotencyKey(request),
             request.id,
+            normalizeCorrelationId(request.headers[CORRELATION_ID_HEADER], request.id),
           )
           return reply
             .code(result.created ? 201 : 200)

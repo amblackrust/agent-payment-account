@@ -38,6 +38,7 @@ export class V2PaymentServiceAdapter implements PaymentServiceLike {
     input: PaymentRequest,
     idempotencyKey: string,
     requestId?: string,
+    correlationId?: string,
   ): Promise<PaymentResult> {
     const denominationId = await this.findDenominationId(input.currency)
     const result = await this.service.createPayment(
@@ -54,6 +55,7 @@ export class V2PaymentServiceAdapter implements PaymentServiceLike {
       },
       normalizeIdempotencyKey(idempotencyKey),
       requestId ?? 'legacy-v1',
+      correlationId,
     )
     return this.toPaymentResult(result.view, result.created)
   }
@@ -67,6 +69,7 @@ export class V2PaymentServiceAdapter implements PaymentServiceLike {
     },
     idempotencyKey: string,
     requestId?: string,
+    correlationId?: string,
   ): Promise<PaymentResult> {
     const denominationId = await this.findDenominationId(input.currency)
     const result = await this.service.createRefund(
@@ -75,6 +78,7 @@ export class V2PaymentServiceAdapter implements PaymentServiceLike {
       { amount: input.amount, denominationId },
       normalizeIdempotencyKey(idempotencyKey),
       requestId ?? 'legacy-v1',
+      correlationId,
     )
     return this.toPaymentResult(result.view, result.created)
   }

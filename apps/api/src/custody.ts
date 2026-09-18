@@ -17,6 +17,7 @@ export interface ConstrainedEffectSigningRequest {
   readonly accountId: string
   readonly paymentId: string
   readonly attemptId: string
+  readonly correlationId?: string
   readonly effectHash: string
   readonly network: string
   readonly assetReference: string
@@ -103,6 +104,12 @@ function validateEffectSigningRequest(request: ConstrainedEffectSigningRequest):
     request.feePayerIdentity.length === 0
   ) {
     throw new ValidationError('Custody signing effect is incomplete')
+  }
+  if (
+    request.correlationId !== undefined &&
+    (request.correlationId.length === 0 || request.correlationId.length > 128)
+  ) {
+    throw new ValidationError('Custody correlation ID is invalid')
   }
 }
 

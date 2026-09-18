@@ -57,6 +57,7 @@ export interface PaymentServiceLike {
     input: PaymentRequest,
     idempotencyKey: string,
     requestId?: string,
+    correlationId?: string,
   ): Promise<PaymentResult>
   createRefund(
     account: AuthenticatedAccount,
@@ -67,6 +68,7 @@ export interface PaymentServiceLike {
     },
     idempotencyKey: string,
     requestId?: string,
+    correlationId?: string,
   ): Promise<PaymentResult>
   getPayment(accountId: string, paymentId: string): Promise<PaymentRecord>
   listPaymentsPage(

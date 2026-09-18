@@ -28,11 +28,12 @@ import {
   validateLegacyWalletCustody,
   WalletSecretCipher,
 } from './custody.js'
-import { createDomainHealthSnapshot } from './observability.js'
+import { createDomainHealthSnapshot, MetricsRegistry } from './observability.js'
 import { MaintenanceSchedule } from './maintenance-schedule.js'
 import type { V2OutgoingWorker } from './outgoing-v2.js'
 import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
 import { waitForShutdown } from './lifecycle.js'
+import { buildRuntimeIdentity } from './runtime-identity.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -181,6 +182,7 @@ async function startWorker(): Promise<void> {
 
   const database = createDatabaseClient(config.databaseUrl)
   const limits = getRuntimeLimits(config)
+  const metrics = new MetricsRegistry()
   const capacity = new DurableCapacityController(database.v2Admin, limits)
   const rail = createSolanaRail({
     rpcUrl: config.solanaRpcUrl,
@@ -194,39 +196,19 @@ async function startWorker(): Promise<void> {
       : undefined
   const walletCipher =
     walletMasterKey === undefined ? undefined : new WalletSecretCipher(walletMasterKey)
-  const runtimeIdentity =
-    walletMasterKey === undefined
-      ? undefined
-      : {
-          rail: 'SOLANA_SPL',
-          version: '1',
-          cluster: config.solanaCluster,
-          settlementMint: config.solanaSettlementMint,
-          custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey),
-          ...(config.custodyBackendIdentity === undefined
-            ? {}
-            : { custodyBackendIdentity: config.custodyBackendIdentity }),
-          ...(config.custodyBackendMode === undefined
-            ? {}
-            : { custodyBackendMode: config.custodyBackendMode }),
-        }
+  const runtimeIdentity = await buildRuntimeIdentity({
+    database,
+    config,
+    ...(walletMasterKey === undefined
+      ? {}
+      : { custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey) }),
+  })
   if (walletMasterKey !== undefined) {
-    await database.initializeRuntimeIdentity(runtimeIdentity!, (custody) =>
+    await database.initializeRuntimeIdentity(runtimeIdentity, (custody) =>
       validateLegacyWalletCustody(walletCipher!, custody),
     )
   } else {
-    await database.checkRuntimeIdentity({
-      rail: 'SOLANA_SPL',
-      version: '1',
-      cluster: config.solanaCluster,
-      settlementMint: config.solanaSettlementMint,
-      ...(config.custodyBackendIdentity === undefined
-        ? {}
-        : { custodyBackendIdentity: config.custodyBackendIdentity }),
-      ...(config.custodyBackendMode === undefined
-        ? {}
-        : { custodyBackendMode: config.custodyBackendMode }),
-    })
+    await database.checkRuntimeIdentity(runtimeIdentity)
   }
   if (config.runtimeAuthorityId !== undefined) {
     await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
@@ -238,6 +220,7 @@ async function startWorker(): Promise<void> {
           config,
           database,
           ...(walletCipher === undefined ? {} : { walletCipher }),
+          metrics,
         })
       : undefined
 
@@ -296,6 +279,11 @@ async function startWorker(): Promise<void> {
         })
       },
     },
+    metrics,
+  })
+  v2OutgoingRuntime?.worker.setLogger({
+    info: (data, message) => app.log.info(data, message),
+    error: (data, message) => app.log.error(data, message),
   })
   const worker: RuntimeWorker = createWorker({
     role: config.runtimeRole,

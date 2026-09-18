@@ -109,6 +109,7 @@ export class V2PaymentService {
     input: V2CreatePaymentInput,
     idempotencyKey: string,
     requestId: string,
+    correlationId?: string,
   ): Promise<{ readonly view: V2PaymentView; readonly created: boolean }> {
     const denomination = await this.loadDenomination(input.denominationId)
     const amount = parseAmount(input.amount, denomination)
@@ -352,6 +353,7 @@ export class V2PaymentService {
         requestHash: fingerprint,
         fingerprint,
         requestId,
+        ...(correlationId === undefined ? {} : { correlationId }),
         payerPublicKey: account.account.solanaPublicKey,
         recipientId: target.recipientId,
         recipientManagedAccountId: target.managedAccountId,
@@ -474,6 +476,7 @@ export class V2PaymentService {
     input: Omit<V2CreatePaymentInput, 'kind' | 'recipientId'>,
     idempotencyKey: string,
     requestId: string,
+    correlationId?: string,
   ): Promise<{ readonly view: V2PaymentView; readonly created: boolean }> {
     const original = await this.getPayment(account.account.id, originalPaymentId)
     if (original.payment.status !== 'CONFIRMED') {
@@ -530,6 +533,7 @@ export class V2PaymentService {
       },
       idempotencyKey,
       requestId,
+      correlationId,
     )
   }
 

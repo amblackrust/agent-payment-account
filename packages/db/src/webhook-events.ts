@@ -13,6 +13,7 @@ export async function enqueueWebhookEvent(
     readonly resourceVersion: number
     readonly eventType: string
     readonly resource: Readonly<Record<string, unknown>>
+    readonly correlationId?: string
     readonly eventId?: string
   },
 ): Promise<void> {
@@ -28,10 +29,16 @@ export async function enqueueWebhookEvent(
       resourceVersion: input.resourceVersion,
       eventType: input.eventType,
       eventVersion: WEBHOOK_EVENT_VERSION,
+      ...(input.correlationId === undefined
+        ? {}
+        : { correlationId: input.correlationId }),
       rawBody: JSON.stringify({
         id: eventId,
         type: input.eventType,
         version: WEBHOOK_EVENT_VERSION,
+        ...(input.correlationId === undefined
+          ? {}
+          : { correlation_id: input.correlationId }),
         resource: input.resource,
       }),
     },

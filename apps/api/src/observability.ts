@@ -1,4 +1,5 @@
 const ALLOWED_LABELS = new Set([
+  'alert',
   'operation',
   'rail',
   'status',
@@ -64,6 +65,33 @@ export interface DomainHealthSnapshot {
   readonly status: 'ok' | 'degraded'
   readonly checks: Readonly<Record<string, 'ok' | 'degraded'>>
   readonly alerts?: readonly DomainAlert[]
+}
+
+const DOMAIN_ALERT_NAMES: readonly DomainAlertName[] = [
+  'REVIEW_REQUIRED_BACKLOG',
+  'REVIEW_REQUIRED_AGE',
+  'INCOMING_ISSUES_EXHAUSTED',
+  'CUSTODY_FAILURES',
+  'NO_PROGRESS',
+  'DATABASE_SATURATION',
+  'DEPENDENCY_DEGRADED',
+  'WEBHOOK_BACKLOG',
+  'RESTORE_VERIFICATION_FAILED',
+  'RUNTIME_IDENTITY_MISMATCH',
+]
+
+export function recordDomainHealthMetrics(
+  metrics: MetricsRegistry,
+  snapshot: DomainHealthSnapshot,
+): void {
+  const activeAlerts = new Set(snapshot.alerts?.map((alert) => alert.name) ?? [])
+  metrics.setGauge('mux_domain_health_status', snapshot.status === 'ok' ? 1 : 0)
+  metrics.setGauge('mux_domain_dependency_check_failed', 0)
+  for (const name of DOMAIN_ALERT_NAMES) {
+    metrics.setGauge('mux_domain_alert_active', activeAlerts.has(name) ? 1 : 0, {
+      alert: name,
+    })
+  }
 }
 
 export interface DomainHealthDependency {
