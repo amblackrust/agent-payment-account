@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import type { IncomingPaymentRepository, ReceiveRepository } from '@agent-payment/db'
 import type { IncomingTransfer, SolanaIncomingReader } from '@agent-payment/solana-rail'
 import type { CapacityResult } from './capacity.js'
@@ -24,13 +24,16 @@ export interface IncomingReconciliationOptions {
 export class IncomingReconciliationService {
   private stopped = false
   private currentRun: Promise<void> | undefined
+  private readonly owner: string
 
   public constructor(
     private readonly repository: IncomingStore,
     private readonly reader: SolanaIncomingReader,
     private readonly logger: { error(data: object, message: string): void },
     private readonly options: IncomingReconciliationOptions = {},
-  ) {}
+  ) {
+    this.owner = options.owner ?? `incoming-${process.pid}-${randomUUID()}`
+  }
 
   public runOnce(): Promise<void> {
     if (this.stopped) return Promise.resolve()
@@ -81,7 +84,7 @@ export class IncomingReconciliationService {
   }
 
   private async reconcileAccount(account: IndexedAccount): Promise<void> {
-    const owner = this.options.owner ?? `incoming-${process.pid}`
+    const owner = this.owner
     const leaseSeconds = this.options.leaseSeconds ?? 60
     const partition = await this.repository.claimIncomingPartition?.({
       accountId: account.accountId,
@@ -94,6 +97,10 @@ export class IncomingReconciliationService {
     if (this.repository.claimIncomingPartition !== undefined && partition === null) {
       return
     }
+    const lease: { expiresAt?: Date } = {}
+    if (partition?.leaseExpiresAt !== undefined && partition.leaseExpiresAt !== null) {
+      lease.expiresAt = partition.leaseExpiresAt
+    }
     const cursor =
       partition ??
       (await this.repository.getIncomingCursor(
@@ -101,7 +108,12 @@ export class IncomingReconciliationService {
         'SOLANA_SPL',
         account.solanaPublicKey,
       ))
-    const heartbeat = this.startPartitionLeaseHeartbeat(account, owner, leaseSeconds)
+    const heartbeat = this.startPartitionLeaseHeartbeat(
+      account,
+      owner,
+      leaseSeconds,
+      lease,
+    )
     try {
       if (!(await this.hasRpcCapacity(account.accountId))) return
       const scan =
@@ -140,7 +152,12 @@ export class IncomingReconciliationService {
           cursorSignature: scan.nextCursor,
           ...(this.repository.claimIncomingPartition === undefined
             ? {}
-            : { leaseOwner: owner }),
+            : {
+                leaseOwner: owner,
+                ...(lease.expiresAt === undefined
+                  ? {}
+                  : { leaseExpiresAt: lease.expiresAt }),
+              }),
         })
       }
     } catch (error) {
@@ -158,6 +175,7 @@ export class IncomingReconciliationService {
         rail: 'SOLANA_SPL',
         address: account.solanaPublicKey,
         owner,
+        ...(lease.expiresAt === undefined ? {} : { leaseExpiresAt: lease.expiresAt }),
       })
     }
   }
@@ -166,6 +184,7 @@ export class IncomingReconciliationService {
     account: IndexedAccount,
     owner: string,
     leaseSeconds: number,
+    lease: { expiresAt?: Date },
   ): { stop(): void } {
     const renew = this.repository.renewIncomingPartition
     if (renew === undefined || this.repository.claimIncomingPartition === undefined) {
@@ -173,22 +192,32 @@ export class IncomingReconciliationService {
     }
     const timer = setInterval(
       () => {
+        const now = new Date()
+        const expectedLeaseExpiresAt = lease.expiresAt
         void renew({
           accountId: account.accountId,
           rail: 'SOLANA_SPL',
           address: account.solanaPublicKey,
           owner,
           leaseSeconds,
-          now: new Date(),
-        }).catch((error: unknown) => {
-          this.logger.error(
-            {
-              accountId: account.accountId,
-              errorCode: error instanceof Error ? error.name : 'UNKNOWN',
-            },
-            'Incoming partition lease renewal failed',
-          )
-        })
+          now,
+          ...(expectedLeaseExpiresAt === undefined
+            ? {}
+            : { leaseExpiresAt: expectedLeaseExpiresAt }),
+        }).then(
+          () => {
+            lease.expiresAt = new Date(now.getTime() + leaseSeconds * 1_000)
+          },
+          (error: unknown) => {
+            this.logger.error(
+              {
+                accountId: account.accountId,
+                errorCode: error instanceof Error ? error.name : 'UNKNOWN',
+              },
+              'Incoming partition lease renewal failed',
+            )
+          },
+        )
       },
       Math.max(1_000, Math.floor((leaseSeconds * 1_000) / 3)),
     )

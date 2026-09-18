@@ -6,6 +6,7 @@ import {
   ConflictError,
   IdempotencyConflictError,
   IdempotencyKeyReusedError,
+  InvalidStateError,
   NotFoundError,
   RecipientResolutionError,
 } from '@agent-payment/core'
@@ -758,36 +759,34 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
             reference: 'invoice-42',
           }),
         ).rejects.toThrow(ConflictError)
-        const first = await database.createIncomingPayment({
-          id: incomingId,
-          accountId,
-          signature: 'chain-signature-42',
-          amountAtomic: 1250n,
-          currency: 'USD',
-          sourceAddress: 'source-wallet',
-          reference: request.reference,
-          tokenAccount: 'destination-token-account',
-          settlementMint: 'settlement-mint',
-          confirmedAt: new Date(),
-        })
-        const duplicate = await database.createIncomingPayment({
-          id: `in_${randomUUID().replaceAll('-', '')}`,
-          accountId: first.payment.accountId,
-          signature: first.payment.signature,
-          amountAtomic: first.payment.amountAtomic,
-          currency: first.payment.currency,
-          ...(first.payment.sourceAddress === null
-            ? {}
-            : { sourceAddress: first.payment.sourceAddress }),
-          ...(first.payment.reference === null
-            ? {}
-            : { reference: first.payment.reference }),
-          tokenAccount: first.payment.tokenAccount,
-          settlementMint: first.payment.settlementMint,
-          confirmedAt: new Date(),
-        })
-        expect(first.created).toBe(true)
-        expect(duplicate.created).toBe(false)
+        const [first, duplicate] = await Promise.all([
+          database.createIncomingPayment({
+            id: incomingId,
+            accountId,
+            signature: 'chain-signature-42',
+            amountAtomic: 1250n,
+            currency: 'USD',
+            sourceAddress: 'source-wallet',
+            reference: request.reference,
+            tokenAccount: 'destination-token-account',
+            settlementMint: 'settlement-mint',
+            confirmedAt: new Date(),
+          }),
+          database.createIncomingPayment({
+            id: `in_${randomUUID().replaceAll('-', '')}`,
+            accountId,
+            signature: 'chain-signature-42',
+            amountAtomic: 1250n,
+            currency: 'USD',
+            sourceAddress: 'source-wallet',
+            reference: request.reference,
+            tokenAccount: 'destination-token-account',
+            settlementMint: 'settlement-mint',
+            confirmedAt: new Date(),
+          }),
+        ])
+        expect([first.created, duplicate.created].sort()).toEqual([false, true])
+        expect(first.payment.id).toBe(duplicate.payment.id)
         expect(
           (await database.findReceiveRequestForOwner(accountId, receiveId))?.status,
         ).toBe('PAID')
@@ -1417,6 +1416,233 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
             )
           ).some((issue) => issue.signature === signature),
         ).toBe(false)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('makes the final reconciliation attempt recoverable after a worker crash', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const issueId = `issue_${randomUUID().replaceAll('-', '')}`
+      const signature = `crashed-issue-${randomUUID()}`
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'incoming-issue-crash-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'mux_integration',
+        })
+        await database.recordIncomingReconciliationIssue({
+          id: issueId,
+          accountId,
+          signature,
+          reason: 'TRANSACTION_UNAVAILABLE',
+        })
+
+        let now = new Date(Date.now() + 1_000)
+        for (
+          let expectedRetryCount = 1;
+          expectedRetryCount <= 8;
+          expectedRetryCount += 1
+        ) {
+          const claimed = await database.claimIncomingReconciliationIssues(1, now)
+          expect(claimed).toHaveLength(1)
+          expect(claimed[0]).toMatchObject({
+            id: issueId,
+            retryCount: expectedRetryCount,
+          })
+          now = new Date(now.getTime() + 10 * 60_000)
+        }
+
+        const recovered = await database.claimIncomingReconciliationIssues(1, now)
+        expect(recovered).toHaveLength(1)
+        expect(recovered[0]).toMatchObject({ id: issueId, retryCount: 9 })
+        const recoveredAgain = await database.claimIncomingReconciliationIssues(
+          1,
+          new Date(now.getTime() + 10 * 60_000),
+        )
+        expect(recoveredAgain).toHaveLength(1)
+        expect(recoveredAgain[0]).toMatchObject({ id: issueId, retryCount: 9 })
+        await database.resolveIncomingReconciliationIssue(issueId)
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('rejects fractional leases and stale work-item mutations', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const workItemId = `work_${randomUUID().replaceAll('-', '')}`
+      const finalWorkItemId = `work_${randomUUID().replaceAll('-', '')}`
+      let sqlConnected = false
+
+      try {
+        await expect(
+          database.v2.claimWorkItem({
+            kind: 'OUTGOING_PAYMENT',
+            owner: 'fractional-lease-owner',
+            leaseSeconds: 1.5,
+          }),
+        ).rejects.toBeInstanceOf(InvalidStateError)
+
+        await sql.connect()
+        sqlConnected = true
+        await sql.query(
+          `INSERT INTO durable_work_items
+             (id, kind, resource_type, resource_id, status, available_at,
+              lease_owner, lease_expires_at, attempt_count, max_attempts, updated_at)
+           VALUES ($1, 'STALE_OUTGOING_PAYMENT', 'PAYMENT', $2, 'CLAIMED', NOW() - INTERVAL '1 second',
+                   'expired-owner', NOW() - INTERVAL '1 second', 1, 10, NOW())`,
+          [workItemId, `payment_${randomUUID().replaceAll('-', '')}`],
+        )
+        await sql.query(
+          `INSERT INTO durable_work_items
+             (id, kind, resource_type, resource_id, status, available_at,
+              lease_owner, lease_expires_at, attempt_count, max_attempts, updated_at)
+           VALUES ($1, 'OUTGOING_PAYMENT', 'PAYMENT', $2, 'CLAIMED', NOW() - INTERVAL '1 second',
+                   'final-expired-owner', NOW() - INTERVAL '1 second', 10, 10, NOW())`,
+          [finalWorkItemId, `payment_${randomUUID().replaceAll('-', '')}`],
+        )
+
+        const recoveredFinal = await database.v2.claimWorkItem({
+          kind: 'OUTGOING_PAYMENT',
+          owner: 'final-recovery-owner',
+          leaseSeconds: 30,
+        })
+        expect(recoveredFinal).toMatchObject({
+          id: finalWorkItemId,
+          attemptCount: 10,
+        })
+        await expect(
+          database.v2.completeWorkItem(finalWorkItemId, 'final-expired-owner'),
+        ).rejects.toBeInstanceOf(ConflictError)
+        await sql.query(
+          `UPDATE durable_work_items
+           SET lease_expires_at = NOW() - INTERVAL '1 second', updated_at = NOW()
+           WHERE id = $1`,
+          [finalWorkItemId],
+        )
+        const recoveredAfterSecondCrash = await database.v2.claimWorkItem({
+          kind: 'OUTGOING_PAYMENT',
+          owner: 'final-recovery-owner-2',
+          leaseSeconds: 30,
+        })
+        expect(recoveredAfterSecondCrash).toMatchObject({
+          id: finalWorkItemId,
+          attemptCount: 10,
+        })
+        await database.v2.completeWorkItem(finalWorkItemId, 'final-recovery-owner-2')
+
+        await expect(
+          database.v2.completeWorkItem(workItemId, 'expired-owner'),
+        ).rejects.toBeInstanceOf(ConflictError)
+        await expect(
+          database.v2.retryWorkItem({
+            id: workItemId,
+            owner: 'expired-owner',
+            retryAt: new Date(),
+            errorCode: 'TEST_RETRY',
+            errorSafe: 'test retry',
+          }),
+        ).rejects.toBeInstanceOf(ConflictError)
+        await expect(
+          database.v2.failWorkItem({
+            id: workItemId,
+            owner: 'expired-owner',
+            errorCode: 'TEST_FAILURE',
+            errorSafe: 'test failure',
+          }),
+        ).rejects.toBeInstanceOf(ConflictError)
+      } finally {
+        if (sqlConnected) {
+          await sql.query('DELETE FROM durable_work_items WHERE id IN ($1, $2)', [
+            workItemId,
+            finalWorkItemId,
+          ])
+          await sql.end()
+        }
+        await database.disconnect()
+      }
+    })
+
+    it('does not release a newer same-owner incoming lease with an old token', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const owner = 'explicit-owner'
+      const firstClaimAt = new Date('2026-09-18T00:00:00.000Z')
+      const secondClaimAt = new Date('2026-09-18T00:00:11.000Z')
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'incoming-lease-integration-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        const first = await database.claimIncomingPartition!({
+          accountId,
+          rail: 'SOLANA_SPL',
+          address: `${accountId}_address`,
+          owner,
+          leaseSeconds: 10,
+          now: firstClaimAt,
+        })
+        const second = await database.claimIncomingPartition!({
+          accountId,
+          rail: 'SOLANA_SPL',
+          address: `${accountId}_address`,
+          owner,
+          leaseSeconds: 20,
+          now: secondClaimAt,
+        })
+
+        expect(first?.leaseExpiresAt).toEqual(new Date('2026-09-18T00:00:10.000Z'))
+        expect(second?.leaseExpiresAt).toEqual(new Date('2026-09-18T00:00:31.000Z'))
+        await database.releaseIncomingPartition!({
+          accountId,
+          rail: 'SOLANA_SPL',
+          address: `${accountId}_address`,
+          owner,
+          leaseExpiresAt: first?.leaseExpiresAt as Date,
+        })
+        expect(
+          (
+            await database.getIncomingCursor(
+              accountId,
+              'SOLANA_SPL',
+              `${accountId}_address`,
+            )
+          )?.leaseExpiresAt,
+        ).toEqual(new Date('2026-09-18T00:00:31.000Z'))
+        await database.releaseIncomingPartition!({
+          accountId,
+          rail: 'SOLANA_SPL',
+          address: `${accountId}_address`,
+          owner,
+          leaseExpiresAt: second?.leaseExpiresAt as Date,
+        })
+        expect(
+          (
+            await database.getIncomingCursor(
+              accountId,
+              'SOLANA_SPL',
+              `${accountId}_address`,
+            )
+          )?.leaseExpiresAt,
+        ).toBeNull()
       } finally {
         await database.disconnect()
       }

@@ -120,15 +120,20 @@ export class V2PaymentService {
     correlationId?: string,
   ): Promise<{ readonly view: V2PaymentView; readonly created: boolean }> {
     const denomination = await this.loadDenomination(input.denominationId)
-    const amount = parseAmount(input.amount, denomination)
-    if (amount.atomicUnits <= 0n) {
+    const fingerprintAmount = parseAmount(
+      input.amount,
+      denomination.status === 'ACTIVE'
+        ? denomination
+        : { ...denomination, status: 'ACTIVE' },
+    )
+    if (fingerprintAmount.atomicUnits <= 0n) {
       throw new ValidationError('Payment amount must be positive')
     }
     const metadataJson = serializePaymentMetadata(input.metadata)
     const fingerprint = hashJson({
       kind: input.kind,
       recipient_id: input.recipientId,
-      amount: amount.amount,
+      amount: fingerprintAmount.amount,
       denomination_id: denomination.id,
       description: input.description ?? null,
       external_reference: input.externalReference ?? null,
@@ -158,6 +163,7 @@ export class V2PaymentService {
       }
       return { view: existingView, created: false }
     }
+    const amount = parseAmount(input.amount, denomination)
     const routes = await this.options.repository.listActiveSettlementRoutes()
     const capabilities =
       this.options.routeCapabilityProvider === undefined

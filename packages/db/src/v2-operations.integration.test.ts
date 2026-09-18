@@ -96,10 +96,9 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         )
       } finally {
         if (sqlConnected) {
-          await sql.query(
-            'DELETE FROM operational_exceptions WHERE resource_id = $1',
-            [deliveryId],
-          )
+          await sql.query('DELETE FROM operational_exceptions WHERE resource_id = $1', [
+            deliveryId,
+          ])
           await sql.query('DELETE FROM webhook_deliveries WHERE id = $1', [deliveryId])
           await sql.query('DELETE FROM webhook_events WHERE event_id = $1', [eventId])
           await sql.query('DELETE FROM webhook_subscriptions WHERE id = $1', [

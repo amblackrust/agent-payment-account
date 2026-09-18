@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { DependencyUnavailableError } from '@agent-payment/core'
 import type { createDatabaseClient } from '@agent-payment/db'
 import {
@@ -129,7 +130,7 @@ export function createV2OutgoingWorker(input: {
     mode: input.config.runtimeRole === 'reconcile' ? 'reconcile' : 'outgoing',
     batchSize: limits.workerBatchSize,
     leaseSeconds: limits.workerLeaseSeconds,
-    owner: `outgoing-v2-${process.pid}`,
+    owner: `outgoing-v2-${process.pid}-${randomUUID()}`,
     accountStatusProvider: {
       getStatus: async (accountId) => {
         if (findAccountSummary === undefined) {

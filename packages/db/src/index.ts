@@ -396,6 +396,7 @@ export interface IncomingCursor {
   readonly rail: string
   readonly address: string
   readonly cursorSignature: string | null
+  readonly leaseExpiresAt?: Date | null
 }
 
 export interface CreateReceiveRequestInput {
@@ -475,6 +476,7 @@ export interface IncomingPaymentRepository {
     readonly rail: string
     readonly address: string
     readonly owner: string
+    readonly leaseExpiresAt?: Date
   }) => Promise<void>
   readonly renewIncomingPartition?: (input: {
     readonly accountId: string
@@ -483,6 +485,7 @@ export interface IncomingPaymentRepository {
     readonly owner: string
     readonly leaseSeconds: number
     readonly now?: Date
+    readonly leaseExpiresAt?: Date
   }) => Promise<void>
   saveIncomingCursor(input: {
     readonly accountId: string
@@ -490,6 +493,7 @@ export interface IncomingPaymentRepository {
     readonly address: string
     readonly cursorSignature: string
     readonly leaseOwner?: string
+    readonly leaseExpiresAt?: Date
   }): Promise<void>
   createIncomingPayment(
     input: CreateIncomingPaymentInput,
@@ -2184,7 +2188,15 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       const cursor = await prisma.indexerCheckpoint.findUnique({
         where: { accountId_rail_address: { accountId, rail, address } },
       })
-      return cursor === null ? null : cursor
+      return cursor === null
+        ? null
+        : {
+            accountId: cursor.accountId,
+            rail: cursor.rail,
+            address: cursor.address,
+            cursorSignature: cursor.cursorSignature,
+            leaseExpiresAt: cursor.leaseExpiresAt,
+          }
     },
     async claimIncomingPartition(input) {
       if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
@@ -2226,11 +2238,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         ) {
           return null
         }
+        const leaseExpiresAt = new Date(now.getTime() + input.leaseSeconds * 1_000)
         await transaction.indexerCheckpoint.update({
           where: { id: checkpoint.id },
           data: {
             leaseOwner: input.owner,
-            leaseExpiresAt: new Date(now.getTime() + input.leaseSeconds * 1_000),
+            leaseExpiresAt,
           },
         })
         return {
@@ -2238,6 +2251,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           rail: input.rail,
           address: input.address,
           cursorSignature: checkpoint.cursor_signature,
+          leaseExpiresAt,
         }
       })
     },
@@ -2248,6 +2262,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           rail: input.rail,
           address: input.address,
           leaseOwner: input.owner,
+          ...(input.leaseExpiresAt === undefined
+            ? { leaseExpiresAt: { gt: new Date() } }
+            : { leaseExpiresAt: input.leaseExpiresAt }),
         },
         data: { leaseOwner: null, leaseExpiresAt: null },
       })
@@ -2263,6 +2280,8 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           rail: input.rail,
           address: input.address,
           leaseOwner: input.owner,
+          leaseExpiresAt:
+            input.leaseExpiresAt === undefined ? { gt: now } : input.leaseExpiresAt,
         },
         data: {
           leaseExpiresAt: new Date(now.getTime() + input.leaseSeconds * 1_000),
@@ -2277,7 +2296,14 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         accountId: input.accountId,
         rail: input.rail,
         address: input.address,
-        ...(input.leaseOwner === undefined ? {} : { leaseOwner: input.leaseOwner }),
+        ...(input.leaseOwner === undefined
+          ? {}
+          : {
+              leaseOwner: input.leaseOwner,
+              ...(input.leaseExpiresAt === undefined
+                ? { leaseExpiresAt: { gt: new Date() } }
+                : { leaseExpiresAt: input.leaseExpiresAt }),
+            }),
       }
       const result = await prisma.indexerCheckpoint.updateMany({
         where,
@@ -2335,14 +2361,19 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           FROM "incoming_reconciliation_issues" issue
           JOIN "agent_accounts" account ON account.id = issue.account_id
           WHERE issue.status = 'PENDING'
-            AND issue.retry_count <= ${MAX_INCOMING_ISSUE_RETRIES}
+            AND issue.retry_count <= ${MAX_INCOMING_ISSUE_RETRIES + 1}
             AND issue.next_retry_at <= ${now}
           ORDER BY issue.next_retry_at ASC, issue.id ASC
           LIMIT ${limit}
           FOR UPDATE OF issue SKIP LOCKED
         `
         for (const issue of issues) {
-          const retryCount = issue.retry_count + 1
+          // Keep the recovery claim at the bounded sentinel so a worker crash
+          // cannot move the row beyond the query's recovery boundary.
+          const retryCount = Math.min(
+            issue.retry_count + 1,
+            MAX_INCOMING_ISSUE_RETRIES + 1,
+          )
           const backoffMilliseconds = Math.min(
             5 * 60_000,
             5_000 * 2 ** Math.min(retryCount - 1, 6),
@@ -2362,7 +2393,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           accountPublicKey: issue.account_public_key,
           signature: issue.signature,
           reason: issue.reason,
-          retryCount: issue.retry_count + 1,
+          retryCount: Math.min(issue.retry_count + 1, MAX_INCOMING_ISSUE_RETRIES + 1),
         }))
       })
     },
@@ -2421,8 +2452,56 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
     },
     async createIncomingPayment(input) {
-      return prisma.$transaction(async (transaction) => {
-        const existing = await transaction.incomingPayment.findUnique({
+      try {
+        return await prisma.$transaction(async (transaction) => {
+          const existing = await transaction.incomingPayment.findUnique({
+            where: {
+              accountId_signature: {
+                accountId: input.accountId,
+                signature: input.signature,
+              },
+            },
+          })
+          if (existing !== null) {
+            return { payment: toIncomingPaymentRecord(existing), created: false }
+          }
+          const incoming = await transaction.incomingPayment.create({
+            data: {
+              id: input.id,
+              accountId: input.accountId,
+              signature: input.signature,
+              amountAtomic: input.amountAtomic,
+              tokenAtomicUnits: input.tokenAtomicUnits ?? input.amountAtomic,
+              tokenDecimals: input.tokenDecimals ?? 2,
+              currency: input.currency,
+              ...(input.sourceAddress === undefined
+                ? {}
+                : { sourceAddress: input.sourceAddress }),
+              ...(input.reference === undefined ? {} : { reference: input.reference }),
+              tokenAccount: input.tokenAccount,
+              settlementMint: input.settlementMint,
+              confirmedAt: input.confirmedAt,
+            },
+          })
+          await enqueueIncomingPaymentWebhookEvent(transaction, incoming, 'created', 1)
+          await matchIncomingPaymentInTransaction(transaction, {
+            incomingPaymentId: incoming.id,
+            accountId: input.accountId,
+            amountAtomic: input.amountAtomic,
+            reference: input.reference ?? null,
+            confirmedAt: input.confirmedAt,
+          })
+          const createdPayment = await transaction.incomingPayment.findUniqueOrThrow({
+            where: { id: incoming.id },
+          })
+          return {
+            payment: toIncomingPaymentRecord(createdPayment),
+            created: true,
+          }
+        })
+      } catch (error) {
+        if (!isPrismaUniqueConstraintError(error)) throw error
+        const existing = await prisma.incomingPayment.findUnique({
           where: {
             accountId_signature: {
               accountId: input.accountId,
@@ -2430,43 +2509,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             },
           },
         })
-        if (existing !== null) {
-          return { payment: toIncomingPaymentRecord(existing), created: false }
-        }
-        const incoming = await transaction.incomingPayment.create({
-          data: {
-            id: input.id,
-            accountId: input.accountId,
-            signature: input.signature,
-            amountAtomic: input.amountAtomic,
-            tokenAtomicUnits: input.tokenAtomicUnits ?? input.amountAtomic,
-            tokenDecimals: input.tokenDecimals ?? 2,
-            currency: input.currency,
-            ...(input.sourceAddress === undefined
-              ? {}
-              : { sourceAddress: input.sourceAddress }),
-            ...(input.reference === undefined ? {} : { reference: input.reference }),
-            tokenAccount: input.tokenAccount,
-            settlementMint: input.settlementMint,
-            confirmedAt: input.confirmedAt,
-          },
-        })
-        await enqueueIncomingPaymentWebhookEvent(transaction, incoming, 'created', 1)
-        await matchIncomingPaymentInTransaction(transaction, {
-          incomingPaymentId: incoming.id,
-          accountId: input.accountId,
-          amountAtomic: input.amountAtomic,
-          reference: input.reference ?? null,
-          confirmedAt: input.confirmedAt,
-        })
-        const createdPayment = await transaction.incomingPayment.findUniqueOrThrow({
-          where: { id: incoming.id },
-        })
-        return {
-          payment: toIncomingPaymentRecord(createdPayment),
-          created: true,
-        }
-      })
+        if (existing === null) throw error
+        return { payment: toIncomingPaymentRecord(existing), created: false }
+      }
     },
     async reconcileUnmatchedManagedIncoming(limit): Promise<number> {
       return prisma.$transaction(async (transaction) => {

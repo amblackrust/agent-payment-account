@@ -747,6 +747,37 @@ export function createV2OperationsRepository(
       }
       const leaseExpiresAt = new Date(now.getTime() + input.leaseSeconds * 1000)
       return prisma.$transaction(async (transaction) => {
+        const expiredFinalRows = await transaction.$queryRaw<readonly { id: string }[]>`
+          SELECT id
+          FROM "webhook_deliveries"
+          WHERE status = 'CLAIMED'
+            AND lease_expires_at <= ${now}
+            AND attempt_count >= ${input.maxAttempts}
+          ORDER BY available_at ASC, id ASC
+          LIMIT ${input.limit}
+          FOR UPDATE SKIP LOCKED
+        `
+        for (const row of expiredFinalRows) {
+          const delivery = await transaction.webhookDelivery.findUnique({
+            where: { id: row.id },
+          })
+          if (
+            delivery === null ||
+            delivery.status !== 'CLAIMED' ||
+            delivery.leaseExpiresAt === null ||
+            delivery.leaseExpiresAt > now ||
+            delivery.attemptCount < input.maxAttempts
+          ) {
+            continue
+          }
+          await exhaustWebhookDelivery(
+            transaction,
+            delivery,
+            delivery.errorSafe ??
+              'Webhook delivery lease expired after maximum attempts',
+            now,
+          )
+        }
         const rows = await transaction.$queryRaw<
           readonly {
             id: string
@@ -827,8 +858,14 @@ export function createV2OperationsRepository(
     },
 
     async markWebhookDelivered(id, owner, responseStatus) {
+      const now = new Date()
       const result = await prisma.webhookDelivery.updateMany({
-        where: { id, status: 'CLAIMED', leaseOwner: owner },
+        where: {
+          id,
+          status: 'CLAIMED',
+          leaseOwner: owner,
+          leaseExpiresAt: { gt: now },
+        },
         data: {
           status: 'DELIVERED',
           responseStatus,
@@ -842,6 +879,7 @@ export function createV2OperationsRepository(
 
     async retryWebhookDelivery(input) {
       await prisma.$transaction(async (transaction) => {
+        const now = new Date()
         const locked = await transaction.$queryRaw<readonly { id: string }[]>`
           SELECT id
           FROM "webhook_deliveries"
@@ -856,7 +894,9 @@ export function createV2OperationsRepository(
         if (
           delivery === null ||
           delivery.status !== 'CLAIMED' ||
-          delivery.leaseOwner !== input.owner
+          delivery.leaseOwner !== input.owner ||
+          delivery.leaseExpiresAt === null ||
+          delivery.leaseExpiresAt <= now
         ) {
           throw new ConflictError('Webhook delivery lease is no longer owned')
         }
@@ -864,55 +904,21 @@ export function createV2OperationsRepository(
           throw new ValidationError('Webhook maximum attempts must be positive')
         }
         const exhausted = delivery.attemptCount >= input.maxAttempts
+        if (exhausted) {
+          await exhaustWebhookDelivery(transaction, delivery, input.errorSafe)
+          return
+        }
         await transaction.webhookDelivery.update({
           where: { id: input.id },
           data: {
-            status: exhausted ? 'EXHAUSTED' : 'RETRY_WAIT',
-            availableAt: exhausted ? delivery.availableAt : input.retryAt,
-            nextRetryAt: exhausted ? null : input.retryAt,
+            status: 'RETRY_WAIT',
+            availableAt: input.retryAt,
+            nextRetryAt: input.retryAt,
             errorSafe: input.errorSafe,
             leaseOwner: null,
             leaseExpiresAt: null,
           },
         })
-        if (exhausted) {
-          const subscription = await transaction.webhookSubscription.findUnique({
-            where: { id: delivery.subscriptionId },
-            select: { accountId: true },
-          })
-          await transaction.operationalException.upsert({
-            where: { activeDedupeKey: `active:webhook:${input.id}` },
-            create: {
-              id: `opx_webhook_${randomId()}`,
-              ...(subscription === null ? {} : { accountId: subscription.accountId }),
-              resourceType: 'WEBHOOK_DELIVERY',
-              resourceId: input.id,
-              dedupeKey: `webhook:${input.id}`,
-              activeDedupeKey: `active:webhook:${input.id}`,
-              reasonCode: 'WEBHOOK_DELIVERY_EXHAUSTED',
-              detailsJson: JSON.stringify({ error: input.errorSafe }),
-            },
-            update: {
-              updatedAt: new Date(),
-              detailsJson: JSON.stringify({ error: input.errorSafe }),
-            },
-          })
-          await createTimelineEvent(transaction, {
-            id: `timeline_${randomId()}`,
-            ...(subscription === null ? {} : { accountId: subscription.accountId }),
-            resourceType: 'WEBHOOK_DELIVERY',
-            resourceId: input.id,
-            eventType: 'WEBHOOK_DELIVERY_EXHAUSTED',
-            actorType: 'SYSTEM',
-            source: 'V2_WEBHOOK_WORKER',
-            occurredAt: new Date(),
-            newStateJson: JSON.stringify({
-              status: 'EXHAUSTED',
-              attempt_count: delivery.attemptCount,
-              error: input.errorSafe,
-            }),
-          })
-        }
       })
     },
 
@@ -995,6 +1001,66 @@ export function createV2OperationsRepository(
   }
 }
 
+async function exhaustWebhookDelivery(
+  transaction: Prisma.TransactionClient,
+  delivery: {
+    readonly id: string
+    readonly subscriptionId: string
+    readonly attemptCount: number
+    readonly availableAt: Date
+  },
+  errorSafe: string,
+  occurredAt = new Date(),
+): Promise<void> {
+  await transaction.webhookDelivery.update({
+    where: { id: delivery.id },
+    data: {
+      status: 'EXHAUSTED',
+      nextRetryAt: null,
+      availableAt: delivery.availableAt,
+      errorSafe,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    },
+  })
+  const subscription = await transaction.webhookSubscription.findUnique({
+    where: { id: delivery.subscriptionId },
+    select: { accountId: true },
+  })
+  await transaction.operationalException.upsert({
+    where: { activeDedupeKey: `active:webhook:${delivery.id}` },
+    create: {
+      id: `opx_webhook_${randomId()}`,
+      ...(subscription === null ? {} : { accountId: subscription.accountId }),
+      resourceType: 'WEBHOOK_DELIVERY',
+      resourceId: delivery.id,
+      dedupeKey: `webhook:${delivery.id}`,
+      activeDedupeKey: `active:webhook:${delivery.id}`,
+      reasonCode: 'WEBHOOK_DELIVERY_EXHAUSTED',
+      detailsJson: JSON.stringify({ error: errorSafe }),
+    },
+    update: {
+      updatedAt: occurredAt,
+      detailsJson: JSON.stringify({ error: errorSafe }),
+    },
+  })
+  await createTimelineEvent(transaction, {
+    id: `timeline_${randomId()}`,
+    ...(subscription === null ? {} : { accountId: subscription.accountId }),
+    resourceType: 'WEBHOOK_DELIVERY',
+    resourceId: delivery.id,
+    eventType: 'WEBHOOK_DELIVERY_EXHAUSTED',
+    actorType: 'SYSTEM',
+    source: 'V2_WEBHOOK_WORKER',
+    occurredAt,
+    newStateJson: JSON.stringify({
+      status: 'EXHAUSTED',
+      attempt_count: delivery.attemptCount,
+      error: errorSafe,
+    }),
+  })
+}
+
 async function resolveExceptionWithEvidence(
   prisma: PrismaClient,
   input: {
@@ -1012,9 +1078,17 @@ async function resolveExceptionWithEvidence(
     const payment = await findExceptionPayment(transaction, exception)
     if (payment === null)
       throw new InvalidStateError('Exception is not linked to a payment')
+    const attempts = await transaction.paymentAttempt.findMany({
+      where: { paymentId: payment.id },
+      orderBy: { attemptNumber: 'asc' },
+    })
+    const currentAttempt = attempts.at(-1)
+    if (currentAttempt === undefined)
+      throw new InvalidStateError('Payment has no attempt')
     const evidence = await transaction.evidenceRecord.findFirst({
       where: {
         paymentId: payment.id,
+        attemptId: currentAttempt.id,
         ...(input.evidenceId === undefined ? {} : { id: input.evidenceId }),
         outcome,
       },
@@ -1030,13 +1104,6 @@ async function resolveExceptionWithEvidence(
     if (!allowedAuthorities.has(evidence.authority)) {
       throw new ConflictError(`Authoritative ${outcome} evidence is required`)
     }
-    const attempts = await transaction.paymentAttempt.findMany({
-      where: { paymentId: payment.id },
-      orderBy: { attemptNumber: 'asc' },
-    })
-    const currentAttempt = attempts.at(-1)
-    if (currentAttempt === undefined)
-      throw new InvalidStateError('Payment has no attempt')
     if (outcome === 'CONFIRMED') {
       if (
         attempts.some(

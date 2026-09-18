@@ -902,9 +902,12 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     async createV2Payment(input) {
       return prisma.$transaction(async (transaction) => {
         const accountRows = await transaction.$queryRaw<
-          Array<{ id: string; status: string }>
+          Array<{ id: string; status: string; current_time: Date }>
         >`
-          SELECT id, status FROM "agent_accounts" WHERE id = ${input.accountId} FOR UPDATE
+          SELECT id, status, CURRENT_TIMESTAMP AS current_time
+          FROM "agent_accounts"
+          WHERE id = ${input.accountId}
+          FOR UPDATE
         `
         const account = accountRows[0]
         if (account === undefined)
@@ -996,7 +999,10 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
         const windowStart =
           currentPolicy.rollingWindowSeconds === null
             ? new Date(0)
-            : new Date(Date.now() - currentPolicy.rollingWindowSeconds * 1_000)
+            : new Date(
+                account.current_time.getTime() -
+                  currentPolicy.rollingWindowSeconds * 1_000,
+              )
         const [confirmed, held, unresolved, transactionCount, approvedDestination] =
           await Promise.all([
             transaction.payment.aggregate({
@@ -2319,14 +2325,21 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     },
 
     async claimWorkItem(input) {
-      if (input.leaseSeconds <= 0) throw new InvalidStateError('Lease must be positive')
+      if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
+        throw new InvalidStateError('Lease must be positive')
+      }
       const now = input.now ?? new Date()
       return prisma.$transaction(async (transaction) => {
-        const rows = await transaction.$queryRaw<Array<{ id: string }>>`
-          SELECT id FROM "durable_work_items"
+        const rows = await transaction.$queryRaw<
+          Array<{ id: string; attempt_count: number; max_attempts: number }>
+        >`
+          SELECT id, attempt_count, max_attempts FROM "durable_work_items"
           WHERE kind = ${input.kind}
             AND (status = 'AVAILABLE' OR status = 'RETRY_WAIT' OR (status = 'CLAIMED' AND lease_expires_at <= ${now}))
-            AND attempt_count < max_attempts
+            AND (
+              (status IN ('AVAILABLE', 'RETRY_WAIT') AND attempt_count < max_attempts)
+              OR (status = 'CLAIMED' AND attempt_count <= max_attempts)
+            )
             AND available_at <= ${now}
           ORDER BY available_at ASC, id ASC
           FOR UPDATE SKIP LOCKED
@@ -2341,7 +2354,9 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
             status: 'CLAIMED',
             leaseOwner: input.owner,
             leaseExpiresAt,
-            attemptCount: { increment: 1 },
+            ...(row.attempt_count >= row.max_attempts
+              ? {}
+              : { attemptCount: { increment: 1 } }),
           },
         })
         const accountId = await resolveWorkAccountId(
@@ -2362,8 +2377,14 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
     },
 
     async completeWorkItem(id, owner) {
+      const now = new Date()
       const result = await prisma.durableWorkItem.updateMany({
-        where: { id, status: 'CLAIMED', leaseOwner: owner },
+        where: {
+          id,
+          status: 'CLAIMED',
+          leaseOwner: owner,
+          leaseExpiresAt: { gt: now },
+        },
         data: {
           status: 'COMPLETED',
           completedAt: new Date(),
@@ -2397,8 +2418,14 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 
     async retryWorkItem(input) {
       await prisma.$transaction(async (transaction) => {
+        const now = new Date()
         const item = await transaction.durableWorkItem.findFirst({
-          where: { id: input.id, status: 'CLAIMED', leaseOwner: input.owner },
+          where: {
+            id: input.id,
+            status: 'CLAIMED',
+            leaseOwner: input.owner,
+            leaseExpiresAt: { gt: now },
+          },
         })
         if (item === null) throw new ConflictError('Work item lease is no longer owned')
         const exhausted = item.attemptCount >= item.maxAttempts
@@ -2429,8 +2456,14 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 
     async failWorkItem(input) {
       await prisma.$transaction(async (transaction) => {
+        const now = new Date()
         const item = await transaction.durableWorkItem.findFirst({
-          where: { id: input.id, status: 'CLAIMED', leaseOwner: input.owner },
+          where: {
+            id: input.id,
+            status: 'CLAIMED',
+            leaseOwner: input.owner,
+            leaseExpiresAt: { gt: now },
+          },
         })
         if (item === null) throw new ConflictError('Work item lease is no longer owned')
         await markWorkItemExhausted(transaction, item, input.errorCode, input.errorSafe)

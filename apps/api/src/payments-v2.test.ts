@@ -35,6 +35,7 @@ function createHarness(
   let captured: V2PaymentCreateInput | undefined
   let latestView: V2PaymentView | undefined
   let existingIdempotency: V2IdempotencyRecord | null = null
+  let denominationStatus: 'ACTIVE' | 'RETIRED' = 'ACTIVE'
   const getSettledAtomic = vi.fn(async () => 1_000n)
   const findV2Idempotency = vi.fn(async () => existingIdempotency)
   const repository = {
@@ -42,7 +43,7 @@ function createHarness(
       id: 'denom_usd',
       symbol: 'USD',
       maxScale: 2,
-      status: 'ACTIVE',
+      status: denominationStatus,
       version: 1,
     }),
     listActiveSettlementRoutes: async () => [
@@ -218,6 +219,9 @@ function createHarness(
     setExistingIdempotency: (record: V2IdempotencyRecord | null) => {
       existingIdempotency = record
     },
+    setDenominationStatus: (status: 'ACTIVE' | 'RETIRED') => {
+      denominationStatus = status
+    },
   }
 }
 
@@ -362,8 +366,18 @@ describe('V2 payment service', () => {
       'req_2',
     )
 
+    harness.setDenominationStatus('RETIRED')
+    const replayAfterRetirement = await harness.service.createPayment(
+      account,
+      input,
+      'idem_replay',
+      'req_3',
+    )
+
     expect(second.created).toBe(false)
     expect(second.view.payment.id).toBe(first.view.payment.id)
+    expect(replayAfterRetirement.created).toBe(false)
+    expect(replayAfterRetirement.view.payment.id).toBe(first.view.payment.id)
     expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
   })
 
