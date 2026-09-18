@@ -1,6 +1,10 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
+import { lookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
+import { request as httpsRequest } from 'node:https'
 import { computeRetryAt } from '@agent-payment/core'
 import {
+  assertSafeWebhookAddress,
   assertSafeWebhookEndpoint,
   type V2OperationsRepository,
   type V2WebhookDeliveryClaim,
@@ -17,6 +21,34 @@ export const DEFAULT_WEBHOOK_REPLAY_WINDOW_SECONDS = 300
 export const WEBHOOK_SIGNATURE_HEADER = 'x-mux-signature'
 export const WEBHOOK_SIGNATURE_VERSION_HEADER = 'x-mux-signature-version'
 export const WEBHOOK_TIMESTAMP_HEADER = 'x-mux-timestamp'
+
+const DEFAULT_HTTPS_PORT = 443
+
+export interface WebhookResolvedAddress {
+  readonly address: string
+  readonly family: 4 | 6
+}
+
+export type WebhookHostnameResolver = (
+  hostname: string,
+) => Promise<readonly WebhookResolvedAddress[]>
+
+export interface WebhookDeliveryRequest {
+  readonly endpoint: URL
+  readonly address: WebhookResolvedAddress
+  readonly headers: Readonly<Record<string, string>>
+  readonly body: string
+  readonly signal: AbortSignal
+}
+
+export interface WebhookDeliveryResponse {
+  readonly ok: boolean
+  readonly status: number
+}
+
+export type WebhookSender = (
+  request: WebhookDeliveryRequest,
+) => Promise<WebhookDeliveryResponse>
 
 export interface WebhookSigningKeyProvider {
   getKey(reference: string, version: number): Promise<Uint8Array>
@@ -78,6 +110,8 @@ export interface WebhookDeliveryWorkerOptions {
   readonly leaseSeconds?: number
   readonly maxAttempts?: number
   readonly timeoutMs?: number
+  readonly resolveHostname?: WebhookHostnameResolver
+  readonly send?: WebhookSender
   readonly capacity?: {
     acquire(dependency: 'webhook', now?: Date): Promise<CapacityResult>
   }
@@ -143,7 +177,10 @@ export class WebhookDeliveryWorker {
         claim.signingKeyVersion,
       )
       if (key.byteLength === 0) throw new Error('Webhook signing key is empty')
-      assertSafeWebhookEndpoint(claim.endpoint)
+      const target = await resolveWebhookTarget(
+        claim.endpoint,
+        this.options.resolveHostname ?? resolveWebhookHostname,
+      )
       const timestampSeconds = Math.floor(this.now().getTime() / 1_000)
       const signature = createWebhookSignature(claim.rawBody, timestampSeconds, key)
       if (!(await this.acquireCapacity(claim))) return
@@ -152,10 +189,11 @@ export class WebhookDeliveryWorker {
         () => controller.abort(),
         this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       )
-      let response: Response
+      let response: WebhookDeliveryResponse
       try {
-        response = await fetch(claim.endpoint, {
-          method: 'POST',
+        response = await (this.options.send ?? sendWebhookRequest)({
+          endpoint: target.endpoint,
+          address: target.address,
           headers: {
             'content-type': 'application/json',
             'x-mux-event-id': claim.eventId,
@@ -164,7 +202,6 @@ export class WebhookDeliveryWorker {
             [WEBHOOK_TIMESTAMP_HEADER]: String(timestampSeconds),
           },
           body: claim.rawBody,
-          redirect: 'error',
           signal: controller.signal,
         })
       } finally {
@@ -253,6 +290,76 @@ export class WebhookDeliveryWorker {
     }, intervalMs)
     return { stop: () => clearInterval(timer) }
   }
+}
+
+async function resolveWebhookHostname(
+  hostname: string,
+): Promise<readonly WebhookResolvedAddress[]> {
+  const addresses = await lookup(hostname, { all: true, verbatim: true })
+  return addresses.map((candidate) => {
+    if (candidate.family !== 4 && candidate.family !== 6) {
+      throw new Error('Webhook endpoint returned an unsupported address family')
+    }
+    return { address: candidate.address, family: candidate.family }
+  })
+}
+
+async function resolveWebhookTarget(
+  endpoint: string,
+  resolveHostname: WebhookHostnameResolver,
+): Promise<{ endpoint: URL; address: WebhookResolvedAddress }> {
+  assertSafeWebhookEndpoint(endpoint)
+  const parsed = new URL(endpoint)
+  const hostname = parsed.hostname.replace(/^\[|\]$/gu, '').toLowerCase()
+  const version = isIP(hostname)
+  const addresses =
+    version === 4 || version === 6
+      ? [{ address: hostname, family: version as 4 | 6 }]
+      : await resolveHostname(hostname)
+  if (addresses.length === 0) {
+    throw new Error('Webhook endpoint did not resolve to a public address')
+  }
+  for (const address of addresses) assertSafeWebhookAddress(address.address)
+  const address = addresses[0]
+  if (address === undefined) {
+    throw new Error('Webhook endpoint did not resolve to a public address')
+  }
+  return { endpoint: parsed, address }
+}
+
+async function sendWebhookRequest(
+  input: WebhookDeliveryRequest,
+): Promise<WebhookDeliveryResponse> {
+  const body = Buffer.from(input.body, 'utf8')
+  return await new Promise<WebhookDeliveryResponse>((resolve, reject) => {
+    const request = httpsRequest(
+      {
+        protocol: input.endpoint.protocol,
+        hostname: input.address.address,
+        port:
+          input.endpoint.port === '' ? DEFAULT_HTTPS_PORT : Number(input.endpoint.port),
+        path: `${input.endpoint.pathname}${input.endpoint.search}`,
+        method: 'POST',
+        headers: {
+          ...input.headers,
+          host: input.endpoint.host,
+          'content-length': String(body.byteLength),
+        },
+        servername: input.endpoint.hostname.replace(/^\[|\]$/gu, ''),
+        lookup: (_hostname, _options, callback) => {
+          callback(null, input.address.address, input.address.family)
+        },
+        signal: input.signal,
+      },
+      (response) => {
+        const status = response.statusCode ?? 0
+        response.resume()
+        resolve({ ok: status >= 200 && status < 300, status })
+      },
+    )
+    request.once('error', reject)
+    request.end(body)
+  })
 }
 
 function createWebhookSignature(

@@ -1191,6 +1191,13 @@ export function assertSafeWebhookEndpoint(endpoint: string): void {
   }
 }
 
+export function assertSafeWebhookAddress(address: string): void {
+  const normalized = address.replace(/^\[|\]$/gu, '').toLowerCase()
+  if (isIP(normalized) === 0 || isPrivateWebhookIp(normalized)) {
+    throw new ValidationError('Webhook endpoint must resolve to a public address')
+  }
+}
+
 function isPrivateWebhookIp(hostname: string): boolean {
   const version = isIP(hostname)
   if (version === 4) {
@@ -1214,6 +1221,8 @@ function isPrivateWebhookIp(hostname: string): boolean {
     )
   }
   if (version === 6) {
+    const mappedIpv4 = parseMappedIpv4(hostname)
+    if (mappedIpv4 !== undefined) return isPrivateWebhookIp(mappedIpv4)
     return (
       hostname === '::' ||
       hostname === '::1' ||
@@ -1230,6 +1239,13 @@ function isPrivateWebhookIp(hostname: string): boolean {
     )
   }
   return false
+}
+
+function parseMappedIpv4(hostname: string): string | undefined {
+  const match = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/u.exec(hostname)
+  const mappedIpv4 = match?.[1]
+  if (mappedIpv4 === undefined || isIP(mappedIpv4) !== 4) return undefined
+  return mappedIpv4
 }
 
 function randomId(): string {

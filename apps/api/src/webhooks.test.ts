@@ -1,18 +1,25 @@
 import { createHmac } from 'node:crypto'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   assertSafeWebhookEndpoint,
   type V2OperationsRepository,
   type V2WebhookDeliveryClaim,
 } from '@agent-payment/db'
-import { verifyWebhookSignature, WebhookDeliveryWorker } from './webhooks.js'
+import {
+  verifyWebhookSignature,
+  WebhookDeliveryWorker,
+  type WebhookDeliveryRequest,
+  type WebhookResolvedAddress,
+} from './webhooks.js'
 
-const originalFetch = globalThis.fetch
+const publicAddress: WebhookResolvedAddress = {
+  address: '93.184.216.34',
+  family: 4,
+}
 
-afterEach(() => {
-  globalThis.fetch = originalFetch
-  vi.restoreAllMocks()
-})
+const resolvePublicHostname = async (): Promise<readonly WebhookResolvedAddress[]> => [
+  publicAddress,
+]
 
 function claim(
   overrides: Partial<V2WebhookDeliveryClaim> = {},
@@ -52,19 +59,14 @@ describe('webhook delivery worker', () => {
     const expectedSignature = createHmac('sha256', key)
       .update(`${timestamp}.${currentClaim.rawBody}`, 'utf8')
       .digest('hex')
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      expect(init?.body).toBe(currentClaim.rawBody)
-      expect(new Headers(init?.headers).get('x-mux-signature')).toBe(
-        `sha256=${expectedSignature}`,
-      )
-      expect(new Headers(init?.headers).get('x-mux-timestamp')).toBe(String(timestamp))
-      expect(new Headers(init?.headers).get('x-mux-event-id')).toBe(
-        currentClaim.eventId,
-      )
-      expect(init?.redirect).toBe('error')
-      return new Response(null, { status: 204 })
+    const sendMock = vi.fn(async (input: WebhookDeliveryRequest) => {
+      expect(input.body).toBe(currentClaim.rawBody)
+      expect(input.headers['x-mux-signature']).toBe(`sha256=${expectedSignature}`)
+      expect(input.headers['x-mux-timestamp']).toBe(String(timestamp))
+      expect(input.headers['x-mux-event-id']).toBe(currentClaim.eventId)
+      expect(input.address).toEqual(publicAddress)
+      return { ok: true, status: 204 }
     })
-    globalThis.fetch = fetchMock as typeof globalThis.fetch
     const worker = new WebhookDeliveryWorker({
       repository: repository(currentClaim, {
         markWebhookDelivered: async (id, owner, status) => {
@@ -74,11 +76,13 @@ describe('webhook delivery worker', () => {
       signingKeys: { getKey: async () => key },
       owner: 'webhook-worker-1',
       now: () => now,
+      resolveHostname: resolvePublicHostname,
+      send: sendMock,
     })
 
     await worker.runOnce()
 
-    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(sendMock).toHaveBeenCalledOnce()
     expect(delivered).toEqual([
       { id: 'delivery_1', owner: 'webhook-worker-1', status: 204 },
     ])
@@ -97,6 +101,27 @@ describe('webhook delivery worker', () => {
     expect(() =>
       assertSafeWebhookEndpoint('https://merchant.example.test/webhook'),
     ).not.toThrow()
+  })
+
+  it('rejects a public-looking hostname that resolves to a private address', async () => {
+    const retries: unknown[] = []
+    const sendMock = vi.fn()
+    const worker = new WebhookDeliveryWorker({
+      repository: repository(claim(), {
+        retryWebhookDelivery: async (input) => {
+          retries.push(input)
+        },
+      }),
+      signingKeys: { getKey: async () => new TextEncoder().encode('webhook-secret') },
+      owner: 'webhook-worker-1',
+      resolveHostname: async () => [{ address: '127.0.0.1', family: 4 }],
+      send: sendMock,
+    })
+
+    await worker.runOnce()
+
+    expect(sendMock).not.toHaveBeenCalled()
+    expect(retries).toHaveLength(1)
   })
 
   it('verifies the timestamp-bound signature and rejects stale or modified deliveries', () => {
@@ -140,9 +165,7 @@ describe('webhook delivery worker', () => {
   it('moves failed deliveries to the durable retry path', async () => {
     const retries: unknown[] = []
     const currentClaim = claim({ attemptCount: 2 })
-    globalThis.fetch = vi.fn(
-      async () => new Response(null, { status: 503 }),
-    ) as typeof globalThis.fetch
+    const sendMock = vi.fn(async () => ({ ok: false, status: 503 }))
     const worker = new WebhookDeliveryWorker({
       repository: repository(currentClaim, {
         retryWebhookDelivery: async (input) => {
@@ -153,6 +176,8 @@ describe('webhook delivery worker', () => {
       owner: 'webhook-worker-1',
       maxAttempts: 3,
       now: () => new Date('2026-01-01T00:00:00.000Z'),
+      resolveHostname: resolvePublicHostname,
+      send: sendMock,
     })
 
     await worker.runOnce()
@@ -170,7 +195,7 @@ describe('webhook delivery worker', () => {
     const retries: unknown[] = []
     const currentClaim = claim()
     const retryAt = new Date('2026-09-18T00:01:00.000Z')
-    globalThis.fetch = vi.fn() as typeof globalThis.fetch
+    const sendMock = vi.fn()
     const worker = new WebhookDeliveryWorker({
       repository: repository(currentClaim, {
         retryWebhookDelivery: async (input) => {
@@ -181,6 +206,8 @@ describe('webhook delivery worker', () => {
       owner: 'webhook-worker-1',
       maxAttempts: 3,
       now: () => new Date('2026-09-18T00:00:00.000Z'),
+      resolveHostname: resolvePublicHostname,
+      send: sendMock,
       capacity: {
         acquire: async () => ({ allowed: false, count: 51, retryAt }),
       },
@@ -188,7 +215,7 @@ describe('webhook delivery worker', () => {
 
     await worker.runOnce()
 
-    expect(globalThis.fetch).not.toHaveBeenCalled()
+    expect(sendMock).not.toHaveBeenCalled()
     expect(retries).toHaveLength(1)
     expect(retries[0]).toMatchObject({
       id: currentClaim.id,

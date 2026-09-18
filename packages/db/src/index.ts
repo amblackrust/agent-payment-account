@@ -23,6 +23,7 @@ const MAX_INCOMING_ISSUE_RETRIES = 8
 export { createV2DatabaseRepository } from './v2.js'
 export { createV2AdminRepository } from './v2-admin.js'
 export {
+  assertSafeWebhookAddress,
   assertSafeWebhookEndpoint,
   createV2OperationsRepository,
 } from './v2-operations.js'
