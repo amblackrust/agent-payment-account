@@ -847,6 +847,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
           status: currentDenomination.status as 'ACTIVE' | 'RETIRED',
           version: currentDenomination.version,
         })
+        await assertSettlementContextIsCurrent(transaction, input)
         const policy: SpendPolicy = {
           id: currentPolicy.id,
           accountId: currentPolicy.accountId,
@@ -2173,6 +2174,98 @@ async function resolveWorkAccountId(
     return attempt?.payment.payerAccountId
   }
   return undefined
+}
+
+async function assertSettlementContextIsCurrent(
+  transaction: Prisma.TransactionClient,
+  input: V2PaymentCreateInput,
+): Promise<void> {
+  if (input.route === null) return
+  if (input.settlementAssetId === null || input.economicMappingId === null) {
+    throw new InvalidStateError(
+      'A selected settlement route requires asset and mapping references',
+    )
+  }
+
+  const [routeRows, assetRows, mappingRows] = await Promise.all([
+    transaction.$queryRaw<
+      Array<{
+        rail: string
+        rail_version: string
+        network: string
+        settlement_asset_id: string
+        economic_mapping_id: string
+        status: string
+        priority: number
+        config_version: string
+      }>
+    >`
+      SELECT id, rail, rail_version, network, settlement_asset_id,
+             economic_mapping_id, status, priority, config_version
+        FROM settlement_routes
+       WHERE id = ${input.route.id}
+       FOR SHARE
+    `,
+    transaction.$queryRaw<
+      Array<{
+        id: string
+        rail: string
+        network: string
+        status: string
+      }>
+    >`
+      SELECT id, rail, network, status
+        FROM settlement_assets
+       WHERE id = ${input.settlementAssetId}
+       FOR SHARE
+    `,
+    transaction.$queryRaw<
+      Array<{
+        id: string
+        denomination_id: string
+        settlement_asset_id: string
+        status: string
+      }>
+    >`
+      SELECT id, denomination_id, settlement_asset_id, status
+        FROM economic_mappings
+       WHERE id = ${input.economicMappingId}
+       FOR SHARE
+    `,
+  ])
+  const route = routeRows[0]
+  const asset = assetRows[0]
+  const mapping = mappingRows[0]
+  if (
+    route === undefined ||
+    route.status !== 'ACTIVE' ||
+    route.rail !== input.route.rail ||
+    route.rail_version !== input.route.railVersion ||
+    route.network !== input.route.network ||
+    route.settlement_asset_id !== input.route.settlementAssetId ||
+    route.economic_mapping_id !== input.route.economicMappingId ||
+    route.priority !== input.route.priority ||
+    route.config_version !== input.route.configVersion
+  ) {
+    throw new ConflictError('Settlement route changed while creating the payment')
+  }
+  if (
+    asset === undefined ||
+    asset.status !== 'ACTIVE' ||
+    asset.rail !== input.route.rail ||
+    asset.network !== input.route.network ||
+    asset.id !== input.settlementAssetId
+  ) {
+    throw new ConflictError('Settlement asset changed while creating the payment')
+  }
+  if (
+    mapping === undefined ||
+    mapping.status !== 'ACTIVE' ||
+    mapping.denomination_id !== input.denominationId ||
+    mapping.settlement_asset_id !== input.settlementAssetId
+  ) {
+    throw new ConflictError('Economic mapping changed while creating the payment')
+  }
 }
 
 function parsePolicyDecision(value: string): PaymentPolicyDecision {
