@@ -276,6 +276,69 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('keeps the credential and idempotency resource after recovery TTL expiry', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const delegatedCredentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const recoveryIdempotencyKey = `CREDENTIAL_CREATE:${accountId}:expired`
+      const requestHash = 'd'.repeat(64)
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'expired-recovery-integration-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.v2Admin.createCredential({
+          accountId,
+          idempotencyKey: 'expired-credential-key',
+          requestHash,
+          fingerprint: requestHash,
+          credentialId: delegatedCredentialId,
+          keyHash: `${accountId}_delegated_hash`,
+          keyPrefix: 'apa_expired',
+          scopes: ['payments:read'],
+          recoveryCiphertext: 'expired-recovery-ciphertext',
+          recoveryNonce: 'bm9uY2U=',
+          recoveryAuthTag: 'dGFn',
+          recoveryIdempotencyKey,
+          recoveryExpiresAt: new Date('2026-09-19T00:00:00.000Z'),
+          actorId: 'platform-operator:integration',
+        })
+
+        await expect(
+          database.v2Admin.consumeRecoveryEnvelope(
+            accountId,
+            recoveryIdempotencyKey,
+            new Date('2026-09-20T00:00:00.000Z'),
+          ),
+        ).resolves.toBeNull()
+        await expect(
+          database.v2Admin.findCredentialIdempotency({
+            accountId,
+            idempotencyKey: 'expired-credential-key',
+          }),
+        ).resolves.toMatchObject({
+          credential: { id: delegatedCredentialId, status: 'ACTIVE' },
+        })
+        await expect(
+          database.findAccountByCredentialHash(`${accountId}_delegated_hash`),
+        ).resolves.toMatchObject({
+          account: { id: accountId, status: 'ACTIVE' },
+          credential: { id: delegatedCredentialId, status: 'ACTIVE' },
+        })
+      } finally {
+        await database.disconnect()
+      }
+    })
+
     it('records append-only timeline events without storing recovery ciphertext', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const sql = new Client({ connectionString: databaseUrl as string })
