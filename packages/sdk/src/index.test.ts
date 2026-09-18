@@ -206,9 +206,20 @@ const v2Receive = {
   },
 }
 
-async function createLocalV2Api() {
+const v2Balance = {
+  account_id: 'acct_test',
+  denomination_id: 'usd',
+  settled: '10.00',
+  reserved: '1.20',
+  spendable: '8.80',
+  observed_at: '2026-09-06T00:00:00.000Z',
+  degraded: false,
+}
+
+async function createLocalV2Api(balance = v2Balance) {
   const app = Fastify()
   app.get('/v2/accounts/:accountId', async () => v2Account)
+  app.get('/v2/balance', async () => balance)
   app.post('/v2/recipients', async () => v2Recipient)
   app.get('/v2/recipients', async () => ({
     recipients: [v2Recipient],
@@ -244,6 +255,11 @@ describe('AgentPaymentAccount SDK', () => {
         id: 'acct_test',
         name: 'Test account',
         rowVersion: 1,
+      })
+      await expect(account.getBalanceV2('usd')).resolves.toMatchObject({
+        accountId: 'acct_test',
+        settled: '10.00',
+        spendable: '8.80',
       })
       await expect(
         account.createRecipientV2({
@@ -285,6 +301,23 @@ describe('AgentPaymentAccount SDK', () => {
       await expect(account.cancelReceiveV2('recv_v2_test')).resolves.toMatchObject({
         status: 'CANCELLED',
       })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('rejects V2 balance responses outside the canonical exact-money contract', async () => {
+    const app = await createLocalV2Api({ ...v2Balance, settled: '1e-2' })
+    const account = new AgentPaymentAccount({
+      baseUrl: 'http://localhost:3000/',
+      apiKey: 'agent-secret',
+      fetch: fastifyFetch.bind(undefined, app),
+    })
+
+    try {
+      await expect(account.getBalanceV2('usd')).rejects.toThrow(
+        'API returned an invalid V2 balance response',
+      )
     } finally {
       await app.close()
     }

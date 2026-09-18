@@ -169,7 +169,11 @@ export class V2ReceiveService {
       input.amount === undefined
         ? undefined
         : parseExactMoney(input.amount, denomination)
-    const reference = input.reference?.trim() || createReceiveId()
+    const requestedReference = input.reference?.trim()
+    if (input.reference !== undefined && requestedReference?.length === 0) {
+      throw new ValidationError('Receive reference must not be blank')
+    }
+    const reference = requestedReference ?? createReceiveId()
     if (Buffer.byteLength(reference, 'utf8') > MAX_REFERENCE_BYTES) {
       throw new ValidationError(
         `Receive reference must contain at most ${MAX_REFERENCE_BYTES} UTF-8 bytes`,
@@ -201,10 +205,10 @@ export class V2ReceiveService {
             ...requestInput,
             idempotencyKey,
             requestHash: hashJson({
-              denomination_id: input.denominationId,
-              amount: input.amount ?? null,
-              reference,
-              expires_at: input.expiresAt ?? null,
+              denomination_id: denomination.id,
+              amount: amount?.amount ?? null,
+              reference: requestedReference ?? null,
+              expires_at: expiresAt?.toISOString() ?? null,
             }),
           })
     return serializeV2ReceiveRequest(

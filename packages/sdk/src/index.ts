@@ -7,6 +7,7 @@ import {
   transactionResponseSchema,
   v2ErrorEnvelopeSchema,
   v2AccountResponseSchema,
+  v2BalanceResponseSchema,
   v2FundingDestinationResponseSchema,
   v2HistoryResponseSchema,
   v2PaymentCreateRequestSchema,
@@ -26,6 +27,7 @@ import {
   type V2PaymentListResponse,
   type V2PaymentResponse,
   type V2AccountResponse,
+  type V2BalanceResponse,
   type V2FundingDestinationResponse,
   type V2HistoryResponse,
   type V2RecipientResponse,
@@ -705,36 +707,9 @@ function parseV2Account(value: unknown): V2Account {
 }
 
 function parseV2Balance(value: unknown): V2Balance {
-  const response = parseContract<{
-    account_id: string
-    denomination_id: string
-    settled: string
-    reserved: string
-    spendable: string
-    observed_at: string
-    degraded: boolean
-  }>(
+  const response = parseContract<V2BalanceResponse>(
     value,
-    {
-      safeParse(input: unknown) {
-        if (!isRecord(input)) return { success: false as const }
-        const fields = [
-          'account_id',
-          'denomination_id',
-          'settled',
-          'reserved',
-          'spendable',
-          'observed_at',
-        ]
-        if (
-          fields.some((field) => typeof input[field] !== 'string') ||
-          typeof input.degraded !== 'boolean'
-        ) {
-          return { success: false as const }
-        }
-        return { success: true as const, data: input as never }
-      },
-    },
+    v2BalanceResponseSchema,
     'API returned an invalid V2 balance response',
   )
   return {
