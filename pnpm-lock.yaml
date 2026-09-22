@@ -161,6 +161,37 @@ importers:
 
   tests/e2e: {}
 
+  tests/fake-x402:
+    dependencies:
+      '@solana-program/token':
+        specifier: 0.16.1
+        version: 0.16.1(@solana/kit@8.2.0(typescript@5.9.3))
+      '@solana/keys':
+        specifier: 8.2.0
+        version: 8.2.0(typescript@5.9.3)
+      '@solana/kit':
+        specifier: 8.2.0
+        version: 8.2.0(typescript@5.9.3)
+      '@x402/core':
+        specifier: 2.26.0
+        version: 2.26.0
+      fastify:
+        specifier: 5.12.3
+        version: 5.12.3
+    devDependencies:
+      '@types/node':
+        specifier: 26.4.1
+        version: 26.4.1
+      tsx:
+        specifier: 4.23.13
+        version: 4.23.13
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: 5.0.0
+        version: 5.0.0(@types/node@26.4.1)(vite@8.2.2(@types/node@26.4.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
+
 packages:
 
   '@cacheable/memory@2.2.0':

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { encodePaymentRequiredHeader } from '@x402/core/http'
-import type { PaymentRequired } from '@x402/core/types'
+import type { Network, PaymentRequired } from '@x402/core/types'
 import type {
   AuthenticatedAccount,
   V2DatabaseRepository,
@@ -11,26 +11,35 @@ import { X402PaymentService } from './x402-service.js'
 import {
   X402_PROTOCOL,
   X402_RESOURCE_URL,
+  X402_SOLANA_DEVNET_NETWORK,
   X402_SOLANA_MAINNET_NETWORK,
 } from './x402-protocol.js'
 
 const asset = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+const testMint = 'So11111111111111111111111111111111111111112'
 const payTo = 'Gzehfseq1k9AcHFSoV7qHmDGQx92nLMw78XXdqVWQQWa'
 const feePayer = 'Hc3sdEAsCGQcpgfivywog9uwtk8gUBUZgsxdME1EJy88'
 
-function paymentRequired(): PaymentRequired {
+function paymentRequired(
+  input: {
+    readonly network?: Network
+    readonly asset?: string
+    readonly payTo?: string
+    readonly feePayer?: string
+  } = {},
+): PaymentRequired {
   return {
     x402Version: 2,
     resource: { url: X402_RESOURCE_URL },
     accepts: [
       {
         scheme: 'exact',
-        network: X402_SOLANA_MAINNET_NETWORK,
+        network: input.network ?? X402_SOLANA_MAINNET_NETWORK,
         amount: '1000',
-        asset,
-        payTo,
+        asset: input.asset ?? asset,
+        payTo: input.payTo ?? payTo,
         maxTimeoutSeconds: 300,
-        extra: { feePayer },
+        extra: { feePayer: input.feePayer ?? feePayer },
       },
     ],
   }
@@ -104,12 +113,31 @@ function view(metadataJson: string): V2PaymentView {
   }
 }
 
-function harness() {
+function harness(
+  input: {
+    readonly network?: Network
+    readonly routeNetwork?: string
+    readonly settlementMint?: string
+    readonly providerDestination?: string
+  } = {},
+) {
+  const network = input.network ?? X402_SOLANA_MAINNET_NETWORK
+  const routeNetwork = input.routeNetwork ?? 'mainnet-beta'
+  const settlementMint = input.settlementMint ?? asset
+  const providerDestination = input.providerDestination ?? payTo
   const fetchImpl = vi.fn(
     async () =>
       new Response(null, {
         status: 402,
-        headers: { 'PAYMENT-REQUIRED': encodePaymentRequiredHeader(paymentRequired()) },
+        headers: {
+          'PAYMENT-REQUIRED': encodePaymentRequiredHeader(
+            paymentRequired({
+              network,
+              asset: settlementMint,
+              payTo: providerDestination,
+            }),
+          ),
+        },
       }),
   )
   const created = view(
@@ -141,7 +169,7 @@ function harness() {
         id: 'route_mainnet',
         rail: 'SOLANA_SPL',
         railVersion: 'v2',
-        network: 'mainnet-beta',
+        network: routeNetwork,
         settlementAssetId: 'asset_usdc',
         economicMappingId: 'mapping_usdc',
         status: 'ACTIVE' as const,
@@ -152,8 +180,8 @@ function harness() {
     findSettlementAsset: vi.fn(async () => ({
       id: 'asset_usdc',
       rail: 'SOLANA_SPL',
-      network: 'mainnet-beta',
-      assetReference: asset,
+      network: routeNetwork,
+      assetReference: settlementMint,
       decimals: 6,
       status: 'ACTIVE' as const,
       version: 1,
@@ -176,7 +204,10 @@ function harness() {
       paymentService,
       repository,
       resourceUrl: X402_RESOURCE_URL,
-      settlementMint: asset,
+      settlementMint,
+      network,
+      routeNetwork,
+      providerDestination,
       maxPaymentAtomic: 100_000n,
       fetchImpl,
     }),
@@ -234,5 +265,32 @@ describe('x402 payment service', () => {
     expect(replay.created).toBe(false)
     expect(harnessValue.fetchImpl).toHaveBeenCalledTimes(1)
     expect(harnessValue.paymentService.createPayment).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses an explicit devnet network, test mint, route and provider destination', async () => {
+    const harnessValue = harness({
+      network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      settlementMint: testMint,
+      providerDestination: payTo,
+    })
+    await harnessValue.service.createPayment(
+      account(),
+      { denominationId: 'denom_usdc' },
+      'x402-devnet-key-1',
+      'req-devnet-1',
+    )
+    expect(harnessValue.paymentService.createPayment).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        amount: '0.001',
+        target: expect.objectContaining({
+          destination: expect.objectContaining({ walletAddress: payTo }),
+        }),
+      }),
+      'x402-devnet-key-1',
+      'req-devnet-1',
+      undefined,
+    )
   })
 })

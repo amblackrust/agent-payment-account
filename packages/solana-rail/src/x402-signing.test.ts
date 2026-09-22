@@ -118,6 +118,28 @@ describe('Solana x402 signing boundary', () => {
     expect(signatures[payer.address]).not.toBeNull()
     expect(signatures[feePayer.address]).toBeNull()
     expect(signed.externalId).toBe(`x402-effect:${payloadHash}`)
+
+    const feePayerSecret = await exportSecret(feePayer)
+    const fullySigned = await signSolanaX402PreparedEffect({
+      request: {
+        effectHash: 'a'.repeat(64),
+        keyVersion: 1,
+        network: 'mainnet-beta',
+        assetReference: mint,
+        destination: feePayer.address,
+        amountAtomic: 1000n,
+        feePayerIdentity: feePayer.address,
+        preparedPayload: JSON.stringify(prepared),
+      },
+      payerSecret,
+      feePayerSecret,
+    })
+    const fullySignedSignatures = getTransactionDecoder().decode(
+      fullySigned.signedPayload,
+    ).signatures as unknown as Record<string, unknown>
+    expect(fullySignedSignatures[payer.address]).not.toBeNull()
+    expect(fullySignedSignatures[feePayer.address]).not.toBeNull()
+    feePayerSecret.fill(0)
     payerSecret.fill(0)
   })
 

@@ -5,10 +5,18 @@ import {
   decodePaymentResponseHeader,
   encodePaymentSignatureHeader,
 } from '@x402/core/http'
-import type { PaymentPayload, PaymentRequired, SettleResponse } from '@x402/core/types'
+import type {
+  Network,
+  PaymentPayload,
+  PaymentRequired,
+  SettleResponse,
+} from '@x402/core/types'
 import { ValidationError } from '@agent-payment/core'
 
 export const X402_SOLANA_MAINNET_NETWORK = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'
+export const X402_SOLANA_DEVNET_NETWORK = 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1'
+export const X402_SOLANA_MAINNET_CLUSTER = 'mainnet-beta'
+export const X402_SOLANA_DEVNET_CLUSTER = 'devnet'
 export const X402_SOLANA_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 export const X402_ABSOLUTE_MAX_PAYMENT_ATOMIC = 100_000n
 export const X402_PROTOCOL = 'x402-v2'
@@ -18,9 +26,36 @@ export const X402_PAYMENT_RESPONSE_HEADER = 'PAYMENT-RESPONSE'
 export const X402_RESOURCE_URL = 'https://x402engine.app/api/crypto/price?ids=bitcoin'
 const MAX_PROTOCOL_METADATA_BYTES = 16 * 1024
 
+export interface X402SolanaAdapterConfig {
+  readonly network: Network
+  readonly routeNetwork: string
+  readonly settlementMint: string
+  readonly providerDestination?: string
+}
+
+export interface X402SolanaAdapterConfigInput {
+  readonly network?: string
+  readonly routeNetwork?: string
+  readonly settlementMint?: string
+  readonly providerDestination?: string
+}
+
+/**
+ * Maps the rail's explicit Solana cluster to the x402 v2 CAIP-2 network.
+ * Localnet and testnet intentionally return undefined because this adapter has
+ * no implicit x402 provider contract for those environments.
+ */
+export function x402NetworkForSolanaCluster(
+  cluster: string,
+): typeof X402_SOLANA_MAINNET_NETWORK | typeof X402_SOLANA_DEVNET_NETWORK | undefined {
+  if (cluster === X402_SOLANA_MAINNET_CLUSTER) return X402_SOLANA_MAINNET_NETWORK
+  if (cluster === X402_SOLANA_DEVNET_CLUSTER) return X402_SOLANA_DEVNET_NETWORK
+  return undefined
+}
+
 export interface X402SelectedRequirement {
   readonly scheme: 'exact'
-  readonly network: typeof X402_SOLANA_MAINNET_NETWORK
+  readonly network: Network
   readonly amount: string
   readonly asset: string
   readonly payTo: string
@@ -47,10 +82,92 @@ export class X402ProtocolError extends ValidationError {
   }
 }
 
+export function resolveX402SolanaAdapterConfig(
+  input: X402SolanaAdapterConfigInput = {},
+): X402SolanaAdapterConfig {
+  const network = input.network ?? X402_SOLANA_MAINNET_NETWORK
+  if (!isX402SolanaNetwork(network)) {
+    throw new X402ProtocolError('x402 Solana network must be a concrete CAIP-2 network')
+  }
+
+  const settlementMint =
+    input.settlementMint ??
+    (network === X402_SOLANA_MAINNET_NETWORK ? X402_SOLANA_USDC_MINT : undefined)
+  if (settlementMint === undefined || !isSolanaAddress(settlementMint)) {
+    throw new X402ProtocolError('x402 settlement mint must be a valid Solana address')
+  }
+  if (
+    network === X402_SOLANA_DEVNET_NETWORK &&
+    settlementMint === X402_SOLANA_USDC_MINT
+  ) {
+    throw new X402ProtocolError(
+      'x402 Solana devnet requires an explicit non-mainnet test settlement mint',
+    )
+  }
+
+  const routeNetwork = input.routeNetwork ?? inferRouteNetwork(network) ?? undefined
+  if (routeNetwork === undefined || routeNetwork.length === 0) {
+    throw new X402ProtocolError(
+      'x402 route network is required for an unrecognized Solana network',
+    )
+  }
+
+  if (
+    input.providerDestination !== undefined &&
+    !isSolanaAddress(input.providerDestination)
+  ) {
+    throw new X402ProtocolError(
+      'x402 provider destination must be a valid Solana address',
+    )
+  }
+
+  return {
+    network,
+    routeNetwork,
+    settlementMint,
+    ...(input.providerDestination === undefined
+      ? {}
+      : { providerDestination: input.providerDestination }),
+  }
+}
+
+export function assertCompatibleX402SolanaAdapterConfig(
+  config: X402SolanaAdapterConfig,
+): void {
+  if (
+    config.network === X402_SOLANA_MAINNET_NETWORK &&
+    (config.routeNetwork !== X402_SOLANA_MAINNET_CLUSTER ||
+      config.settlementMint !== X402_SOLANA_USDC_MINT)
+  ) {
+    throw new X402ProtocolError(
+      'x402 mainnet requires the canonical Solana mainnet USDC configuration',
+    )
+  }
+  if (
+    config.routeNetwork === X402_SOLANA_MAINNET_CLUSTER &&
+    config.network !== X402_SOLANA_MAINNET_NETWORK
+  ) {
+    throw new X402ProtocolError(
+      'x402 mainnet route requires the canonical Solana mainnet network',
+    )
+  }
+  if (
+    config.network === X402_SOLANA_DEVNET_NETWORK &&
+    (config.routeNetwork !== X402_SOLANA_DEVNET_CLUSTER ||
+      config.settlementMint === X402_SOLANA_USDC_MINT)
+  ) {
+    throw new X402ProtocolError(
+      'x402 Solana devnet requires the devnet settlement route and a non-mainnet test mint',
+    )
+  }
+}
+
 export function parsePaymentRequiredResponse(
   response: Response,
   resourceUrl: string,
   expectedAsset: string,
+  expectedNetwork: string = X402_SOLANA_MAINNET_NETWORK,
+  expectedPayTo?: string,
 ): X402PaymentRequiredSnapshot {
   if (response.status !== 402) {
     throw new X402ProtocolError(
@@ -75,11 +192,18 @@ export function parsePaymentRequiredResponse(
       'x402 resource URL differs from the configured proof target',
     )
   }
+  if (!isX402SolanaNetwork(expectedNetwork) || !isSolanaAddress(expectedAsset)) {
+    throw new X402ProtocolError('x402 expected Solana network or asset is invalid')
+  }
+  if (expectedPayTo !== undefined && !isSolanaAddress(expectedPayTo)) {
+    throw new X402ProtocolError('x402 expected provider destination is invalid')
+  }
   const compatible = paymentRequired.accepts.filter(
     (candidate): candidate is X402SelectedRequirement =>
       candidate.scheme === 'exact' &&
-      candidate.network === X402_SOLANA_MAINNET_NETWORK &&
+      candidate.network === expectedNetwork &&
       candidate.asset === expectedAsset &&
+      (expectedPayTo === undefined || candidate.payTo === expectedPayTo) &&
       isPositiveAtomicAmount(candidate.amount) &&
       isSolanaAddress(candidate.payTo) &&
       typeof candidate.maxTimeoutSeconds === 'number' &&
@@ -89,9 +213,14 @@ export function parsePaymentRequiredResponse(
       isSolanaAddress(candidate.extra?.feePayer),
   )
   if (compatible.length !== 1) {
+    const requirementLabel =
+      expectedNetwork === X402_SOLANA_MAINNET_NETWORK &&
+      expectedAsset === X402_SOLANA_USDC_MINT
+        ? 'Solana mainnet USDC'
+        : 'the configured Solana network and settlement asset'
     throw new X402ProtocolError(
       compatible.length === 0
-        ? 'x402 provider has no compatible Solana mainnet USDC requirement'
+        ? `x402 provider has no compatible ${requirementLabel} requirement`
         : 'x402 provider returned multiple compatible payment requirements',
     )
   }
@@ -221,6 +350,20 @@ export function parseX402Metadata(value: string | null | undefined): {
 
 function isPositiveAtomicAmount(value: unknown): value is string {
   return typeof value === 'string' && /^[1-9]\d*$/u.test(value)
+}
+
+function isX402SolanaNetwork(value: unknown): value is Network {
+  return typeof value === 'string' && /^solana:[1-9A-HJ-NP-Za-km-z]+$/u.test(value)
+}
+
+function inferRouteNetwork(network: string): string | undefined {
+  if (network === X402_SOLANA_MAINNET_NETWORK) {
+    return X402_SOLANA_MAINNET_CLUSTER
+  }
+  if (network === X402_SOLANA_DEVNET_NETWORK) {
+    return X402_SOLANA_DEVNET_CLUSTER
+  }
+  return undefined
 }
 
 function isSolanaAddress(value: unknown): value is string {

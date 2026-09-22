@@ -27,7 +27,7 @@ import { V2OutgoingWorker } from './outgoing-v2.js'
 import type { MetricsRegistry } from './observability.js'
 import type { V2OutgoingExecutor } from './outgoing-v2.js'
 import { createX402OutgoingExecutor } from './x402-executor.js'
-import { isX402PaymentMetadata } from './x402-protocol.js'
+import { isX402PaymentMetadata, x402NetworkForSolanaCluster } from './x402-protocol.js'
 
 const SPONSORSHIP_MAX_LAMPORTS_PER_DAY = 10_000_000n
 const SPONSORSHIP_MAX_TRANSACTIONS_PER_HOUR = 60
@@ -86,6 +86,14 @@ export function createV2OutgoingWorker(input: {
                 preparedPayload !== undefined &&
                 isX402PreparedPayload(preparedPayload)
               ) {
+                if (
+                  input.config.x402SignFeePayer === true &&
+                  feePayerSecret === undefined
+                ) {
+                  throw new DependencyUnavailableError(
+                    'Platform fee-payer custody is unavailable for devnet x402 execution',
+                  )
+                }
                 return await signSolanaX402PreparedEffect({
                   request: {
                     effectHash: request.effectHash,
@@ -98,6 +106,9 @@ export function createV2OutgoingWorker(input: {
                     preparedPayload,
                   },
                   payerSecret,
+                  ...(input.config.x402SignFeePayer === true
+                    ? { feePayerSecret: feePayerSecret! }
+                    : {}),
                 })
               }
               if (feePayerSecret === undefined) {
@@ -118,6 +129,7 @@ export function createV2OutgoingWorker(input: {
         input.config.nodeEnv,
       )
   const rpc = createSolanaRpc(input.config.solanaRpcUrl as ClusterUrl)
+  const x402Network = x402NetworkForSolanaCluster(input.config.solanaCluster)
   const standardExecutor = createSolanaV2OutgoingExecutor({
     rpc,
     settlementMint: input.config.solanaSettlementMint,
@@ -153,6 +165,16 @@ export function createV2OutgoingWorker(input: {
     rpc,
     rpcUrl: input.config.solanaRpcUrl,
     settlementMint: input.config.solanaSettlementMint,
+    ...(x402Network === undefined
+      ? {}
+      : {
+          network: x402Network,
+          routeNetwork: input.config.solanaCluster,
+        }),
+    signFeePayer: input.config.x402SignFeePayer === true,
+    ...(input.config.solanaFeePayerIdentity === undefined
+      ? {}
+      : { platformFeePayerIdentity: input.config.solanaFeePayerIdentity }),
     resourceUrl: input.config.x402ResourceUrl ?? DEFAULT_X402_RESOURCE_URL,
     httpTimeoutMs: input.config.x402HttpTimeoutMs ?? DEFAULT_X402_HTTP_TIMEOUT_MS,
     maxPaymentAtomic:
@@ -198,7 +220,7 @@ export function createV2OutgoingWorker(input: {
         : standardExecutor.reconcile(input),
     checkReadiness: async () => {
       await standardExecutor.checkReadiness()
-      await x402Executor.checkReadiness()
+      if (x402Network !== undefined) await x402Executor.checkReadiness()
     },
   }
   const findAccountSummary = input.database.findAccountSummary

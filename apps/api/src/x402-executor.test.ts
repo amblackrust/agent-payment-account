@@ -6,6 +6,7 @@ import {
   createTransactionMessage,
   generateKeyPairSigner,
   getBase64EncodedWireTransaction,
+  getSignatureFromTransaction,
   getTransactionDecoder,
   pipe,
   setTransactionMessageFeePayerSigner,
@@ -17,7 +18,7 @@ import {
   TOKEN_PROGRAM_ADDRESS,
 } from '@solana-program/token'
 import { encodePaymentResponseHeader } from '@x402/core/http'
-import type { SettleResponse } from '@x402/core/types'
+import type { Network, SettleResponse } from '@x402/core/types'
 import { describe, expect, it, vi } from 'vitest'
 import type { SolanaRpc } from '@agent-payment/solana-rail'
 import {
@@ -28,13 +29,17 @@ import type { V2PaymentAttemptSnapshot } from '@agent-payment/db'
 import type { V2PreparedEffect } from './outgoing-v2.js'
 import { createX402OutgoingExecutor } from './x402-executor.js'
 import {
+  hashRequirement,
   X402_PAYMENT_RESPONSE_HEADER,
   X402_PROTOCOL,
+  X402_SOLANA_DEVNET_NETWORK,
   X402_SOLANA_MAINNET_NETWORK,
+  X402_SOLANA_USDC_MINT,
 } from './x402-protocol.js'
 
 const resourceUrl = 'https://x402engine.app/api/crypto/price?ids=bitcoin'
-const mint = 'So11111111111111111111111111111111111111112'
+const mint = X402_SOLANA_USDC_MINT
+const testMint = 'So11111111111111111111111111111111111111112'
 const blockhash = '11111111111111111111111111111111'
 const settlementTransaction = '1'.repeat(64)
 
@@ -82,7 +87,55 @@ describe('x402 outgoing executor', () => {
     expect(result.status).toBe('CONFIRMED')
     expect(result.externalId).toBe(settlement.transaction)
     expect(result.evidenceMetadataJson).toContain('provider-request-1')
+    expect(result.evidenceMetadataJson).toContain('100000')
     expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('accepts an explicit devnet network, test mint and provider fee payer', async () => {
+    const fixture = await createFixture({
+      x402Network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      mint: testMint,
+    })
+    const settlement: SettleResponse = {
+      success: true,
+      transaction: settlementTransaction,
+      network: X402_SOLANA_DEVNET_NETWORK,
+      payer: fixture.payer.address,
+    }
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ bitcoin: { usd: 60_000 } }), {
+          status: 200,
+          headers: {
+            [X402_PAYMENT_RESPONSE_HEADER]: encodePaymentResponseHeader(settlement),
+          },
+        }),
+    )
+    const executor = createX402OutgoingExecutor({
+      rpc: fixture.rpc,
+      rpcUrl: 'https://rpc.example.test',
+      network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      settlementMint: testMint,
+      providerDestination: fixture.recipient.address,
+      resourceUrl,
+      maxPaymentAtomic: 100_000n,
+      fetchImpl,
+      getPayerPublicKey: async () => fixture.payer.address,
+      getDenomination: async () => null,
+      getSettlementAsset: async () => null,
+      getEconomicMapping: async () => null,
+      getSettlementRoute: async () => null,
+      getActiveKeyVersion: async () => null,
+      signPaymentEffect: async () => fixture.signed,
+    })
+    const result = await executor.submit({
+      prepared: fixture.prepared,
+      signed: fixture.signed,
+    })
+    expect(result.status).toBe('CONFIRMED')
+    expect(result.externalId).toBe(settlementTransaction)
   })
 
   it('replays the same signed payload during reconciliation and never rebuilds a transaction', async () => {
@@ -181,13 +234,87 @@ describe('x402 outgoing executor', () => {
     expect(result.status).toBe('UNKNOWN')
     expect(result.externalId).toBeUndefined()
   })
+
+  it('recovers a confirmed devnet effect from the durable fully signed payload', async () => {
+    const fixture = await createFixture({
+      x402Network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      mint: testMint,
+    })
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('fake provider is unavailable after settlement')
+    })
+    const executor = createX402OutgoingExecutor({
+      rpc: fixture.rpc,
+      rpcUrl: 'https://rpc.example.test',
+      network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      settlementMint: testMint,
+      providerDestination: fixture.recipient.address,
+      signFeePayer: true,
+      platformFeePayerIdentity: fixture.recipient.address,
+      resourceUrl,
+      maxPaymentAtomic: 100_000n,
+      fetchImpl,
+      getPayerPublicKey: async () => fixture.payer.address,
+      getDenomination: async () => null,
+      getSettlementAsset: async () => null,
+      getEconomicMapping: async () => null,
+      getSettlementRoute: async () => null,
+      getActiveKeyVersion: async () => null,
+      signPaymentEffect: async () => fixture.fullySigned,
+    })
+    const attempt: V2PaymentAttemptSnapshot = {
+      id: 'att_recovery',
+      paymentId: 'pay_recovery',
+      attemptNumber: 1,
+      routeId: 'route_1',
+      status: 'RECONCILING',
+      outcome: 'UNKNOWN',
+      preparedEffectHash: fixture.prepared.effectHash,
+      preparedEffectJson: JSON.stringify({
+        ...fixture.prepared,
+        amountAtomic: fixture.prepared.amountAtomic.toString(),
+        validityExpiresAt: fixture.prepared.validityExpiresAt?.toISOString(),
+      }),
+      signedPayloadHash: sha256(fixture.fullySigned.signedPayload),
+      signedPayloadEncrypted: null,
+      expectedExternalId: fixture.fullySigned.externalId,
+      validityExpiresAt: fixture.prepared.validityExpiresAt ?? null,
+      validitySlot: null,
+      rowVersion: 1,
+    }
+    const result = await executor.reconcile!({
+      view: {} as Parameters<NonNullable<typeof executor.reconcile>>[0]['view'],
+      attempt,
+      signedPayload: fixture.fullySigned.signedPayload,
+    })
+    const transaction = getTransactionDecoder().decode(
+      fixture.fullySigned.signedPayload,
+    )
+    expect(result.status).toBe('CONFIRMED')
+    expect(result.externalId).toBe(String(getSignatureFromTransaction(transaction)))
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
 })
 
-async function createFixture(): Promise<{
+async function createFixture(
+  input: {
+    readonly x402Network: Network
+    readonly routeNetwork: string
+    readonly mint: string
+  } = {
+    x402Network: X402_SOLANA_MAINNET_NETWORK,
+    routeNetwork: 'mainnet-beta',
+    mint,
+  },
+): Promise<{
   readonly payer: Awaited<ReturnType<typeof generateKeyPairSigner>>
+  readonly recipient: Awaited<ReturnType<typeof generateKeyPairSigner>>
   readonly rpc: SolanaRpc
   readonly prepared: V2PreparedEffect
   readonly signed: Awaited<ReturnType<typeof signSolanaX402PreparedEffect>>
+  readonly fullySigned: Awaited<ReturnType<typeof signSolanaX402PreparedEffect>>
 }> {
   const payer = await generateKeyPairSigner(true)
   const feePayer = await generateKeyPairSigner(true)
@@ -195,12 +322,12 @@ async function createFixture(): Promise<{
     findAssociatedTokenPda({
       owner: payer.address,
       tokenProgram: TOKEN_PROGRAM_ADDRESS,
-      mint: mint as never,
+      mint: input.mint as never,
     }),
     findAssociatedTokenPda({
       owner: feePayer.address,
       tokenProgram: TOKEN_PROGRAM_ADDRESS,
-      mint: mint as never,
+      mint: input.mint as never,
     }),
   ])
   const message = pipe(
@@ -217,7 +344,7 @@ async function createFixture(): Promise<{
         [
           getTransferCheckedInstruction({
             source: payerAta[0],
-            mint: mint as never,
+            mint: input.mint as never,
             destination: recipientAta[0],
             authority: createNoopSigner(payer.address),
             amount: 1000n,
@@ -229,6 +356,15 @@ async function createFixture(): Promise<{
   )
   const transactionBase64 = getBase64EncodedWireTransaction(compileTransaction(message))
   const payloadHash = hashMessage(transactionBase64)
+  const requirementHash = hashRequirement({
+    scheme: 'exact',
+    network: input.x402Network,
+    amount: '1000',
+    asset: input.mint,
+    payTo: feePayer.address,
+    maxTimeoutSeconds: 300,
+    extra: { feePayer: feePayer.address },
+  })
   const preparedPayload: SolanaX402PreparedPayload = {
     version: 1,
     protocol: X402_PROTOCOL,
@@ -236,20 +372,20 @@ async function createFixture(): Promise<{
     recipientOwner: feePayer.address,
     payerAta: payerAta[0],
     recipientAta: recipientAta[0],
-    settlementMint: mint,
+    settlementMint: input.mint,
     tokenAmount: '1000',
     feePayerIdentity: feePayer.address,
     transactionBase64,
     payloadHash,
-    requirementHash: 'd'.repeat(64),
+    requirementHash,
     paymentPayloadJson: JSON.stringify({
       x402Version: 2,
       resource: { url: resourceUrl },
       accepted: {
         scheme: 'exact',
-        network: X402_SOLANA_MAINNET_NETWORK,
+        network: input.x402Network,
         amount: '1000',
-        asset: mint,
+        asset: input.mint,
         payTo: feePayer.address,
         maxTimeoutSeconds: 300,
         extra: { feePayer: feePayer.address },
@@ -262,8 +398,8 @@ async function createFixture(): Promise<{
     request: {
       effectHash: 'a'.repeat(64),
       keyVersion: 1,
-      network: 'mainnet-beta',
-      assetReference: mint,
+      network: input.routeNetwork,
+      assetReference: input.mint,
       destination: feePayer.address,
       amountAtomic: 1000n,
       feePayerIdentity: feePayer.address,
@@ -271,14 +407,30 @@ async function createFixture(): Promise<{
     },
     payerSecret: secret,
   })
+  const feePayerSecret = await exportSecret(feePayer)
+  const fullySigned = await signSolanaX402PreparedEffect({
+    request: {
+      effectHash: 'a'.repeat(64),
+      keyVersion: 1,
+      network: input.routeNetwork,
+      assetReference: input.mint,
+      destination: feePayer.address,
+      amountAtomic: 1000n,
+      feePayerIdentity: feePayer.address,
+      preparedPayload: JSON.stringify(preparedPayload),
+    },
+    payerSecret: secret,
+    feePayerSecret,
+  })
+  feePayerSecret.fill(0)
   secret.fill(0)
   const prepared: V2PreparedEffect = {
     accountId: 'acct_1',
     paymentId: 'pay_1',
     attemptId: 'att_1',
     effectHash: signed.effectHash,
-    network: 'mainnet-beta',
-    assetReference: mint,
+    network: input.routeNetwork,
+    assetReference: input.mint,
     destination: feePayer.address,
     amountAtomic: 1000n,
     feePayerIdentity: feePayer.address,
@@ -290,6 +442,7 @@ async function createFixture(): Promise<{
   }
   return {
     payer,
+    recipient: feePayer,
     rpc: {
       getSignatureStatuses: () => ({
         send: async () => ({
@@ -299,6 +452,7 @@ async function createFixture(): Promise<{
     } as unknown as SolanaRpc,
     prepared,
     signed,
+    fullySigned,
   }
 }
 

@@ -15,15 +15,16 @@ import type {
 } from '@agent-payment/db'
 import type { V2PaymentService } from './payments-v2.js'
 import {
+  assertCompatibleX402SolanaAdapterConfig,
   parsePaymentRequiredResponse,
   parseX402Metadata,
+  resolveX402SolanaAdapterConfig,
   X402_ABSOLUTE_MAX_PAYMENT_ATOMIC,
   X402_PROTOCOL,
-  X402_SOLANA_USDC_MINT,
+  type X402SolanaAdapterConfig,
 } from './x402-protocol.js'
 
 const SOLANA_SPL_RAIL = 'SOLANA_SPL'
-const MAINNET_CLUSTER = 'mainnet-beta'
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000
 
 export interface X402PaymentServiceOptions {
@@ -38,7 +39,10 @@ export interface X402PaymentServiceOptions {
     | 'findEconomicMapping'
   >
   readonly resourceUrl: string
-  readonly settlementMint: string
+  readonly settlementMint?: string
+  readonly network?: string
+  readonly routeNetwork?: string
+  readonly providerDestination?: string
   readonly maxPaymentAtomic: bigint
   readonly httpTimeoutMs?: number
   readonly fetchImpl?: typeof fetch
@@ -51,8 +55,10 @@ export interface X402PaymentRequest {
 export class X402PaymentService {
   private readonly httpTimeoutMs: number
   private readonly fetchImpl: typeof fetch
+  private readonly adapterConfig: X402SolanaAdapterConfig
 
   public constructor(private readonly options: X402PaymentServiceOptions) {
+    this.adapterConfig = resolveX402SolanaAdapterConfig(options)
     this.httpTimeoutMs = options.httpTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS
     if (!Number.isInteger(this.httpTimeoutMs) || this.httpTimeoutMs <= 0) {
       throw new Error('x402 HTTP timeout must be a positive integer')
@@ -73,13 +79,7 @@ export class X402PaymentService {
     requestId: string,
     correlationId?: string,
   ): Promise<{ readonly view: V2PaymentView; readonly created: boolean }> {
-    if (this.options.settlementMint !== X402_SOLANA_USDC_MINT) {
-      throw new ExternalRailError(
-        'x402 settlement mint must be canonical Solana USDC',
-        undefined,
-        'DETERMINISTIC',
-      )
-    }
+    assertCompatibleX402SolanaAdapterConfig(this.adapterConfig)
     const existing = await this.options.repository.findV2Idempotency(
       account.account.id,
       idempotencyKey,
@@ -110,7 +110,9 @@ export class X402PaymentService {
     const snapshot = parsePaymentRequiredResponse(
       discoveryResponse,
       this.options.resourceUrl,
-      this.options.settlementMint,
+      this.adapterConfig.settlementMint,
+      this.adapterConfig.network,
+      this.adapterConfig.providerDestination,
     )
     const tokenAmount = BigInt(snapshot.requirement.amount)
     if (tokenAmount > this.options.maxPaymentAtomic) {
@@ -174,7 +176,7 @@ export class X402PaymentService {
         metadata,
         target: {
           recipientId: null,
-          displayName: 'x402engine Bitcoin price API',
+          displayName: 'x402 paid resource',
           managedAccountId: null,
           destination: {
             id: `x402_destination_${sha256(snapshot.requirement.payTo).slice(0, 32)}`,
@@ -207,7 +209,7 @@ export class X402PaymentService {
           (route) =>
             route.status === 'ACTIVE' &&
             route.rail === SOLANA_SPL_RAIL &&
-            route.network === MAINNET_CLUSTER,
+            route.network === this.adapterConfig.routeNetwork,
         )
         .map(async (route) => {
           const [asset, mapping] = await Promise.all([
@@ -219,8 +221,8 @@ export class X402PaymentService {
             mapping === null ||
             asset.status !== 'ACTIVE' ||
             asset.rail !== SOLANA_SPL_RAIL ||
-            asset.network !== MAINNET_CLUSTER ||
-            asset.assetReference !== this.options.settlementMint ||
+            asset.network !== this.adapterConfig.routeNetwork ||
+            asset.assetReference !== this.adapterConfig.settlementMint ||
             mapping.status !== 'ACTIVE' ||
             mapping.denominationId !== denominationId ||
             mapping.settlementAssetId !== asset.id
@@ -241,7 +243,7 @@ export class X402PaymentService {
       )[0]
     if (route === undefined) {
       throw new DependencyUnavailableError(
-        'No active Solana mainnet USDC route matches the selected denomination',
+        'No active x402 Solana route matches the configured network and settlement asset',
       )
     }
     return route

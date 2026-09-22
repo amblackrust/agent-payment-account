@@ -109,6 +109,32 @@ describe('configuration', () => {
     ).toBe(true)
   })
 
+  it('restricts fee-payer co-signing to explicitly configured non-production devnet', () => {
+    expect(() =>
+      loadConfig({ ...validEnvironment, X402_SIGN_FEE_PAYER: 'true' }),
+    ).toThrow('SOLANA_CLUSTER=devnet')
+
+    const config = loadConfig({
+      ...validEnvironment,
+      SOLANA_CLUSTER: 'devnet',
+      X402_SIGN_FEE_PAYER: 'true',
+    })
+    expect(config.x402SignFeePayer).toBe(true)
+
+    expect(() =>
+      loadConfig({
+        ...validEnvironment,
+        NODE_ENV: 'production',
+        RUNTIME_ROLE: 'api',
+        RUNTIME_AUTHORITY_ID: 'runtime-api-1',
+        SOLANA_FEE_PAYER_SECRET: undefined,
+        X402_SIGN_FEE_PAYER: 'true',
+        CUSTODY_BACKEND_IDENTITY: 'external-custody',
+        CUSTODY_BACKEND_MODE: 'EXTERNAL',
+      }),
+    ).toThrow(/non-production devnet/i)
+  })
+
   it('fails closed for an implicit all-in-one production runtime', () => {
     expect(() =>
       loadConfig({

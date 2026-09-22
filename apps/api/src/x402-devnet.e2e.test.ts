@@ -1,0 +1,755 @@
+import { createHash, randomBytes } from 'node:crypto'
+import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import type { Readable } from 'node:stream'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import path from 'node:path'
+
+import { createDatabaseClient } from '@agent-payment/db'
+import type { SettlementRoute } from '@agent-payment/core'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+const enabled = process.env.DEVNET_X402_E2E === '1'
+const repositoryRoot = path.resolve(
+  fileURLToPath(new URL('../../../', import.meta.url)),
+)
+const databaseUrl =
+  process.env.DEVNET_X402_DATABASE_URL?.trim() || process.env.DATABASE_URL?.trim()
+const apiPort = Number(process.env.DEVNET_X402_API_PORT ?? 3_842)
+const fakePort = Number(process.env.DEVNET_X402_FAKE_PORT ?? 4_542)
+const adminApiKey = `devnet-x402-admin-${randomBytes(16).toString('hex')}`
+const runtimeWalletKey =
+  process.env.DEVNET_X402_WALLET_MASTER_KEY?.trim() || randomBytes(32).toString('hex')
+const recoveryEnvelopeKey =
+  process.env.DEVNET_X402_RECOVERY_ENVELOPE_KEY?.trim() ||
+  randomBytes(32).toString('hex')
+const runId = randomBytes(8).toString('hex')
+const accountName = `devnet-x402-${runId}`
+const accountIdempotencyKey = `devnet-x402-account-${runId}`
+const paymentIdempotencyKey = `devnet-x402-payment-${runId}`
+const resourceUrl = `http://127.0.0.1:${fakePort}/api/crypto/price?ids=bitcoin`
+
+const DENOMINATION_ID = 'devnet_x402_usd'
+const SETTLEMENT_ASSET_ID = 'devnet_x402_test_usdc'
+const ECONOMIC_MAPPING_ID = 'devnet_x402_usd_to_test_usdc'
+const SETTLEMENT_ROUTE_ID = 'devnet_x402_solana_route'
+
+interface HttpResult {
+  readonly status: number
+  readonly body: unknown
+  readonly headers: Headers
+}
+
+interface RunningProcess {
+  readonly child: ChildProcessByStdio<null, Readable, Readable>
+  readonly diagnostics: () => string
+}
+
+interface E2EState {
+  readonly database: ReturnType<typeof createDatabaseClient>
+  readonly apiBaseUrl: string
+  readonly fakeBaseUrl: string
+  readonly adminApiKey: string
+  readonly accountId: string
+  readonly accountOwner: string
+  readonly apiKey: string
+  readonly providerDestination: string
+  readonly settlementMint: string
+  readonly platformFeePayer: string
+  readonly apiProcess: RunningProcess
+  readonly fakeProcess: RunningProcess
+}
+
+interface DevnetX402Tools {
+  readonly DEVNET_X402_RPC_URL: string
+  readonly setupDevnetX402: (options: {
+    readonly homeDirectory: string
+    readonly rpcUrl: string
+    readonly agentAddress?: string
+    readonly tokenTargetAtomic: bigint
+    readonly solTargetLamports: bigint
+  }) => Promise<{
+    readonly platformFeePayer: { readonly address: string }
+    readonly fakeService: { readonly destination: string }
+    readonly settlementAsset: { readonly mint: string }
+    readonly agentAccount?: { readonly tokenAccount?: string }
+  }>
+  readonly resolveDevnetX402Paths: (homeDirectory: string) => {
+    readonly home: string
+    readonly platformFeePayer: string
+  }
+}
+
+let state: E2EState | undefined
+
+describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
+  beforeAll(async () => {
+    if (databaseUrl === undefined || databaseUrl.length === 0) {
+      throw new Error(
+        'DEVNET_X402_E2E=1 requires DEVNET_X402_DATABASE_URL or DATABASE_URL',
+      )
+    }
+    assertPort(apiPort, 'DEVNET_X402_API_PORT')
+    assertPort(fakePort, 'DEVNET_X402_FAKE_PORT')
+    if (apiPort === fakePort) {
+      throw new Error('DEVNET_X402_API_PORT and DEVNET_X402_FAKE_PORT must differ')
+    }
+
+    const devnetTools = (await import(
+      pathToFileURL(path.join(repositoryRoot, 'scripts', 'devnet-x402.mjs')).href
+    )) as unknown as DevnetX402Tools
+    const devnetRpcUrl = devnetTools.DEVNET_X402_RPC_URL
+
+    const setup = await devnetTools.setupDevnetX402({
+      homeDirectory: path.join(repositoryRoot, '.local', 'devnet-x402'),
+      rpcUrl: devnetRpcUrl,
+      tokenTargetAtomic: 10_000_000n,
+      solTargetLamports: 1_000_000_000n,
+    })
+    const paths = devnetTools.resolveDevnetX402Paths(
+      path.join(repositoryRoot, '.local', 'devnet-x402'),
+    )
+    const platformFeePayerSecret = readFileSync(paths.platformFeePayer, 'utf8').trim()
+
+    await seedDevnetFinancialIdentity(databaseUrl, setup.settlementAsset.mint)
+    const database = createDatabaseClient(databaseUrl)
+    let apiProcess: RunningProcess | undefined
+    let fakeProcess: RunningProcess | undefined
+    try {
+      apiProcess = startProcess(
+        ['--filter', '@agent-payment/api', 'exec', 'tsx', 'src/server.ts'],
+        {
+          DATABASE_URL: databaseUrl,
+          PORT: String(apiPort),
+          NODE_ENV: 'test',
+          ADMIN_API_KEY: adminApiKey,
+          SOLANA_RPC_URL: devnetRpcUrl,
+          SOLANA_CLUSTER: 'devnet',
+          SOLANA_SETTLEMENT_MINT: setup.settlementAsset.mint,
+          SOLANA_FEE_PAYER_SECRET: platformFeePayerSecret,
+          SOLANA_FEE_PAYER_IDENTITY: setup.platformFeePayer.address,
+          X402_RESOURCE_URL: resourceUrl,
+          X402_MAX_PAYMENT_ATOMIC: '1000',
+          X402_SIGN_FEE_PAYER: 'true',
+          WALLET_MASTER_KEY: runtimeWalletKey,
+          RECOVERY_ENVELOPE_KEY: recoveryEnvelopeKey,
+          RUNTIME_ROLE: 'all',
+          CUSTODY_BACKEND_IDENTITY: 'devnet-local-test-custody',
+          CUSTODY_BACKEND_MODE: 'LOCAL_TEST',
+          WORKER_INTERVAL_MS: '250',
+          WORKER_LEASE_SECONDS: '30',
+          ALLOW_MAINNET: 'false',
+        },
+      )
+      await waitForHttp(`${apiBaseUrl()}/health/ready`, apiProcess, 60_000)
+
+      const initialProvisioning = await requestJson(`${apiBaseUrl()}/v2/accounts`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-api-key': adminApiKey,
+          'idempotency-key': accountIdempotencyKey,
+        },
+        body: JSON.stringify({ name: accountName }),
+      })
+
+      const requestHash = createHash('sha256')
+        .update(JSON.stringify({ name: accountName }), 'utf8')
+        .digest('hex')
+      const replay = await database.v2Admin.findProvisioningReplay({
+        idempotencyKey: accountIdempotencyKey,
+        requestHash,
+      })
+
+      let accountId: string
+      let accountOwner: string
+      let apiKey: string
+      if (initialProvisioning.status === 201) {
+        throw new Error(
+          'Fresh devnet x402 account unexpectedly provisioned before its token account was created',
+        )
+      }
+      if (replay === null) {
+        throw new Error(
+          `V2 account provisioning did not persist a replay record (HTTP ${initialProvisioning.status})`,
+        )
+      }
+      accountId = replay.accountId
+      const failedAccount = await database.v2Admin.findAccount(accountId)
+      if (failedAccount === null || failedAccount.status !== 'PROVISIONING_FAILED') {
+        throw new Error(
+          'V2 account did not enter PROVISIONING_FAILED before funding setup',
+        )
+      }
+      accountOwner = failedAccount.solanaPublicKey
+
+      const funded = await devnetTools.setupDevnetX402({
+        homeDirectory: path.join(repositoryRoot, '.local', 'devnet-x402'),
+        rpcUrl: devnetRpcUrl,
+        agentAddress: accountOwner,
+        tokenTargetAtomic: 10_000_000n,
+        solTargetLamports: 1_000_000_000n,
+      })
+      if (funded.agentAccount?.tokenAccount === undefined) {
+        throw new Error(
+          'Devnet setup did not produce the MUX Agent Account token account',
+        )
+      }
+
+      const completedProvisioning = await requestJson(`${apiBaseUrl()}/v2/accounts`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-api-key': adminApiKey,
+          'idempotency-key': accountIdempotencyKey,
+        },
+        body: JSON.stringify({ name: accountName }),
+      })
+      expect(completedProvisioning.status).toBe(201)
+      const accountResponse = asRecord(
+        completedProvisioning.body,
+        'completed account response',
+      )
+      apiKey = requireString(accountResponse.api_key, 'agent API key')
+      expect(requireString(accountResponse.id, 'completed account id')).toBe(accountId)
+      expect(requireString(accountResponse.status, 'account status')).toBe('ACTIVE')
+
+      fakeProcess = startProcess(
+        ['--filter', '@agent-payment/fake-x402', 'exec', 'tsx', 'server.ts'],
+        {
+          FAKE_X402_PORT: String(fakePort),
+          FAKE_X402_RPC_URL: devnetRpcUrl,
+          FAKE_X402_TEST_USDC_MINT: funded.settlementAsset.mint,
+          FAKE_X402_DESTINATION: funded.fakeService.destination,
+          FAKE_X402_FEE_PAYER: funded.platformFeePayer.address,
+          FAKE_X402_RESOURCE_URL: resourceUrl,
+        },
+      )
+      await waitForHttp(`${fakeBaseUrl()}/healthz`, fakeProcess, 30_000)
+
+      const recipient = await requestJson(`${apiBaseUrl()}/v2/recipients`, {
+        method: 'POST',
+        headers: agentHeaders(apiKey),
+        body: JSON.stringify({
+          display_name: 'Local fake x402 service',
+          type: 'SOLANA_SPL',
+          destination: {
+            type: 'SOLANA_SPL',
+            wallet_address: funded.fakeService.destination,
+          },
+        }),
+      })
+      expect(recipient.status).toBe(201)
+
+      const fingerprint = sha256(
+        JSON.stringify({
+          rail: 'SOLANA_SPL',
+          network: 'devnet',
+          assetReference: funded.settlementAsset.mint,
+          destination: funded.fakeService.destination,
+        }),
+      )
+      const approvedDestination = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/approved-destinations`,
+        {
+          method: 'POST',
+          headers: adminHeaders(adminApiKey),
+          body: JSON.stringify({
+            fingerprint,
+            rail: 'SOLANA_SPL',
+            network: 'devnet',
+            asset_reference: funded.settlementAsset.mint,
+            destination: funded.fakeService.destination,
+          }),
+        },
+      )
+      expect(approvedDestination.status).toBe(201)
+
+      const policy = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/policy`,
+        {
+          method: 'PUT',
+          headers: adminHeaders(adminApiKey),
+          body: JSON.stringify({
+            denomination_id: DENOMINATION_ID,
+            max_per_payment: '0.01',
+            rolling_budget: '1',
+            rolling_window_seconds: 3_600,
+            transaction_count_cap: 10,
+          }),
+        },
+      )
+      expect(policy.status).toBe(200)
+      expect(
+        requireString(asRecord(policy.body, 'policy').status, 'policy status'),
+      ).toBe('ACTIVE')
+
+      const fundingDestination = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/funding-destination`,
+        { method: 'GET', headers: agentHeaders(apiKey) },
+      )
+      expect(fundingDestination.status).toBe(200)
+      const fundingBody = asRecord(fundingDestination.body, 'funding destination')
+      expect(fundingBody.readiness).toBe('READY')
+      expect(fundingBody.network).toBe('devnet')
+      expect(fundingBody.destination).toBe(funded.agentAccount?.tokenAccount)
+
+      const discovery = await fetch(`${fakeBaseUrl()}/api/crypto/price?ids=bitcoin`)
+      expect(discovery.status).toBe(402)
+      expect(discovery.headers.get('payment-required')).toBeTruthy()
+
+      const paymentRequest = await requestJson(
+        `${apiBaseUrl()}/v2/external-payments/x402`,
+        {
+          method: 'POST',
+          headers: {
+            ...agentHeaders(apiKey),
+            'idempotency-key': paymentIdempotencyKey,
+          },
+          body: JSON.stringify({ denomination_id: DENOMINATION_ID }),
+        },
+      )
+      expect([200, 201]).toContain(paymentRequest.status)
+      const createdPayment = asRecord(paymentRequest.body, 'created payment')
+      const paymentId = requireString(createdPayment.id, 'payment id')
+
+      let confirmedPayment: HttpResult | undefined
+      await waitForCondition(
+        async () => {
+          const result = await requestJson(`${apiBaseUrl()}/v2/payments/${paymentId}`, {
+            method: 'GET',
+            headers: agentHeaders(apiKey),
+          })
+          if (result.status !== 200) return false
+          confirmedPayment = result
+          return asRecord(result.body, 'payment poll').status === 'CONFIRMED'
+        },
+        120_000,
+        'x402 payment confirmation',
+      )
+      const confirmed = asRecord(confirmedPayment?.body, 'confirmed payment')
+      expect(confirmed.status).toBe('CONFIRMED')
+      expect(confirmed.policy_decision).toBe('ALLOW')
+      expect(confirmed.reservation_status).toBe('CONSUMED')
+      expect(confirmed.settlement_state).toBe('CONFIRMED')
+      expect(confirmed.execution_state).toBe('TERMINAL')
+      expect(confirmed.outcome_state).toBe('CONFIRMED')
+      expect(confirmed.route_id).toBe(SETTLEMENT_ROUTE_ID)
+      expect(confirmed.settlement_asset_id).toBe(SETTLEMENT_ASSET_ID)
+
+      const view = await database.v2.findPaymentView(accountId, paymentId)
+      if (view === null) throw new Error('Confirmed payment view is unavailable')
+      expect(view.attempts).toHaveLength(1)
+      const attempt = view.attempts[0]
+      if (
+        attempt === undefined ||
+        attempt.externalId === undefined ||
+        attempt.externalId === null
+      ) {
+        throw new Error('Confirmed payment has no durable external Solana signature')
+      }
+      const transactionSignature = attempt.externalId
+      const signatureStatus = await readRpc(devnetRpcUrl, 'getSignatureStatuses', [
+        [transactionSignature],
+        { searchTransactionHistory: true },
+      ])
+      const signatureResponse = asRecord(signatureStatus, 'signature status response')
+      if (!Array.isArray(signatureResponse.value)) {
+        throw new Error('Solana signature status response value must be an array')
+      }
+      const signatureEntry = asRecord(signatureResponse.value[0], 'signature status')
+      expect(signatureEntry.err).toBeNull()
+      expect(['confirmed', 'finalized']).toContain(signatureEntry.confirmationStatus)
+
+      const history = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/history`,
+        {
+          method: 'GET',
+          headers: agentHeaders(apiKey),
+        },
+      )
+      expect(history.status).toBe(200)
+      const historyItems = asRecord(history.body, 'history').items
+      expect(Array.isArray(historyItems)).toBe(true)
+      expect(
+        (historyItems as unknown[]).some(
+          (item) =>
+            asRecord(item, 'history item').id === paymentId &&
+            asRecord(item, 'history item').status === 'CONFIRMED' &&
+            asRecord(item, 'history item').external_id === transactionSignature,
+        ),
+      ).toBe(true)
+
+      const timeline = await requestJson(`${apiBaseUrl()}/v2/timeline`, {
+        method: 'GET',
+        headers: agentHeaders(apiKey),
+      })
+      expect(timeline.status).toBe(200)
+      const timelineItems = asRecord(timeline.body, 'timeline').items
+      expect(Array.isArray(timelineItems)).toBe(true)
+      expect(
+        (timelineItems as unknown[]).some(
+          (item) =>
+            asRecord(item, 'timeline item').event_type === 'EVIDENCE_RECORDED' &&
+            timelinePaymentId(asRecord(item, 'timeline item').new_state) === paymentId,
+        ),
+      ).toBe(true)
+
+      const duplicate = await requestJson(`${apiBaseUrl()}/v2/external-payments/x402`, {
+        method: 'POST',
+        headers: {
+          ...agentHeaders(apiKey),
+          'idempotency-key': paymentIdempotencyKey,
+        },
+        body: JSON.stringify({ denomination_id: DENOMINATION_ID }),
+      })
+      expect(duplicate.status).toBe(200)
+      expect(
+        requireString(asRecord(duplicate.body, 'duplicate payment').id, 'payment id'),
+      ).toBe(paymentId)
+      const afterDuplicate = await database.v2.findPaymentView(accountId, paymentId)
+      expect(afterDuplicate?.attempts).toHaveLength(1)
+
+      await stopProcess(apiProcess)
+      apiProcess = startProcess(
+        ['--filter', '@agent-payment/api', 'exec', 'tsx', 'src/server.ts'],
+        {
+          DATABASE_URL: databaseUrl,
+          PORT: String(apiPort),
+          NODE_ENV: 'test',
+          ADMIN_API_KEY: adminApiKey,
+          SOLANA_RPC_URL: devnetRpcUrl,
+          SOLANA_CLUSTER: 'devnet',
+          SOLANA_SETTLEMENT_MINT: setup.settlementAsset.mint,
+          SOLANA_FEE_PAYER_SECRET: platformFeePayerSecret,
+          SOLANA_FEE_PAYER_IDENTITY: setup.platformFeePayer.address,
+          X402_RESOURCE_URL: resourceUrl,
+          X402_MAX_PAYMENT_ATOMIC: '1000',
+          X402_SIGN_FEE_PAYER: 'true',
+          WALLET_MASTER_KEY: runtimeWalletKey,
+          RECOVERY_ENVELOPE_KEY: recoveryEnvelopeKey,
+          RUNTIME_ROLE: 'all',
+          CUSTODY_BACKEND_IDENTITY: 'devnet-local-test-custody',
+          CUSTODY_BACKEND_MODE: 'LOCAL_TEST',
+          WORKER_INTERVAL_MS: '250',
+          WORKER_LEASE_SECONDS: '30',
+          ALLOW_MAINNET: 'false',
+        },
+      )
+      await waitForHttp(`${apiBaseUrl()}/health/ready`, apiProcess, 60_000)
+      const afterRestart = await requestJson(
+        `${apiBaseUrl()}/v2/payments/${paymentId}`,
+        {
+          method: 'GET',
+          headers: agentHeaders(apiKey),
+        },
+      )
+      expect(afterRestart.status).toBe(200)
+      expect(asRecord(afterRestart.body, 'payment after restart').status).toBe(
+        'CONFIRMED',
+      )
+
+      state = {
+        database,
+        apiBaseUrl: apiBaseUrl(),
+        fakeBaseUrl: fakeBaseUrl(),
+        adminApiKey,
+        accountId,
+        accountOwner,
+        apiKey,
+        providerDestination: funded.fakeService.destination,
+        settlementMint: funded.settlementAsset.mint,
+        platformFeePayer: funded.platformFeePayer.address,
+        apiProcess,
+        fakeProcess,
+      }
+      apiProcess = undefined
+      fakeProcess = undefined
+    } catch (error) {
+      if (fakeProcess !== undefined) await stopProcess(fakeProcess)
+      if (apiProcess !== undefined) await stopProcess(apiProcess)
+      await database.disconnect()
+      throw error
+    }
+  }, 240_000)
+
+  afterAll(async () => {
+    if (state !== undefined) {
+      await stopProcess(state.fakeProcess)
+      await stopProcess(state.apiProcess)
+      await state.database.disconnect()
+      state = undefined
+    }
+  })
+
+  it('completes the real devnet transaction and all durable MUX states', () => {
+    expect(state).toBeDefined()
+    expect(state?.providerDestination).toBeTruthy()
+    expect(state?.settlementMint).toBeTruthy()
+    expect(state?.platformFeePayer).toBeTruthy()
+  })
+})
+
+async function seedDevnetFinancialIdentity(
+  url: string,
+  settlementMint: string,
+): Promise<void> {
+  const database = createDatabaseClient(url)
+  try {
+    const denomination = await database.v2.findDenomination(DENOMINATION_ID)
+    if (denomination === null) {
+      await database.v2.createDenomination({
+        id: DENOMINATION_ID,
+        symbol: 'USD',
+        maxScale: 6,
+      })
+    } else if (denomination.symbol !== 'USD' || denomination.maxScale !== 6) {
+      throw new Error(`Denomination ${DENOMINATION_ID} is incompatible with TEST_USDC`)
+    }
+
+    const asset = await database.v2.findSettlementAsset(SETTLEMENT_ASSET_ID)
+    if (asset === null) {
+      await database.v2.createSettlementAsset({
+        id: SETTLEMENT_ASSET_ID,
+        rail: 'SOLANA_SPL',
+        network: 'devnet',
+        assetReference: settlementMint,
+        decimals: 6,
+      })
+    } else if (
+      asset.rail !== 'SOLANA_SPL' ||
+      asset.network !== 'devnet' ||
+      asset.assetReference !== settlementMint ||
+      asset.decimals !== 6
+    ) {
+      throw new Error(
+        `Settlement asset ${SETTLEMENT_ASSET_ID} is incompatible with TEST_USDC`,
+      )
+    }
+
+    const mapping = await database.v2.findEconomicMapping(ECONOMIC_MAPPING_ID)
+    if (mapping === null) {
+      await database.v2.createEconomicMapping({
+        id: ECONOMIC_MAPPING_ID,
+        denominationId: DENOMINATION_ID,
+        settlementAssetId: SETTLEMENT_ASSET_ID,
+        numerator: 1n,
+        denominator: 1n,
+      })
+    } else if (
+      mapping.denominationId !== DENOMINATION_ID ||
+      mapping.settlementAssetId !== SETTLEMENT_ASSET_ID ||
+      mapping.numerator !== 1n ||
+      mapping.denominator !== 1n
+    ) {
+      throw new Error(`Economic mapping ${ECONOMIC_MAPPING_ID} is incompatible`)
+    }
+
+    const activeRoutes = await database.v2.listActiveSettlementRoutes()
+    if (activeRoutes.some((route) => route.id !== SETTLEMENT_ROUTE_ID)) {
+      throw new Error(
+        'The devnet E2E database contains another active route; use a dedicated database',
+      )
+    }
+    const route = await database.v2.findSettlementRoute(SETTLEMENT_ROUTE_ID)
+    if (route === null) {
+      const devnetRoute: SettlementRoute = {
+        id: SETTLEMENT_ROUTE_ID,
+        rail: 'SOLANA_SPL',
+        railVersion: 'v2-devnet',
+        network: 'devnet',
+        settlementAssetId: SETTLEMENT_ASSET_ID,
+        economicMappingId: ECONOMIC_MAPPING_ID,
+        status: 'ACTIVE',
+        priority: 1,
+        configVersion: 'devnet-x402-v1',
+      }
+      await database.v2.createSettlementRoute(devnetRoute)
+    } else if (
+      route.rail !== 'SOLANA_SPL' ||
+      route.network !== 'devnet' ||
+      route.settlementAssetId !== SETTLEMENT_ASSET_ID ||
+      route.economicMappingId !== ECONOMIC_MAPPING_ID ||
+      route.status !== 'ACTIVE'
+    ) {
+      throw new Error(`Settlement route ${SETTLEMENT_ROUTE_ID} is incompatible`)
+    }
+  } finally {
+    await database.disconnect()
+  }
+}
+
+function startProcess(
+  args: readonly string[],
+  environment: Readonly<Record<string, string>>,
+): RunningProcess {
+  const child = spawn('pnpm', args, {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      COREPACK_HOME: '/tmp/agent-payment-account-corepack',
+      NO_DNA: '1',
+      ...environment,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let output = ''
+  const capture = (chunk: Buffer): void => {
+    if (output.length >= 12_000) return
+    output += chunk.toString('utf8').slice(0, 12_000 - output.length)
+  }
+  child.stdout.on('data', capture)
+  child.stderr.on('data', capture)
+  return {
+    child,
+    diagnostics: () => output.slice(-4_000),
+  }
+}
+
+async function stopProcess(process: RunningProcess): Promise<void> {
+  if (process.child.exitCode !== null || process.child.signalCode !== null) return
+  process.child.kill('SIGTERM')
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      if (process.child.exitCode === null && process.child.signalCode === null) {
+        process.child.kill('SIGKILL')
+      }
+      resolve()
+    }, 10_000)
+    process.child.once('exit', () => {
+      clearTimeout(timeout)
+      resolve()
+    })
+  })
+}
+
+async function waitForHttp(
+  url: string,
+  process: RunningProcess,
+  timeoutMs: number,
+): Promise<void> {
+  await waitForCondition(
+    async () => {
+      if (process.child.exitCode !== null || process.child.signalCode !== null) {
+        throw new Error(
+          `Child process exited while waiting for ${url}: ${process.diagnostics()}`,
+        )
+      }
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(1_000) })
+        return response.ok
+      } catch {
+        return false
+      }
+    },
+    timeoutMs,
+    `HTTP readiness at ${url}`,
+  )
+}
+
+async function waitForCondition(
+  check: () => Promise<boolean>,
+  timeoutMs: number,
+  description: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+  while (Date.now() < deadline) {
+    try {
+      if (await check()) return
+    } catch (error) {
+      lastError = error
+      if (error instanceof Error && error.message.includes('Child process exited')) {
+        throw error
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  throw new Error(
+    `Timed out waiting for ${description}${
+      lastError instanceof Error ? `: ${lastError.message}` : ''
+    }`,
+  )
+}
+
+async function requestJson(url: string, init: RequestInit): Promise<HttpResult> {
+  const response = await fetch(url, {
+    ...init,
+    signal: init.signal ?? AbortSignal.timeout(30_000),
+  })
+  const text = await response.text()
+  let body: unknown = null
+  if (text.length > 0) {
+    try {
+      body = JSON.parse(text) as unknown
+    } catch {
+      body = text
+    }
+  }
+  return { status: response.status, body, headers: response.headers }
+}
+
+function apiBaseUrl(): string {
+  return `http://127.0.0.1:${apiPort}`
+}
+
+function fakeBaseUrl(): string {
+  return `http://127.0.0.1:${fakePort}`
+}
+
+function adminHeaders(key: string): Record<string, string> {
+  return { 'content-type': 'application/json', 'x-admin-api-key': key }
+}
+
+function agentHeaders(key: string): Record<string, string> {
+  return { 'content-type': 'application/json', authorization: `Bearer ${key}` }
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function assertPort(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+    throw new Error(`${name} must be a valid TCP port`)
+  }
+}
+
+function asRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`)
+  }
+  return value as Record<string, unknown>
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string`)
+  }
+  return value
+}
+
+function timelinePaymentId(value: unknown): string | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined
+  }
+  const paymentId = (value as Record<string, unknown>).payment_id
+  return typeof paymentId === 'string' ? paymentId : undefined
+}
+
+async function readRpc(
+  rpcUrl: string,
+  method: string,
+  params: readonly unknown[],
+): Promise<unknown> {
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const payload: unknown = await response.json()
+  const object = asRecord(payload, 'Solana RPC response')
+  if (object.error !== undefined) throw new Error(`Solana RPC ${method} failed`)
+  return object.result
+}

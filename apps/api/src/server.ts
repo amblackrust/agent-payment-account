@@ -47,9 +47,11 @@ import { buildRuntimeIdentity } from './runtime-identity.js'
 import { createRuntimeOwner } from './runtime-owner.js'
 import { createFundingProvisioner } from './funding-provisioner.js'
 import { X402PaymentService } from './x402-service.js'
+import { x402NetworkForSolanaCluster } from './x402-protocol.js'
 
 async function startServer(): Promise<void> {
   const config = loadConfig()
+  const x402Network = x402NetworkForSolanaCluster(config.solanaCluster)
   if (config.runtimeRole !== 'api' && config.runtimeRole !== 'all') {
     throw new ConfigurationError(
       `RUNTIME_ROLE=${config.runtimeRole} must use the dedicated worker entrypoint`,
@@ -185,6 +187,12 @@ async function startServer(): Promise<void> {
     repository: database.v2,
     resourceUrl: config.x402ResourceUrl ?? DEFAULT_X402_RESOURCE_URL,
     settlementMint: config.solanaSettlementMint,
+    ...(x402Network === undefined
+      ? {}
+      : {
+          network: x402Network,
+          routeNetwork: config.solanaCluster,
+        }),
     maxPaymentAtomic: config.x402MaxPaymentAtomic ?? DEFAULT_X402_MAX_PAYMENT_ATOMIC,
     httpTimeoutMs: config.x402HttpTimeoutMs ?? DEFAULT_X402_HTTP_TIMEOUT_MS,
   })

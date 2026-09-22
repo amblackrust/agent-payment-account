@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import {
   address,
   createNoopSigner,
+  getSignatureFromTransaction,
   getTransactionDecoder,
   signature,
   type Address,
@@ -14,7 +15,7 @@ import {
 } from '@solana-program/token'
 import { x402Client } from '@x402/core/client'
 import { x402HTTPClient } from '@x402/core/http'
-import type { PaymentPayload, PaymentRequired } from '@x402/core/types'
+import type { Network, PaymentPayload, PaymentRequired } from '@x402/core/types'
 import { ExactSvmScheme } from '@x402/svm/exact/client'
 import {
   convertFromSettlementAtomicUnits,
@@ -28,17 +29,17 @@ import type { SolanaRpc } from '@agent-payment/solana-rail'
 import type { V2PaymentAttemptSnapshot, V2PaymentView } from '@agent-payment/db'
 import type { V2OutgoingExecutor, V2PreparedEffect } from './outgoing-v2.js'
 import {
+  assertCompatibleX402SolanaAdapterConfig,
   assertSuccessfulSettlement,
   createPaymentSignatureHeader,
   hashRequirement,
   parsePaymentRequiredResponse,
   parsePaymentResourceResponse,
   parseX402Metadata,
+  resolveX402SolanaAdapterConfig,
   serializeProtocolMetadata,
   X402_ABSOLUTE_MAX_PAYMENT_ATOMIC,
   X402_PROTOCOL,
-  X402_SOLANA_MAINNET_NETWORK,
-  X402_SOLANA_USDC_MINT,
 } from './x402-protocol.js'
 import {
   parseSolanaX402PreparedPayload,
@@ -49,12 +50,17 @@ const DEFAULT_HTTP_TIMEOUT_MS = 15_000
 const DEFAULT_RPC_TIMEOUT_MS = 5_000
 const MAX_RESPONSE_BODY_BYTES = 8 * 1024
 const SOLANA_SPL_RAIL = 'SOLANA_SPL'
-const MAINNET_CLUSTER = 'mainnet-beta'
 
 export interface X402OutgoingExecutorOptions {
   readonly rpc: SolanaRpc
   readonly rpcUrl: string
-  readonly settlementMint: string
+  readonly settlementMint?: string
+  readonly network?: string
+  readonly routeNetwork?: string
+  readonly providerDestination?: string
+  /** Adds the platform fee-payer signature inside the MUX custody boundary. */
+  readonly signFeePayer?: boolean
+  readonly platformFeePayerIdentity?: string
   readonly resourceUrl: string
   readonly httpTimeoutMs?: number
   readonly rpcTimeoutMs?: number
@@ -99,7 +105,24 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
 > & {
   checkReadiness(): Promise<void>
 } {
-  const settlementMint = parseSolanaAddress(options.settlementMint, 'settlement mint')
+  const adapterConfig = resolveX402SolanaAdapterConfig(options)
+  const settlementMint = parseSolanaAddress(
+    adapterConfig.settlementMint,
+    'settlement mint',
+  )
+  const x402Network = adapterConfig.network
+  const routeNetwork = adapterConfig.routeNetwork
+  const signFeePayer = options.signFeePayer === true
+  if (signFeePayer && options.platformFeePayerIdentity === undefined) {
+    throw new Error('x402 fee-payer signing requires the platform fee-payer identity')
+  }
+  const platformFeePayerIdentity =
+    options.platformFeePayerIdentity === undefined
+      ? undefined
+      : parseSolanaAddress(
+          options.platformFeePayerIdentity,
+          'platform fee-payer identity',
+        )
   const httpTimeoutMs = options.httpTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS
   if (!Number.isInteger(httpTimeoutMs) || httpTimeoutMs <= 0) {
@@ -120,6 +143,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     readonly view: V2PaymentView
     readonly attempt: V2PaymentAttemptSnapshot
   }): Promise<V2PreparedEffect> {
+    assertCompatibleX402SolanaAdapterConfig(adapterConfig)
     const payment = input.view.payment
     const metadata = parseX402Metadata(payment.metadataJson)
     if (metadata.resourceUrl !== options.resourceUrl) {
@@ -163,6 +187,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       assetRecord,
       mappingRecord,
       denominationRecord,
+      routeNetwork,
       settlementMint,
     )
     const denomination = createDenomination({
@@ -194,9 +219,20 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     const snapshot = parsePaymentRequiredResponse(
       discoveryResponse,
       options.resourceUrl,
-      settlementMint,
+      adapterConfig.settlementMint,
+      x402Network,
+      adapterConfig.providerDestination,
     )
     const requirement = snapshot.requirement
+    if (
+      signFeePayer &&
+      (platformFeePayerIdentity === undefined ||
+        requirement.extra.feePayer !== platformFeePayerIdentity)
+    ) {
+      throw deterministicError(
+        'x402 provider fee payer does not match the configured MUX platform fee payer',
+      )
+    }
     const tokenAmount = BigInt(requirement.amount)
     if (tokenAmount > options.maxPaymentAtomic) {
       throw deterministicError('x402 payment exceeds the configured absolute spend cap')
@@ -227,6 +263,11 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     const recipientOwner = parseSolanaAddress(requirement.payTo, 'x402 payTo')
     if (payerOwner === recipientOwner) {
       throw deterministicError('x402 payTo must differ from the Agent Account signer')
+    }
+    if (signFeePayer && platformFeePayerIdentity === payerOwner) {
+      throw deterministicError(
+        'x402 platform fee payer must differ from the Agent Account signer',
+      )
     }
     await validateSettlementMint(asset)
     const [payerAta, recipientAta] = await Promise.all([
@@ -311,6 +352,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     readonly prepared: V2PreparedEffect
     readonly signed: Parameters<V2OutgoingExecutor['submit']>[0]['signed']
   }): Promise<Awaited<ReturnType<V2OutgoingExecutor['submit']>>> {
+    assertCompatibleX402SolanaAdapterConfig(adapterConfig)
     return sendPaidRequest(input.prepared, input.signed.signedPayload)
   }
 
@@ -319,6 +361,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     readonly attempt: V2PaymentAttemptSnapshot
     readonly signedPayload?: Uint8Array
   }): Promise<Awaited<ReturnType<NonNullable<V2OutgoingExecutor['reconcile']>>>> {
+    assertCompatibleX402SolanaAdapterConfig(adapterConfig)
     const prepared = restorePreparedEffect(input.attempt)
     if (prepared === undefined || input.signedPayload === undefined) {
       return { status: 'UNKNOWN' }
@@ -330,6 +373,41 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       throw deterministicError(
         'Durable x402 signed payload hash does not match the attempt',
       )
+    }
+    const durable = parseSolanaX402PreparedPayload(prepared.preparedPayload)
+    validateSignedTransaction(input.signedPayload, durable, signFeePayer)
+    const signedTransactionId = signFeePayer
+      ? readFullySignedTransactionSignature(input.signedPayload, durable)
+      : undefined
+    if (
+      signedTransactionId !== undefined &&
+      signedTransactionId !== input.attempt.expectedExternalId
+    ) {
+      const observed = await observeSettlementOnChain(signedTransactionId)
+      if (observed.status === 'CONFIRMED') {
+        return {
+          status: 'CONFIRMED',
+          externalId: signedTransactionId,
+          evidenceMetadataJson: serializeProtocolMetadata({
+            protocol: X402_PROTOCOL,
+            resource_url: options.resourceUrl,
+            on_chain: observed,
+            recovery: 'SIGNED_PAYLOAD_SIGNATURE',
+          }),
+        }
+      }
+      if (observed.status === 'PENDING' || observed.status === 'FAILED') {
+        return {
+          status: 'UNKNOWN',
+          externalId: signedTransactionId,
+          evidenceMetadataJson: serializeProtocolMetadata({
+            protocol: X402_PROTOCOL,
+            resource_url: options.resourceUrl,
+            on_chain: observed,
+            recovery: 'SIGNED_PAYLOAD_SIGNATURE',
+          }),
+        }
+      }
     }
     if (input.attempt.expectedExternalId !== null) {
       const observed = await observeSettlementOnChain(input.attempt.expectedExternalId)
@@ -382,6 +460,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
   }
 
   async function checkReadiness(): Promise<void> {
+    assertCompatibleX402SolanaAdapterConfig(adapterConfig)
     await validateSettlementMintWithoutPayment()
   }
 
@@ -389,19 +468,34 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     prepared: V2PreparedEffect,
     signedPayload: Uint8Array,
   ): Promise<Awaited<ReturnType<V2OutgoingExecutor['submit']>>> {
+    assertCompatibleX402SolanaAdapterConfig(adapterConfig)
     let durable: SolanaX402PreparedPayload
     try {
       durable = parseSolanaX402PreparedPayload(prepared.preparedPayload)
     } catch (error) {
       throw error
     }
+    if (
+      prepared.network !== routeNetwork ||
+      prepared.assetReference !== adapterConfig.settlementMint ||
+      (adapterConfig.providerDestination !== undefined &&
+        prepared.destination !== adapterConfig.providerDestination) ||
+      durable.settlementMint !== adapterConfig.settlementMint ||
+      (adapterConfig.providerDestination !== undefined &&
+        durable.recipientOwner !== adapterConfig.providerDestination)
+    ) {
+      throw deterministicError(
+        'x402 prepared effect does not match the configured Solana adapter',
+      )
+    }
     const paymentPayload = parsePaymentPayload(
       durable.paymentPayloadJson,
       durable,
       options.resourceUrl,
+      x402Network,
     )
     const signedTransaction = Buffer.from(signedPayload).toString('base64')
-    validateSignedTransaction(signedPayload, durable)
+    validateSignedTransaction(signedPayload, durable, signFeePayer)
     const paymentWithSignedTransaction: PaymentPayload = {
       ...paymentPayload,
       payload: {
@@ -460,7 +554,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       settlement: parsed.settlement,
     })
     try {
-      assertSuccessfulSettlement(parsed.settlement)
+      assertSuccessfulSettlement(parsed.settlement, x402Network)
     } catch {
       return { status: 'UNKNOWN', evidenceMetadataJson: evidence }
     }
@@ -593,7 +687,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     readonly decimals: number
     readonly assetReference: string
   }): Promise<void> {
-    if (asset.assetReference !== options.settlementMint) {
+    if (asset.assetReference !== adapterConfig.settlementMint) {
       throw deterministicError('x402 settlement mint differs from the configured asset')
     }
     const mint = await withRpcTimeout((abortSignal) =>
@@ -606,17 +700,12 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       mint.data.decimals !== asset.decimals
     ) {
       throw deterministicError(
-        'Configured canonical USDC mint is unavailable or invalid',
+        'Configured x402 settlement mint is unavailable or invalid',
       )
     }
   }
 
   async function validateSettlementMintWithoutPayment(): Promise<void> {
-    if (options.settlementMint !== X402_SOLANA_USDC_MINT) {
-      throw new ExternalRailError(
-        'Configured x402 settlement mint is not canonical Solana USDC',
-      )
-    }
     const mint = await withRpcTimeout((abortSignal) =>
       fetchMaybeMint(options.rpc, settlementMint, { abortSignal }),
     )
@@ -640,12 +729,12 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       account.data.owner !== owner
     ) {
       throw deterministicError(
-        'Agent Account USDC token account is unavailable or invalid',
+        'Agent Account x402 settlement token account is unavailable or invalid',
       )
     }
     if (account.data.amount < requiredAmount) {
       throw deterministicError(
-        'Agent Account USDC balance is below the x402 payment amount',
+        'Agent Account x402 settlement balance is below the payment amount',
       )
     }
   }
@@ -694,19 +783,28 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     paymentRequired: PaymentRequired,
     payerOwner: Address,
   ): Promise<PaymentPayload> {
+    const expectedRequirement = paymentRequired.accepts.find(
+      (candidate) =>
+        candidate.scheme === 'exact' &&
+        candidate.network === x402Network &&
+        candidate.asset === settlementMint &&
+        (adapterConfig.providerDestination === undefined ||
+          candidate.payTo === adapterConfig.providerDestination),
+    )
+    if (expectedRequirement === undefined) {
+      throw deterministicError(
+        'x402 payment requirement changed before payload creation',
+      )
+    }
     const coreClient = new x402Client((_version, requirements) => {
       const selected = requirements.find(
         (candidate) =>
           candidate.scheme === 'exact' &&
-          candidate.network === X402_SOLANA_MAINNET_NETWORK &&
+          candidate.network === x402Network &&
+          candidate.amount === expectedRequirement.amount &&
           candidate.asset === settlementMint &&
-          candidate.payTo ===
-            paymentRequired.accepts.find(
-              (accepted) =>
-                accepted.scheme === 'exact' &&
-                accepted.network === X402_SOLANA_MAINNET_NETWORK &&
-                accepted.asset === settlementMint,
-            )?.payTo,
+          candidate.payTo === expectedRequirement.payTo &&
+          candidate.extra?.feePayer === expectedRequirement.extra?.feePayer,
       )
       if (selected === undefined) {
         throw deterministicError(
@@ -716,7 +814,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       return selected
     })
     coreClient.register(
-      X402_SOLANA_MAINNET_NETWORK,
+      x402Network,
       new ExactSvmScheme(createNoopSigner(payerOwner), { rpcUrl: options.rpcUrl }),
     )
     const httpClient = new x402HTTPClient(coreClient)
@@ -737,28 +835,33 @@ function assertRouteConfiguration(
     readonly status: string
   },
   mapping: {
+    readonly id: string
     readonly settlementAssetId: string
     readonly denominationId: string
     readonly status: string
   },
   denomination: { readonly id: string; readonly status: string },
+  routeNetwork: string,
   settlementMint: Address,
 ): void {
   if (
     route.rail !== SOLANA_SPL_RAIL ||
-    route.network !== MAINNET_CLUSTER ||
+    route.network !== routeNetwork ||
+    route.status !== 'ACTIVE' ||
+    route.settlementAssetId !== asset.id ||
     asset.status !== 'ACTIVE' ||
     asset.rail !== SOLANA_SPL_RAIL ||
-    asset.network !== MAINNET_CLUSTER ||
+    asset.network !== routeNetwork ||
     asset.assetReference !== settlementMint ||
-    asset.assetReference !== X402_SOLANA_USDC_MINT ||
-    asset.decimals !== 6 ||
     mapping.status !== 'ACTIVE' ||
+    mapping.id !== route.economicMappingId ||
     mapping.settlementAssetId !== asset.id ||
     mapping.denominationId !== denomination.id ||
     denomination.status !== 'ACTIVE'
   ) {
-    throw deterministicError('x402 route configuration is not Solana mainnet USDC')
+    throw deterministicError(
+      'x402 route configuration is incompatible with the configured Solana network and settlement asset',
+    )
   }
 }
 
@@ -805,6 +908,7 @@ function parsePaymentPayload(
   serialized: string,
   durable: SolanaX402PreparedPayload,
   resourceUrl: string,
+  expectedNetwork: Network,
 ): PaymentPayload {
   let parsed: unknown
   try {
@@ -837,16 +941,28 @@ function parsePaymentPayload(
   }
   const accepted = value.accepted as Record<string, unknown>
   const extra = accepted.extra
+  const feePayer =
+    typeof extra === 'object' &&
+    extra !== null &&
+    !Array.isArray(extra) &&
+    typeof (extra as Record<string, unknown>).feePayer === 'string'
+      ? (extra as Record<string, unknown>).feePayer
+      : undefined
+  const maxTimeoutSeconds = accepted.maxTimeoutSeconds
   if (
     accepted.scheme !== 'exact' ||
-    accepted.network !== X402_SOLANA_MAINNET_NETWORK ||
+    accepted.network !== expectedNetwork ||
     accepted.amount !== durable.tokenAmount ||
     accepted.asset !== durable.settlementMint ||
     accepted.payTo !== durable.recipientOwner ||
     typeof extra !== 'object' ||
     extra === null ||
     Array.isArray(extra) ||
-    (extra as Record<string, unknown>).feePayer !== durable.feePayerIdentity ||
+    feePayer !== durable.feePayerIdentity ||
+    typeof maxTimeoutSeconds !== 'number' ||
+    !Number.isInteger(maxTimeoutSeconds) ||
+    maxTimeoutSeconds <= 0 ||
+    maxTimeoutSeconds > 3_600 ||
     transaction !== durable.transactionBase64 ||
     typeof value.resource !== 'object' ||
     value.resource === null ||
@@ -856,6 +972,19 @@ function parsePaymentPayload(
     throw deterministicError(
       'x402 durable payment payload does not match the prepared effect',
     )
+  }
+  if (
+    hashRequirement({
+      scheme: 'exact',
+      network: expectedNetwork,
+      amount: durable.tokenAmount,
+      asset: durable.settlementMint,
+      payTo: durable.recipientOwner,
+      maxTimeoutSeconds,
+      extra: { feePayer: durable.feePayerIdentity },
+    }) !== durable.requirementHash
+  ) {
+    throw deterministicError('x402 durable payment requirement hash does not match')
   }
   return parsed as PaymentPayload
 }
@@ -887,6 +1016,7 @@ function hashTransactionMessage(transactionBase64: string): string {
 function validateSignedTransaction(
   signedPayload: Uint8Array,
   durable: SolanaX402PreparedPayload,
+  signFeePayer: boolean,
 ): void {
   let decoded
   try {
@@ -902,13 +1032,40 @@ function validateSignedTransaction(
     throw deterministicError('Custody changed the prepared x402 transaction message')
   }
   const signatures = decoded.signatures as unknown as Readonly<Record<string, unknown>>
+  const payerSignature = signatures[durable.payerOwner]
+  const feePayerSignature = signatures[durable.feePayerIdentity]
   if (
-    signatures[durable.payerOwner] === null ||
-    signatures[durable.feePayerIdentity] !== null
+    payerSignature === null ||
+    payerSignature === undefined ||
+    (signFeePayer
+      ? feePayerSignature === null || feePayerSignature === undefined
+      : feePayerSignature !== null)
   ) {
-    throw deterministicError(
-      'Custody did not return the expected x402 partial signature',
-    )
+    throw deterministicError('Custody did not return the expected x402 signatures')
+  }
+}
+
+function readFullySignedTransactionSignature(
+  signedPayload: Uint8Array,
+  durable: SolanaX402PreparedPayload,
+): string | undefined {
+  let decoded
+  try {
+    decoded = getTransactionDecoder().decode(signedPayload)
+  } catch {
+    throw deterministicError('Custody returned an invalid x402 Solana transaction')
+  }
+  const signatures = decoded.signatures as unknown as Readonly<Record<string, unknown>>
+  if (
+    signatures[durable.feePayerIdentity] === null ||
+    signatures[durable.feePayerIdentity] === undefined
+  ) {
+    return undefined
+  }
+  try {
+    return String(getSignatureFromTransaction(decoded as never))
+  } catch {
+    throw deterministicError('Custody returned an invalid x402 Solana signature')
   }
 }
 
@@ -928,29 +1085,135 @@ function restorePreparedEffect(
     throw deterministicError('x402 durable prepared effect is invalid')
   }
   const value = parsed as Record<string, unknown>
-  if (
-    typeof value.preparedPayload !== 'string' ||
-    typeof value.effectHash !== 'string' ||
-    typeof value.payloadHash !== 'string'
-  ) {
-    throw deterministicError('x402 durable prepared effect is incomplete')
+  const requiredStrings = [
+    'accountId',
+    'paymentId',
+    'attemptId',
+    'effectHash',
+    'network',
+    'assetReference',
+    'destination',
+    'feePayerIdentity',
+    'preparedPayload',
+    'routeId',
+    'payloadHash',
+  ] as const
+  for (const field of requiredStrings) {
+    if (typeof value[field] !== 'string' || value[field].length === 0) {
+      throw deterministicError('x402 durable prepared effect is incomplete')
+    }
   }
+  const amountAtomic = value.amountAtomic
+  const keyVersion = value.keyVersion
+  if (
+    typeof amountAtomic !== 'string' ||
+    !/^[1-9]\d*$/u.test(amountAtomic) ||
+    typeof keyVersion !== 'number' ||
+    !Number.isInteger(keyVersion) ||
+    keyVersion <= 0 ||
+    !/^[0-9a-f]{64}$/u.test(value.effectHash as string) ||
+    !/^[0-9a-f]{64}$/u.test(value.payloadHash as string)
+  ) {
+    throw deterministicError('x402 durable prepared effect contains invalid fields')
+  }
+  const correlationId = readOptionalPreparedString(value.correlationId)
+  const validityExpiresAt = readOptionalPreparedDate(value.validityExpiresAt)
+  const validitySlot = readOptionalPreparedBigInt(value.validitySlot)
   return {
-    ...(value as unknown as V2PreparedEffect),
-    amountAtomic: BigInt(String(value.amountAtomic)),
-    preparedPayload: value.preparedPayload,
-    effectHash: value.effectHash,
-    payloadHash: value.payloadHash,
+    accountId: value.accountId as string,
+    paymentId: value.paymentId as string,
+    attemptId: value.attemptId as string,
+    ...(correlationId === undefined ? {} : { correlationId }),
+    effectHash: value.effectHash as string,
+    network: value.network as string,
+    assetReference: value.assetReference as string,
+    destination: value.destination as string,
+    amountAtomic: BigInt(amountAtomic),
+    feePayerIdentity: value.feePayerIdentity as string,
+    keyVersion,
+    preparedPayload: value.preparedPayload as string,
+    routeId: value.routeId as string,
+    payloadHash: value.payloadHash as string,
+    ...(validityExpiresAt === undefined ? {} : { validityExpiresAt }),
+    ...(validitySlot === undefined ? {} : { validitySlot }),
   }
 }
 
+function readOptionalPreparedString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || value.length === 0) {
+    throw deterministicError(
+      'x402 durable prepared effect has an invalid optional field',
+    )
+  }
+  return value
+}
+
+function readOptionalPreparedDate(value: unknown): Date | undefined {
+  const serialized = readOptionalPreparedString(value)
+  if (serialized === undefined) return undefined
+  const parsed = new Date(serialized)
+  if (Number.isNaN(parsed.getTime())) {
+    throw deterministicError('x402 durable prepared effect has an invalid expiry')
+  }
+  return parsed
+}
+
+function readOptionalPreparedBigInt(value: unknown): bigint | undefined {
+  const serialized = readOptionalPreparedString(value)
+  if (serialized === undefined) return undefined
+  if (!/^\d+$/u.test(serialized)) {
+    throw deterministicError(
+      'x402 durable prepared effect has an invalid validity slot',
+    )
+  }
+  return BigInt(serialized)
+}
+
 async function readResponseBody(response: Response): Promise<unknown> {
-  const text = await response.text()
-  const bytes = Buffer.byteLength(text, 'utf8')
-  const bounded =
-    bytes > MAX_RESPONSE_BODY_BYTES
-      ? `${text.slice(0, MAX_RESPONSE_BODY_BYTES)}\n[truncated]`
-      : text
+  const body = response.body
+  if (body === null) return ''
+  const reader = body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  let truncated = false
+  try {
+    while (true) {
+      const result = await reader.read()
+      if (result.done) break
+      const chunk = result.value
+      const remaining = MAX_RESPONSE_BODY_BYTES - totalBytes
+      if (remaining <= 0) {
+        truncated = true
+        break
+      }
+      if (chunk.byteLength > remaining) {
+        chunks.push(chunk.slice(0, remaining))
+        totalBytes += remaining
+        truncated = true
+        break
+      }
+      chunks.push(chunk)
+      totalBytes += chunk.byteLength
+    }
+  } finally {
+    if (truncated) {
+      try {
+        await reader.cancel()
+      } catch {
+        // The response is already unusable; the bounded prefix is still valid evidence.
+      }
+    }
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(totalBytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  const text = new TextDecoder().decode(bytes)
+  const bounded = truncated ? `${text}\n[truncated]` : text
   try {
     return JSON.parse(bounded) as unknown
   } catch {

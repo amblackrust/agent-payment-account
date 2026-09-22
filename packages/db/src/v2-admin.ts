@@ -1710,6 +1710,13 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           },
           orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           take: input.limit,
+          include: {
+            attempts: {
+              select: { railTransactionId: true },
+              orderBy: { attemptNumber: 'desc' },
+              take: 1,
+            },
+          },
         }),
         prisma.incomingPayment.findMany({
           where: {
@@ -1740,7 +1747,7 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           denominationId: payment.denominationId,
           currency: payment.currency,
           recipientId: payment.recipientId,
-          externalId: null,
+          externalId: payment.attempts[0]?.railTransactionId ?? null,
           occurredAt: payment.createdAt,
         })),
         ...incoming.map((payment) => ({

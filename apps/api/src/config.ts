@@ -94,6 +94,12 @@ const configSchema = z.object({
     .positive()
     .max(DEFAULT_X402_MAX_PAYMENT_ATOMIC)
     .default(DEFAULT_X402_MAX_PAYMENT_ATOMIC),
+  X402_SIGN_FEE_PAYER: z.preprocess((value: unknown) => {
+    if (value === undefined) return false
+    if (value === 'true' || value === true) return true
+    if (value === 'false' || value === false) return false
+    return value
+  }, z.boolean()),
   WALLET_MASTER_KEY: z
     .string()
     .regex(
@@ -250,6 +256,7 @@ export type AppConfig = {
   readonly x402ResourceUrl?: string
   readonly x402HttpTimeoutMs?: number
   readonly x402MaxPaymentAtomic?: bigint
+  readonly x402SignFeePayer?: boolean
   readonly walletMasterKey: string | undefined
   readonly recoveryEnvelopeKey: string | undefined
   readonly webhookSigningKeysJson?: string
@@ -361,6 +368,26 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       'Production requires the public SOLANA_FEE_PAYER_IDENTITY',
     )
   }
+  if (result.data.X402_SIGN_FEE_PAYER) {
+    if (result.data.NODE_ENV === 'production') {
+      throw new ConfigurationError(
+        'X402_SIGN_FEE_PAYER is restricted to non-production devnet verification',
+      )
+    }
+    if (result.data.SOLANA_CLUSTER !== 'devnet') {
+      throw new ConfigurationError('X402_SIGN_FEE_PAYER requires SOLANA_CLUSTER=devnet')
+    }
+    if (result.data.SOLANA_FEE_PAYER_IDENTITY === undefined) {
+      throw new ConfigurationError(
+        'X402_SIGN_FEE_PAYER requires SOLANA_FEE_PAYER_IDENTITY',
+      )
+    }
+    if (result.data.SOLANA_FEE_PAYER_SECRET === undefined) {
+      throw new ConfigurationError(
+        'X402_SIGN_FEE_PAYER requires SOLANA_FEE_PAYER_SECRET',
+      )
+    }
+  }
   if (
     runtimeRole === 'maintenance' &&
     result.data.BACKUP_OUTPUT_DIRECTORY === undefined
@@ -455,6 +482,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     x402ResourceUrl: result.data.X402_RESOURCE_URL,
     x402HttpTimeoutMs: result.data.X402_HTTP_TIMEOUT_MS,
     x402MaxPaymentAtomic: result.data.X402_MAX_PAYMENT_ATOMIC,
+    x402SignFeePayer: result.data.X402_SIGN_FEE_PAYER,
     walletMasterKey: result.data.WALLET_MASTER_KEY,
     recoveryEnvelopeKey: result.data.RECOVERY_ENVELOPE_KEY,
     ...(result.data.WEBHOOK_SIGNING_KEYS_JSON === undefined
@@ -530,6 +558,7 @@ export interface RedactedConfig {
   readonly x402ResourceUrl: string
   readonly x402HttpTimeoutMs: number
   readonly x402MaxPaymentAtomic: string
+  readonly x402SignFeePayer: boolean
   readonly allowMainnet: boolean
   readonly hasAdminApiKey: boolean
   readonly hasSolanaFeePayerSecret: boolean
@@ -565,6 +594,7 @@ export function redactConfig(config: AppConfig): RedactedConfig {
     x402MaxPaymentAtomic: String(
       config.x402MaxPaymentAtomic ?? DEFAULT_X402_MAX_PAYMENT_ATOMIC,
     ),
+    x402SignFeePayer: config.x402SignFeePayer === true,
     ...(config.solanaPlatformCostAssetId === undefined
       ? {}
       : { solanaPlatformCostAssetId: config.solanaPlatformCostAssetId }),

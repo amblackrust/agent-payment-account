@@ -5,17 +5,22 @@ import {
 } from '@x402/core/http'
 import type { PaymentRequired, SettleResponse } from '@x402/core/types'
 import {
+  assertCompatibleX402SolanaAdapterConfig,
   assertSuccessfulSettlement,
   hashRequirement,
   parsePaymentRequiredResponse,
   parsePaymentResourceResponse,
+  resolveX402SolanaAdapterConfig,
   serializeProtocolMetadata,
   X402_PAYMENT_RESPONSE_HEADER,
+  X402_SOLANA_DEVNET_NETWORK,
   X402_RESOURCE_URL,
   X402_SOLANA_MAINNET_NETWORK,
+  X402_SOLANA_USDC_MINT,
 } from './x402-protocol.js'
 
 const asset = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+const testMint = 'So11111111111111111111111111111111111111112'
 const payTo = 'Gzehfseq1k9AcHFSoV7qHmDGQx92nLMw78XXdqVWQQWa'
 const feePayer = 'Hc3sdEAsCGQcpgfivywog9uwtk8gUBUZgsxdME1EJy88'
 
@@ -105,6 +110,88 @@ describe('x402 protocol adapter', () => {
         asset,
       ),
     ).toThrow(/multiple compatible/i)
+  })
+
+  it('selects a configured devnet requirement with a test mint and fee payer', () => {
+    const parsed = parsePaymentRequiredResponse(
+      responseWithPaymentRequired({
+        x402Version: 2,
+        resource: { url: X402_RESOURCE_URL },
+        accepts: [
+          {
+            scheme: 'exact',
+            network: X402_SOLANA_DEVNET_NETWORK,
+            amount: '1000',
+            asset: testMint,
+            payTo,
+            maxTimeoutSeconds: 300,
+            extra: { feePayer },
+          },
+        ],
+      }),
+      X402_RESOURCE_URL,
+      testMint,
+      X402_SOLANA_DEVNET_NETWORK,
+      payTo,
+    )
+    expect(parsed.requirement.network).toBe(X402_SOLANA_DEVNET_NETWORK)
+    expect(parsed.requirement.asset).toBe(testMint)
+    expect(parsed.requirement.extra.feePayer).toBe(feePayer)
+  })
+
+  it('rejects a configured provider destination mismatch', () => {
+    expect(() =>
+      parsePaymentRequiredResponse(
+        responseWithPaymentRequired({
+          x402Version: 2,
+          resource: { url: X402_RESOURCE_URL },
+          accepts: [
+            {
+              scheme: 'exact',
+              network: X402_SOLANA_DEVNET_NETWORK,
+              amount: '1000',
+              asset: testMint,
+              payTo,
+              maxTimeoutSeconds: 300,
+              extra: { feePayer },
+            },
+          ],
+        }),
+        X402_RESOURCE_URL,
+        testMint,
+        X402_SOLANA_DEVNET_NETWORK,
+        feePayer,
+      ),
+    ).toThrow(/configured Solana network and settlement asset/i)
+  })
+
+  it('keeps mainnet defaults canonical and allows only explicit devnet test config', () => {
+    const defaults = resolveX402SolanaAdapterConfig()
+    expect(defaults).toEqual({
+      network: X402_SOLANA_MAINNET_NETWORK,
+      routeNetwork: 'mainnet-beta',
+      settlementMint: X402_SOLANA_USDC_MINT,
+    })
+
+    const devnet = resolveX402SolanaAdapterConfig({
+      network: X402_SOLANA_DEVNET_NETWORK,
+      settlementMint: testMint,
+      providerDestination: payTo,
+    })
+    expect(devnet.routeNetwork).toBe('devnet')
+    expect(() => assertCompatibleX402SolanaAdapterConfig(devnet)).not.toThrow()
+    expect(() =>
+      assertCompatibleX402SolanaAdapterConfig({
+        ...defaults,
+        settlementMint: testMint,
+      }),
+    ).toThrow(/canonical Solana mainnet USDC/i)
+    expect(() =>
+      resolveX402SolanaAdapterConfig({
+        network: X402_SOLANA_DEVNET_NETWORK,
+        settlementMint: X402_SOLANA_USDC_MINT,
+      }),
+    ).toThrow(/non-mainnet test settlement mint/i)
   })
 
   it('parses an authoritative payment response without treating HTTP body status as settlement', () => {

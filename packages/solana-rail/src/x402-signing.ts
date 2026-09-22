@@ -49,6 +49,12 @@ export interface SolanaX402SignedEffect {
 export async function signSolanaX402PreparedEffect(input: {
   readonly request: SolanaX402SigningRequest
   readonly payerSecret: string | Uint8Array
+  /**
+   * Devnet-only custody mode may add the platform fee-payer signature before
+   * the payload crosses the external provider boundary. Production providers
+   * can still complete the fee-payer signature when this is omitted.
+   */
+  readonly feePayerSecret?: string | Uint8Array
 }): Promise<SolanaX402SignedEffect> {
   const payload = parseSolanaX402PreparedPayload(input.request.preparedPayload)
   if (
@@ -76,7 +82,12 @@ export async function signSolanaX402PreparedEffect(input: {
   }
 
   const secretBytes = parseSecretKey(input.payerSecret)
+  let feePayerSecretBytes: Uint8Array | undefined
   try {
+    feePayerSecretBytes =
+      input.feePayerSecret === undefined
+        ? undefined
+        : parseSecretKey(input.feePayerSecret)
     const payerSigner = await createKeyPairSignerFromBytes(secretBytes, false)
     if (payerSigner.address !== payload.payerOwner) {
       throw new ExternalRailError(
@@ -84,6 +95,30 @@ export async function signSolanaX402PreparedEffect(input: {
         undefined,
         'DETERMINISTIC',
       )
+    }
+    const feePayerKeyPair =
+      feePayerSecretBytes === undefined
+        ? undefined
+        : await createKeyPairFromBytes(feePayerSecretBytes, false)
+    if (feePayerSecretBytes !== undefined) {
+      const feePayerSigner = await createKeyPairSignerFromBytes(
+        feePayerSecretBytes,
+        false,
+      )
+      if (feePayerSigner.address !== payload.feePayerIdentity) {
+        throw new ExternalRailError(
+          'Platform fee-payer custody public key does not match the prepared x402 effect',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
+      if (payerSigner.address === feePayerSigner.address) {
+        throw new ExternalRailError(
+          'Agent Account signer and platform fee payer must be different identities',
+          undefined,
+          'DETERMINISTIC',
+        )
+      }
     }
     const transactionBytes = Uint8Array.from(
       Buffer.from(payload.transactionBase64, 'base64'),
@@ -114,16 +149,23 @@ export async function signSolanaX402PreparedEffect(input: {
       )
     }
     const keyPair = await createKeyPairFromBytes(secretBytes, false)
-    const signedTransaction = await partiallySignTransaction([keyPair], transaction)
+    const signingKeys =
+      feePayerKeyPair === undefined ? [keyPair] : [keyPair, feePayerKeyPair]
+    const signedTransaction = await partiallySignTransaction(signingKeys, transaction)
     const signedPayload = Uint8Array.from(
       Buffer.from(getBase64EncodedWireTransaction(signedTransaction), 'base64'),
     )
     const signedSignatures = signedTransaction.signatures as unknown as Readonly<
       Record<string, unknown>
     >
-    if (signedSignatures[payload.payerOwner] === null) {
+    if (
+      signedSignatures[payload.payerOwner] === null ||
+      (feePayerKeyPair === undefined
+        ? signedSignatures[payload.feePayerIdentity] !== null
+        : signedSignatures[payload.feePayerIdentity] === null)
+    ) {
       throw new ExternalRailError(
-        'Custody did not add the Agent Account x402 signature',
+        'Custody did not produce the expected x402 signatures',
         undefined,
         'DETERMINISTIC',
       )
@@ -136,6 +178,7 @@ export async function signSolanaX402PreparedEffect(input: {
     }
   } finally {
     secretBytes.fill(0)
+    feePayerSecretBytes?.fill(0)
   }
 }
 
@@ -206,7 +249,7 @@ export function parseSolanaX402PreparedPayload(
     }
   }
   if (
-    !/^\d+$/u.test(value.tokenAmount as string) ||
+    !/^[1-9]\d*$/u.test(value.tokenAmount as string) ||
     !/^[0-9a-f]{64}$/u.test(value.payloadHash as string) ||
     !/^[0-9a-f]{64}$/u.test(value.requirementHash as string) ||
     Buffer.from(value.transactionBase64 as string, 'base64').length === 0

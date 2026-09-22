@@ -127,6 +127,8 @@ export interface V2PaymentAttemptSnapshot {
   readonly signedPayloadHash: string | null
   readonly signedPayloadEncrypted?: string | null
   readonly expectedExternalId: string | null
+  /** The submitted rail transaction/signature, when the rail returned one. */
+  readonly externalId?: string | null
   readonly validityExpiresAt: Date | null
   readonly validitySlot: bigint | null
   readonly rowVersion: number
@@ -2675,13 +2677,30 @@ function toV2AttemptSnapshot(attempt: {
   preparedEffectJson: string | null
   signedPayloadHash: string | null
   signedPayloadEncrypted: string | null
+  railTransactionId: string | null
   expectedExternalId: string | null
   validityExpiresAt: Date | null
   validitySlot: bigint | null
   rowVersion: number
 }): V2PaymentAttemptSnapshot {
   return {
-    ...attempt,
+    id: attempt.id,
+    paymentId: attempt.paymentId,
+    attemptNumber: attempt.attemptNumber,
+    status: attempt.status,
+    outcome: attempt.outcome,
+    routeId: attempt.routeId,
+    preparedEffectHash: attempt.preparedEffectHash,
+    preparedEffectJson: attempt.preparedEffectJson,
+    signedPayloadHash: attempt.signedPayloadHash,
+    signedPayloadEncrypted: attempt.signedPayloadEncrypted,
+    expectedExternalId: attempt.expectedExternalId,
+    validityExpiresAt: attempt.validityExpiresAt,
+    validitySlot: attempt.validitySlot,
+    rowVersion: attempt.rowVersion,
+    ...(attempt.railTransactionId === null
+      ? {}
+      : { externalId: attempt.railTransactionId }),
   }
 }
 
