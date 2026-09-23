@@ -257,6 +257,7 @@ export class X402PaymentService {
         method: 'GET',
         headers: { accept: 'application/json' },
         signal: controller.signal,
+        redirect: 'error',
       })
     } catch (error) {
       throw new ExternalRailError('x402 discovery request failed', error, 'RETRYABLE')

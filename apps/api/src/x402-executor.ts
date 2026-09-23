@@ -85,6 +85,12 @@ interface X402OnChainTransaction {
   }
 }
 
+interface X402OnChainWireTransaction {
+  readonly transaction: readonly [string, 'base64']
+}
+
+type X402OnChainRpcTransaction = X402OnChainTransaction | X402OnChainWireTransaction
+
 interface X402TokenTransfer {
   readonly source: string
   readonly destination: string
@@ -100,7 +106,7 @@ interface X402OnChainRpc {
   ): {
     send(options?: {
       readonly abortSignal?: AbortSignal
-    }): Promise<X402OnChainTransaction | null>
+    }): Promise<X402OnChainRpcTransaction | null>
   }
 }
 
@@ -751,6 +757,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
         method: 'GET',
         headers,
         signal: controller.signal,
+        redirect: 'error',
       })
     } catch (error) {
       throw new ExternalRailError(
@@ -790,6 +797,25 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       status.confirmationStatus === 'finalized'
     ) {
       const rpc = options.rpc as unknown as X402OnChainRpc
+      const wireTransaction = await withRpcTimeout((abortSignal) =>
+        rpc
+          .getTransaction(transactionSignature, {
+            encoding: 'base64',
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+          })
+          .send({ abortSignal }),
+      )
+      if (wireTransaction === null) {
+        return { status: 'PENDING', reason: 'TRANSACTION_UNAVAILABLE' }
+      }
+      const wireMessageHash = hashX402WireTransactionMessage(wireTransaction)
+      if (wireMessageHash === undefined) {
+        return { status: 'INVALID', reason: 'INVALID_TRANSACTION_MESSAGE' }
+      }
+      if (wireMessageHash !== durable.payloadHash) {
+        return { status: 'INVALID', reason: 'TRANSACTION_MESSAGE_MISMATCH' }
+      }
       const transaction = await withRpcTimeout((abortSignal) =>
         rpc
           .getTransaction(transactionSignature, {
@@ -801,6 +827,9 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       )
       if (transaction === null) {
         return { status: 'PENDING', reason: 'TRANSACTION_UNAVAILABLE' }
+      }
+      if (!isX402OnChainParsedTransaction(transaction)) {
+        return { status: 'INVALID', reason: 'INVALID_PARSED_TRANSACTION' }
       }
       const verification = verifyX402SettlementTransaction(transaction, durable)
       if (!verification.valid) {
@@ -1104,6 +1133,53 @@ function readX402AccountKey(
 ): string | undefined {
   if (typeof key === 'string') return key
   return key?.pubkey
+}
+
+function hashX402WireTransactionMessage(
+  response: X402OnChainRpcTransaction,
+): string | undefined {
+  const transaction = (response as { readonly transaction?: unknown }).transaction
+  if (
+    !Array.isArray(transaction) ||
+    transaction.length !== 2 ||
+    typeof transaction[0] !== 'string' ||
+    transaction[1] !== 'base64'
+  ) {
+    return undefined
+  }
+  const encoded = transaction[0]
+  if (
+    encoded.length === 0 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded) ||
+    encoded.length % 4 === 1
+  ) {
+    return undefined
+  }
+  const bytes = Buffer.from(encoded, 'base64')
+  if (
+    bytes.length === 0 ||
+    Buffer.from(bytes).toString('base64').replace(/=+$/u, '') !==
+      encoded.replace(/=+$/u, '')
+  ) {
+    return undefined
+  }
+  try {
+    const decoded = getTransactionDecoder().decode(bytes)
+    return sha256(Uint8Array.from(decoded.messageBytes))
+  } catch {
+    return undefined
+  }
+}
+
+function isX402OnChainParsedTransaction(
+  response: X402OnChainRpcTransaction,
+): response is X402OnChainTransaction {
+  return (
+    typeof response === 'object' &&
+    response !== null &&
+    'meta' in response &&
+    !Array.isArray((response as { readonly transaction?: unknown }).transaction)
+  )
 }
 
 function hasX402Signer(

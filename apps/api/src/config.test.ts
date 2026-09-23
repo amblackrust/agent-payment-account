@@ -159,6 +159,21 @@ describe('configuration', () => {
     expect(config.solanaFeePayerSecret).toBeUndefined()
   })
 
+  it('requires an HTTPS x402 resource URL in production', () => {
+    expect(() =>
+      loadConfig({
+        ...validEnvironment,
+        NODE_ENV: 'production',
+        RUNTIME_ROLE: 'api',
+        RUNTIME_AUTHORITY_ID: 'runtime-api-1',
+        SOLANA_FEE_PAYER_SECRET: undefined,
+        CUSTODY_BACKEND_IDENTITY: 'external-custody',
+        CUSTODY_BACKEND_MODE: 'EXTERNAL',
+        X402_RESOURCE_URL: 'http://provider.example.test/resource',
+      }),
+    ).toThrow(/HTTPS/u)
+  })
+
   it('does not require wallet or recovery keys for read-only worker roles', () => {
     const {
       ADMIN_API_KEY: _adminApiKey,

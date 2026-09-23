@@ -295,6 +295,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     )
   }
 
+  if (
+    result.data.NODE_ENV === 'production' &&
+    new URL(result.data.X402_RESOURCE_URL).protocol !== 'https:'
+  ) {
+    throw new ConfigurationError('Production x402 resource URL must use HTTPS')
+  }
+
   if (result.data.NODE_ENV === 'production' && result.data.RUNTIME_ROLE === undefined) {
     throw new ConfigurationError(
       'Production requires an explicit runtime role in RUNTIME_ROLE',

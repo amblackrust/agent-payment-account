@@ -55,6 +55,7 @@ describe('x402 outgoing executor', () => {
     const fetchImpl = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
       const header = new Headers(init?.headers).get('PAYMENT-SIGNATURE')
       expect(header).toBeTruthy()
+      expect(init?.redirect).toBe('error')
       return new Response(JSON.stringify({ bitcoin: { usd: 100_000 } }), {
         status: 200,
         headers: {
@@ -433,6 +434,62 @@ describe('x402 outgoing executor', () => {
     expect(result.externalId).toBeUndefined()
     expect(result.evidenceMetadataJson).toContain('SETTLEMENT_TRANSACTION_MISMATCH')
   })
+
+  it('does not confirm a transaction whose wire message differs from the durable payload', async () => {
+    const fixture = await createFixture({
+      x402Network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      mint: testMint,
+      useMismatchedWire: true,
+    })
+    const signedTransaction = getTransactionDecoder().decode(
+      fixture.fullySigned.signedPayload,
+    )
+    const transactionId = String(getSignatureFromTransaction(signedTransaction))
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ bitcoin: { usd: 60_000 } }), {
+          status: 200,
+          headers: {
+            [X402_PAYMENT_RESPONSE_HEADER]: encodePaymentResponseHeader({
+              success: true,
+              transaction: transactionId,
+              network: X402_SOLANA_DEVNET_NETWORK,
+              payer: fixture.payer.address,
+            }),
+          },
+        }),
+    )
+    const executor = createX402OutgoingExecutor({
+      rpc: fixture.rpc,
+      rpcUrl: 'https://rpc.example.test',
+      network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      settlementMint: testMint,
+      providerDestination: fixture.recipient.address,
+      signFeePayer: true,
+      platformFeePayerIdentity: fixture.recipient.address,
+      resourceUrl,
+      maxPaymentAtomic: 100_000n,
+      fetchImpl,
+      getPayerPublicKey: async () => fixture.payer.address,
+      getDenomination: async () => null,
+      getSettlementAsset: async () => null,
+      getEconomicMapping: async () => null,
+      getSettlementRoute: async () => null,
+      getActiveKeyVersion: async () => null,
+      signPaymentEffect: async () => fixture.fullySigned,
+    })
+
+    const result = await executor.submit({
+      prepared: fixture.prepared,
+      signed: fixture.fullySigned,
+    })
+
+    expect(result.status).toBe('UNKNOWN')
+    expect(result.externalId).toBeUndefined()
+    expect(result.evidenceMetadataJson).toContain('TRANSACTION_MESSAGE_MISMATCH')
+  })
 })
 
 async function createFixture(
@@ -440,6 +497,7 @@ async function createFixture(
     readonly x402Network: Network
     readonly routeNetwork: string
     readonly mint: string
+    readonly useMismatchedWire?: boolean
   } = {
     x402Network: X402_SOLANA_MAINNET_NETWORK,
     routeNetwork: 'mainnet-beta',
@@ -492,6 +550,33 @@ async function createFixture(
       ),
   )
   const transactionBase64 = getBase64EncodedWireTransaction(compileTransaction(message))
+  const mismatchedMessage = pipe(
+    createTransactionMessage({ version: 0 }),
+    (value) =>
+      setTransactionMessageFeePayerSigner(createNoopSigner(feePayer.address), value),
+    (value) =>
+      setTransactionMessageLifetimeUsingBlockhash(
+        { blockhash: blockhash as never, lastValidBlockHeight: 100n },
+        value,
+      ),
+    (value) =>
+      appendTransactionMessageInstructions(
+        [
+          getTransferCheckedInstruction({
+            source: payerAta[0],
+            mint: input.mint as never,
+            destination: recipientAta[0],
+            authority: createNoopSigner(payer.address),
+            amount: 999n,
+            decimals: 6,
+          }),
+        ],
+        value,
+      ),
+  )
+  const mismatchedTransactionBase64 = getBase64EncodedWireTransaction(
+    compileTransaction(mismatchedMessage),
+  )
   const payloadHash = hashMessage(transactionBase64)
   const requirementHash = hashRequirement({
     scheme: 'exact',
@@ -586,67 +671,80 @@ async function createFixture(
           value: [{ err: null, confirmationStatus: 'confirmed' }],
         }),
       }),
-      getTransaction: () => ({
-        send: async () => ({
-          meta: {
-            err: null,
-            preTokenBalances: [
-              {
-                accountIndex: 2,
-                mint: input.mint,
-                owner: payer.address,
-                uiTokenAmount: { amount: '1000000' },
-              },
-              {
-                accountIndex: 3,
-                mint: input.mint,
-                owner: feePayer.address,
-                uiTokenAmount: { amount: '0' },
-              },
-            ],
-            postTokenBalances: [
-              {
-                accountIndex: 2,
-                mint: input.mint,
-                owner: payer.address,
-                uiTokenAmount: { amount: '999000' },
-              },
-              {
-                accountIndex: 3,
-                mint: input.mint,
-                owner: feePayer.address,
-                uiTokenAmount: { amount: '1000' },
-              },
-            ],
-            innerInstructions: [],
-          },
-          transaction: {
-            message: {
-              accountKeys: [
-                { pubkey: feePayer.address, signer: true },
-                { pubkey: payer.address, signer: true },
-                payerAta[0],
-                recipientAta[0],
-              ],
-              instructions: [
-                {
-                  program: 'spl-token',
-                  programId: TOKEN_PROGRAM_ADDRESS,
-                  parsed: {
-                    type: 'transferChecked',
-                    info: {
-                      source: payerAta[0],
-                      destination: recipientAta[0],
-                      authority: payer.address,
+      getTransaction: (
+        _transactionId: string,
+        config: Readonly<Record<string, unknown>>,
+      ) => ({
+        send: async () =>
+          config.encoding === 'base64'
+            ? {
+                transaction: [
+                  input.useMismatchedWire
+                    ? mismatchedTransactionBase64
+                    : Buffer.from(fullySigned.signedPayload).toString('base64'),
+                  'base64',
+                ] as const,
+              }
+            : {
+                meta: {
+                  err: null,
+                  preTokenBalances: [
+                    {
+                      accountIndex: 2,
                       mint: input.mint,
-                      tokenAmount: { amount: '1000' },
+                      owner: payer.address,
+                      uiTokenAmount: { amount: '1000000' },
                     },
+                    {
+                      accountIndex: 3,
+                      mint: input.mint,
+                      owner: feePayer.address,
+                      uiTokenAmount: { amount: '0' },
+                    },
+                  ],
+                  postTokenBalances: [
+                    {
+                      accountIndex: 2,
+                      mint: input.mint,
+                      owner: payer.address,
+                      uiTokenAmount: { amount: '999000' },
+                    },
+                    {
+                      accountIndex: 3,
+                      mint: input.mint,
+                      owner: feePayer.address,
+                      uiTokenAmount: { amount: '1000' },
+                    },
+                  ],
+                  innerInstructions: [],
+                },
+                transaction: {
+                  message: {
+                    accountKeys: [
+                      { pubkey: feePayer.address, signer: true },
+                      { pubkey: payer.address, signer: true },
+                      payerAta[0],
+                      recipientAta[0],
+                    ],
+                    instructions: [
+                      {
+                        program: 'spl-token',
+                        programId: TOKEN_PROGRAM_ADDRESS,
+                        parsed: {
+                          type: 'transferChecked',
+                          info: {
+                            source: payerAta[0],
+                            destination: recipientAta[0],
+                            authority: payer.address,
+                            mint: input.mint,
+                            tokenAmount: { amount: '1000' },
+                          },
+                        },
+                      },
+                    ],
                   },
                 },
-              ],
-            },
-          },
-        }),
+              },
       }),
     } as unknown as SolanaRpc,
     prepared,

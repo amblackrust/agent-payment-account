@@ -239,6 +239,10 @@ describe('x402 payment service', () => {
       'req_1',
       undefined,
     )
+    expect(harnessValue.fetchImpl).toHaveBeenCalledWith(
+      X402_RESOURCE_URL,
+      expect.objectContaining({ redirect: 'error' }),
+    )
   })
 
   it('replays an existing x402 idempotency resource without rediscovery or a second payment', async () => {
