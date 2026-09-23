@@ -27,6 +27,11 @@ const runId = randomBytes(8).toString('hex')
 const accountName = `devnet-x402-${runId}`
 const accountIdempotencyKey = `devnet-x402-account-${runId}`
 const paymentIdempotencyKey = `devnet-x402-payment-${runId}`
+const deniedPaymentIdempotencyKey = `devnet-x402-denied-${runId}`
+const lowBalanceAccountIdempotencyKey = `devnet-x402-low-balance-account-${runId}`
+const lowBalancePaymentIdempotencyKey = `devnet-x402-low-balance-payment-${runId}`
+const lostResponsePaymentIdempotencyKey = `devnet-x402-lost-response-${runId}`
+const delegatedCredentialIdempotencyKey = `devnet-x402-delegated-credential-${runId}`
 const resourceUrl = `http://127.0.0.1:${fakePort}/api/crypto/price?ids=bitcoin`
 
 const DENOMINATION_ID = 'devnet_x402_usd'
@@ -70,7 +75,10 @@ interface DevnetX402Tools {
     readonly solTargetLamports: bigint
   }) => Promise<{
     readonly platformFeePayer: { readonly address: string }
-    readonly fakeService: { readonly destination: string }
+    readonly fakeService: {
+      readonly destination: string
+      readonly tokenAccount: string
+    }
     readonly settlementAsset: { readonly mint: string }
     readonly agentAccount?: { readonly tokenAccount?: string }
   }>
@@ -104,7 +112,7 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       homeDirectory: path.join(repositoryRoot, '.local', 'devnet-x402'),
       rpcUrl: devnetRpcUrl,
       tokenTargetAtomic: 10_000_000n,
-      solTargetLamports: 1_000_000_000n,
+      solTargetLamports: 100_000_000n,
     })
     const paths = devnetTools.resolveDevnetX402Paths(
       path.join(repositoryRoot, '.local', 'devnet-x402'),
@@ -164,6 +172,7 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       let accountId: string
       let accountOwner: string
       let apiKey: string
+      let accountCredentialId: string
       if (initialProvisioning.status === 201) {
         throw new Error(
           'Fresh devnet x402 account unexpectedly provisioned before its token account was created',
@@ -188,7 +197,7 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
         rpcUrl: devnetRpcUrl,
         agentAddress: accountOwner,
         tokenTargetAtomic: 10_000_000n,
-        solTargetLamports: 1_000_000_000n,
+        solTargetLamports: 100_000_000n,
       })
       if (funded.agentAccount?.tokenAccount === undefined) {
         throw new Error(
@@ -211,6 +220,10 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
         'completed account response',
       )
       apiKey = requireString(accountResponse.api_key, 'agent API key')
+      accountCredentialId = requireString(
+        accountResponse.credential_id,
+        'initial credential id',
+      )
       expect(requireString(accountResponse.id, 'completed account id')).toBe(accountId)
       expect(requireString(accountResponse.status, 'account status')).toBe('ACTIVE')
 
@@ -293,6 +306,73 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       expect(fundingBody.readiness).toBe('READY')
       expect(fundingBody.network).toBe('devnet')
       expect(fundingBody.destination).toBe(funded.agentAccount?.tokenAccount)
+      const agentTokenAccount = requireString(
+        funded.agentAccount?.tokenAccount,
+        'devnet Agent Account token account',
+      )
+      const providerTokenAccount = requireString(
+        funded.fakeService.tokenAccount,
+        'fake service token account',
+      )
+      const initialAgentTokenBalance = await readTokenAccountBalance(
+        devnetRpcUrl,
+        agentTokenAccount,
+      )
+      const initialProviderTokenBalance = await readTokenAccountBalance(
+        devnetRpcUrl,
+        providerTokenAccount,
+      )
+
+      const deniedPolicy = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/policy`,
+        {
+          method: 'PUT',
+          headers: adminHeaders(adminApiKey),
+          body: JSON.stringify({
+            denomination_id: DENOMINATION_ID,
+            max_per_payment: '0.0005',
+            rolling_budget: '1',
+            rolling_window_seconds: 3_600,
+            transaction_count_cap: 10,
+          }),
+        },
+      )
+      expect(deniedPolicy.status).toBe(200)
+      const denied = await requestJson(`${apiBaseUrl()}/v2/external-payments/x402`, {
+        method: 'POST',
+        headers: {
+          ...agentHeaders(apiKey),
+          'idempotency-key': deniedPaymentIdempotencyKey,
+        },
+        body: JSON.stringify({ denomination_id: DENOMINATION_ID }),
+      })
+      expect(denied.status).toBe(403)
+      const deniedBody = asRecord(denied.body, 'denied payment response')
+      expect(deniedBody.code).toBe('POLICY_DENIED')
+      const deniedPaymentId = requireString(deniedBody.payment_id, 'denied payment id')
+      const deniedView = await database.v2.findPaymentView(accountId, deniedPaymentId)
+      expect(deniedView?.payment.status).toBe('REJECTED_BY_POLICY')
+      expect(deniedView?.policyDecision).toBe('DENY')
+      expect(deniedView?.attempts).toHaveLength(0)
+      expect(
+        await database.v2.findV2Idempotency(accountId, deniedPaymentIdempotencyKey),
+      ).not.toBeNull()
+
+      const restoredPolicy = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/policy`,
+        {
+          method: 'PUT',
+          headers: adminHeaders(adminApiKey),
+          body: JSON.stringify({
+            denomination_id: DENOMINATION_ID,
+            max_per_payment: '0.01',
+            rolling_budget: '1',
+            rolling_window_seconds: 3_600,
+            transaction_count_cap: 10,
+          }),
+        },
+      )
+      expect(restoredPolicy.status).toBe(200)
 
       const discovery = await fetch(`${fakeBaseUrl()}/api/crypto/price?ids=bitcoin`)
       expect(discovery.status).toBe(402)
@@ -336,6 +416,12 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       expect(confirmed.outcome_state).toBe('CONFIRMED')
       expect(confirmed.route_id).toBe(SETTLEMENT_ROUTE_ID)
       expect(confirmed.settlement_asset_id).toBe(SETTLEMENT_ASSET_ID)
+      expect(await readTokenAccountBalance(devnetRpcUrl, agentTokenAccount)).toBe(
+        initialAgentTokenBalance - 1_000n,
+      )
+      expect(await readTokenAccountBalance(devnetRpcUrl, providerTokenAccount)).toBe(
+        initialProviderTokenBalance + 1_000n,
+      )
 
       const view = await database.v2.findPaymentView(accountId, paymentId)
       if (view === null) throw new Error('Confirmed payment view is unavailable')
@@ -410,6 +496,133 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       const afterDuplicate = await database.v2.findPaymentView(accountId, paymentId)
       expect(afterDuplicate?.attempts).toHaveLength(1)
 
+      const lowBalanceAccountName = `devnet-x402-low-balance-${runId}`
+      const lowBalanceProvisioning = await requestJson(`${apiBaseUrl()}/v2/accounts`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-api-key': adminApiKey,
+          'idempotency-key': lowBalanceAccountIdempotencyKey,
+        },
+        body: JSON.stringify({ name: lowBalanceAccountName }),
+      })
+      expect(lowBalanceProvisioning.status).not.toBe(201)
+      const lowBalanceRequestHash = sha256(
+        JSON.stringify({ name: lowBalanceAccountName }),
+      )
+      const lowBalanceReplay = await database.v2Admin.findProvisioningReplay({
+        idempotencyKey: lowBalanceAccountIdempotencyKey,
+        requestHash: lowBalanceRequestHash,
+      })
+      if (lowBalanceReplay === null) {
+        throw new Error(
+          `Low-balance account provisioning did not persist a replay record (HTTP ${lowBalanceProvisioning.status})`,
+        )
+      }
+      const lowBalanceAccount = await database.v2Admin.findAccount(
+        lowBalanceReplay.accountId,
+      )
+      if (
+        lowBalanceAccount === null ||
+        lowBalanceAccount.status !== 'PROVISIONING_FAILED'
+      ) {
+        throw new Error('Low-balance account did not enter PROVISIONING_FAILED')
+      }
+      const lowBalanceSetup = await devnetTools.setupDevnetX402({
+        homeDirectory: path.join(repositoryRoot, '.local', 'devnet-x402'),
+        rpcUrl: devnetRpcUrl,
+        agentAddress: lowBalanceAccount.solanaPublicKey,
+        tokenTargetAtomic: 500n,
+        solTargetLamports: 100_000_000n,
+      })
+      expect(lowBalanceSetup.agentAccount?.tokenAccount).toBeTruthy()
+      const lowBalanceCompleted = await requestJson(`${apiBaseUrl()}/v2/accounts`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-api-key': adminApiKey,
+          'idempotency-key': lowBalanceAccountIdempotencyKey,
+        },
+        body: JSON.stringify({ name: lowBalanceAccountName }),
+      })
+      expect(lowBalanceCompleted.status).toBe(201)
+      const lowBalanceResponse = asRecord(
+        lowBalanceCompleted.body,
+        'low-balance account response',
+      )
+      const lowBalanceApiKey = requireString(
+        lowBalanceResponse.api_key,
+        'low-balance agent API key',
+      )
+      const lowBalanceAccountId = requireString(
+        lowBalanceResponse.id,
+        'low-balance account id',
+      )
+      const lowBalanceRecipient = await requestJson(`${apiBaseUrl()}/v2/recipients`, {
+        method: 'POST',
+        headers: agentHeaders(lowBalanceApiKey),
+        body: JSON.stringify({
+          display_name: 'Low-balance fake x402 service',
+          type: 'SOLANA_SPL',
+          destination: {
+            type: 'SOLANA_SPL',
+            wallet_address: funded.fakeService.destination,
+          },
+        }),
+      })
+      expect(lowBalanceRecipient.status).toBe(201)
+      const lowBalanceApproved = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${lowBalanceAccountId}/approved-destinations`,
+        {
+          method: 'POST',
+          headers: adminHeaders(adminApiKey),
+          body: JSON.stringify({
+            fingerprint,
+            rail: 'SOLANA_SPL',
+            network: 'devnet',
+            asset_reference: funded.settlementAsset.mint,
+            destination: funded.fakeService.destination,
+          }),
+        },
+      )
+      expect(lowBalanceApproved.status).toBe(201)
+      const lowBalancePolicy = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${lowBalanceAccountId}/policy`,
+        {
+          method: 'PUT',
+          headers: adminHeaders(adminApiKey),
+          body: JSON.stringify({
+            denomination_id: DENOMINATION_ID,
+            max_per_payment: '0.01',
+            rolling_budget: '1',
+            rolling_window_seconds: 3_600,
+            transaction_count_cap: 10,
+          }),
+        },
+      )
+      expect(lowBalancePolicy.status).toBe(200)
+      const insufficient = await requestJson(
+        `${apiBaseUrl()}/v2/external-payments/x402`,
+        {
+          method: 'POST',
+          headers: {
+            ...agentHeaders(lowBalanceApiKey),
+            'idempotency-key': lowBalancePaymentIdempotencyKey,
+          },
+          body: JSON.stringify({ denomination_id: DENOMINATION_ID }),
+        },
+      )
+      expect(insufficient.status).toBe(409)
+      expect(asRecord(insufficient.body, 'insufficient balance response').code).toBe(
+        'INSUFFICIENT_FUNDS',
+      )
+      expect(
+        await database.v2.findV2Idempotency(
+          lowBalanceAccountId,
+          lowBalancePaymentIdempotencyKey,
+        ),
+      ).toBeNull()
+
       await stopProcess(apiProcess)
       apiProcess = startProcess(
         ['--filter', '@agent-payment/api', 'exec', 'tsx', 'src/server.ts'],
@@ -448,6 +661,160 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       expect(asRecord(afterRestart.body, 'payment after restart').status).toBe(
         'CONFIRMED',
       )
+
+      await stopProcess(fakeProcess)
+      fakeProcess = startProcess(
+        ['--filter', '@agent-payment/fake-x402', 'exec', 'tsx', 'server.ts'],
+        {
+          FAKE_X402_PORT: String(fakePort),
+          FAKE_X402_RPC_URL: devnetRpcUrl,
+          FAKE_X402_TEST_USDC_MINT: funded.settlementAsset.mint,
+          FAKE_X402_DESTINATION: funded.fakeService.destination,
+          FAKE_X402_FEE_PAYER: funded.platformFeePayer.address,
+          FAKE_X402_RESOURCE_URL: resourceUrl,
+          FAKE_X402_DROP_RESPONSE_AFTER_SETTLEMENT: 'true',
+        },
+      )
+      await waitForHttp(`${fakeBaseUrl()}/healthz`, fakeProcess, 30_000)
+      const lostResponseRequest = await requestJson(
+        `${apiBaseUrl()}/v2/external-payments/x402`,
+        {
+          method: 'POST',
+          headers: {
+            ...agentHeaders(apiKey),
+            'idempotency-key': lostResponsePaymentIdempotencyKey,
+          },
+          body: JSON.stringify({ denomination_id: DENOMINATION_ID }),
+        },
+      )
+      expect([200, 201]).toContain(lostResponseRequest.status)
+      const lostResponsePayment = asRecord(
+        lostResponseRequest.body,
+        'lost-response payment',
+      )
+      const lostResponsePaymentId = requireString(
+        lostResponsePayment.id,
+        'lost-response payment id',
+      )
+      let recoveredLostResponse: HttpResult | undefined
+      await waitForCondition(
+        async () => {
+          const result = await requestJson(
+            `${apiBaseUrl()}/v2/payments/${lostResponsePaymentId}`,
+            { method: 'GET', headers: agentHeaders(apiKey) },
+          )
+          if (result.status !== 200) return false
+          recoveredLostResponse = result
+          return (
+            asRecord(result.body, 'lost-response payment poll').status === 'CONFIRMED'
+          )
+        },
+        120_000,
+        'x402 lost-response reconciliation',
+      )
+      expect(
+        asRecord(recoveredLostResponse?.body, 'recovered lost-response payment').status,
+      ).toBe('CONFIRMED')
+      const lostResponseView = await database.v2.findPaymentView(
+        accountId,
+        lostResponsePaymentId,
+      )
+      expect(lostResponseView?.attempts).toHaveLength(1)
+      expect(lostResponseView?.attempts[0]?.externalId).toBeTruthy()
+      expect(await readTokenAccountBalance(devnetRpcUrl, agentTokenAccount)).toBe(
+        initialAgentTokenBalance - 2_000n,
+      )
+      expect(await readTokenAccountBalance(devnetRpcUrl, providerTokenAccount)).toBe(
+        initialProviderTokenBalance + 2_000n,
+      )
+      await stopProcess(fakeProcess)
+
+      const credentialRevocation = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/credentials/${accountCredentialId}/revoke`,
+        {
+          method: 'POST',
+          headers: adminHeaders(adminApiKey),
+        },
+      )
+      expect(credentialRevocation.status).toBe(200)
+      const revokedCredentialPayment = await requestJson(
+        `${apiBaseUrl()}/v2/external-payments/x402`,
+        {
+          method: 'POST',
+          headers: {
+            ...agentHeaders(apiKey),
+            'idempotency-key': `devnet-x402-revoked-${runId}`,
+          },
+          body: JSON.stringify({ denomination_id: DENOMINATION_ID }),
+        },
+      )
+      expect(revokedCredentialPayment.status).toBe(401)
+      expect(
+        await database.v2.findV2Idempotency(accountId, `devnet-x402-revoked-${runId}`),
+      ).toBeNull()
+
+      const delegatedCredential = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/credentials`,
+        {
+          method: 'POST',
+          headers: {
+            ...adminHeaders(adminApiKey),
+            'idempotency-key': delegatedCredentialIdempotencyKey,
+          },
+          body: JSON.stringify({
+            scopes: [
+              'payments:create',
+              'payments:read',
+              'balance:read',
+              'history:read',
+            ],
+          }),
+        },
+      )
+      expect(delegatedCredential.status).toBe(201)
+      const delegatedCredentialBody = asRecord(
+        delegatedCredential.body,
+        'delegated credential response',
+      )
+      const delegatedApiKey = requireString(
+        delegatedCredentialBody.api_key,
+        'delegated API key',
+      )
+      const accountBeforeDisable = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}`,
+        { method: 'GET', headers: agentHeaders(delegatedApiKey) },
+      )
+      expect(accountBeforeDisable.status).toBe(200)
+      const accountBeforeDisableBody = asRecord(
+        accountBeforeDisable.body,
+        'account before disable',
+      )
+      const disable = await requestJson(
+        `${apiBaseUrl()}/v2/accounts/${accountId}/lifecycle`,
+        {
+          method: 'POST',
+          headers: adminHeaders(adminApiKey),
+          body: JSON.stringify({
+            current_status: 'ACTIVE',
+            next_status: 'DISABLED',
+            row_version: accountBeforeDisableBody.row_version,
+            reason: 'devnet x402 negative-path verification',
+          }),
+        },
+      )
+      expect(disable.status).toBe(200)
+      const disabledCredentialPayment = await requestJson(
+        `${apiBaseUrl()}/v2/external-payments/x402`,
+        {
+          method: 'POST',
+          headers: {
+            ...agentHeaders(delegatedApiKey),
+            'idempotency-key': `devnet-x402-disabled-${runId}`,
+          },
+          body: JSON.stringify({ denomination_id: DENOMINATION_ID }),
+        },
+      )
+      expect(disabledCredentialPayment.status).toBe(401)
 
       state = {
         database,
@@ -752,4 +1119,23 @@ async function readRpc(
   const object = asRecord(payload, 'Solana RPC response')
   if (object.error !== undefined) throw new Error(`Solana RPC ${method} failed`)
   return object.result
+}
+
+async function readTokenAccountBalance(
+  rpcUrl: string,
+  tokenAccountAddress: string,
+): Promise<bigint> {
+  const result = asRecord(
+    await readRpc(rpcUrl, 'getTokenAccountBalance', [
+      tokenAccountAddress,
+      { commitment: 'confirmed' },
+    ]),
+    'token account balance result',
+  )
+  const value = asRecord(result.value, 'token account balance value')
+  const amount = requireString(value.amount, 'token account balance amount')
+  if (!/^\d+$/u.test(amount)) {
+    throw new Error('token account balance amount must be a non-negative integer')
+  }
+  return BigInt(amount)
 }

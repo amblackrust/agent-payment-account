@@ -1,4 +1,5 @@
 import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
+import { DEVNET_GENESIS_HASH } from './config.js'
 
 export interface FakeX402SignatureStatus {
   readonly err: unknown
@@ -48,6 +49,7 @@ interface RpcMethod<T> {
 }
 
 export interface FakeX402Rpc {
+  getGenesisHash(): RpcMethod<string>
   getSignatureStatuses(
     signatures: readonly string[],
     config: { readonly searchTransactionHistory: boolean },
@@ -64,4 +66,20 @@ export interface FakeX402Rpc {
 
 export function createDevnetRpc(rpcUrl: string): FakeX402Rpc {
   return createSolanaRpc(rpcUrl as ClusterUrl) as unknown as FakeX402Rpc
+}
+
+export async function assertDevnetRpc(
+  rpc: Pick<FakeX402Rpc, 'getGenesisHash'>,
+): Promise<void> {
+  let genesisHash: string
+  try {
+    genesisHash = await rpc.getGenesisHash().send()
+  } catch (error) {
+    throw new Error('The fake x402 service could not verify the Solana devnet RPC', {
+      cause: error,
+    })
+  }
+  if (genesisHash !== DEVNET_GENESIS_HASH) {
+    throw new Error('The fake x402 service requires the Solana devnet genesis hash')
+  }
 }

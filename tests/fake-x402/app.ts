@@ -25,6 +25,7 @@ export interface FakeX402AppOptions {
 
 export function createFakeX402App(options: FakeX402AppOptions): FastifyInstance {
   const verifier = createFakeX402PaymentVerifier(options)
+  let settlementResponseDropped = false
   const app = Fastify({
     logger:
       options.logger === true
@@ -73,6 +74,12 @@ export function createFakeX402App(options: FakeX402AppOptions): FastifyInstance 
 
       try {
         const verified = await verifier.verify(paymentSignature)
+        if (options.config.dropResponseAfterSettlement && !settlementResponseDropped) {
+          settlementResponseDropped = true
+          reply.hijack()
+          request.raw.destroy()
+          return
+        }
         const settlement: SettleResponse = {
           success: true,
           transaction: verified.transactionSignature,

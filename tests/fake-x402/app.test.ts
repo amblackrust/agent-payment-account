@@ -23,7 +23,7 @@ import {
 import type { PaymentPayload } from '@x402/core/types'
 import { describe, expect, it } from 'vitest'
 import { createFakeX402App } from './app.js'
-import { DEVNET_NETWORK, type FakeX402Config } from './config.js'
+import { DEVNET_GENESIS_HASH, DEVNET_NETWORK, type FakeX402Config } from './config.js'
 import type { FakeX402Rpc, FakeX402RpcTransaction } from './rpc.js'
 
 const resourceUrl = 'http://fake-x402.test/api/crypto/price?ids=bitcoin'
@@ -167,6 +167,7 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
     amountAtomic: 1000n,
     tokenDecimals: 6,
     maxTimeoutSeconds: 300,
+    dropResponseAfterSettlement: false,
     resourceUrl,
   }
   const transaction: FakeX402RpcTransaction = {
@@ -231,6 +232,7 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
     },
   }
   const rpc: FakeX402Rpc = {
+    getGenesisHash: () => ({ send: async () => DEVNET_GENESIS_HASH }),
     getSignatureStatuses: () => ({
       send: async () => ({
         value: [{ err: null, confirmationStatus: 'confirmed' }],

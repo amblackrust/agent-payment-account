@@ -6,9 +6,11 @@ export const MAINNET_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 export const DEFAULT_HOST = '127.0.0.1'
 export const DEFAULT_PORT = 4542
 export const DEFAULT_RPC_URL = 'https://api.devnet.solana.com'
+export const DEVNET_GENESIS_HASH = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG'
 export const DEFAULT_AMOUNT_ATOMIC = 1_000n
 export const DEFAULT_TOKEN_DECIMALS = 6
 export const DEFAULT_MAX_TIMEOUT_SECONDS = 300
+export const DEFAULT_DROP_RESPONSE_AFTER_SETTLEMENT = false
 export const RESOURCE_PATH = '/api/crypto/price?ids=bitcoin'
 
 export interface FakeX402Config {
@@ -22,6 +24,7 @@ export interface FakeX402Config {
   readonly amountAtomic: bigint
   readonly tokenDecimals: number
   readonly maxTimeoutSeconds: number
+  readonly dropResponseAfterSettlement: boolean
   readonly resourceUrl: string
 }
 
@@ -81,6 +84,11 @@ export function loadFakeX402Config(
     1,
     3_600,
   )
+  const dropResponseAfterSettlement = parseBoolean(
+    environment.FAKE_X402_DROP_RESPONSE_AFTER_SETTLEMENT,
+    DEFAULT_DROP_RESPONSE_AFTER_SETTLEMENT,
+    'FAKE_X402_DROP_RESPONSE_AFTER_SETTLEMENT',
+  )
   const resourceUrl =
     environment.FAKE_X402_RESOURCE_URL?.trim() ||
     `http://${host}:${port}${RESOURCE_PATH}`
@@ -97,6 +105,7 @@ export function loadFakeX402Config(
     amountAtomic,
     tokenDecimals,
     maxTimeoutSeconds,
+    dropResponseAfterSettlement,
     resourceUrl,
   }
 }
@@ -149,12 +158,28 @@ function parsePositiveBigInt(
   return BigInt(candidate)
 }
 
+function parseBoolean(
+  value: string | undefined,
+  fallback: boolean,
+  name: string,
+): boolean {
+  if (value === undefined || value.trim() === '') return fallback
+  if (value === 'true') return true
+  if (value === 'false') return false
+  throw new Error(`${name} must be true or false`)
+}
+
 function assertDevnetRpcUrl(rpcUrl: string): void {
   let parsed: URL
   try {
     parsed = new URL(rpcUrl)
   } catch {
     throw new Error('FAKE_X402_RPC_URL must be an absolute URL')
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(
+      'FAKE_X402_RPC_URL must use HTTPS; the fake x402 service only targets public devnet RPC',
+    )
   }
   if (
     /mainnet|testnet|localhost|127\.0\.0\.1|0\.0\.0\.0/iu.test(parsed.hostname) ||
