@@ -327,6 +327,11 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     if (payerOwner === recipientOwner) {
       throw deterministicError('x402 payTo must differ from the Agent Account signer')
     }
+    if (requirement.extra.feePayer === payerOwner) {
+      throw deterministicError(
+        'x402 fee payer must differ from the Agent Account signer',
+      )
+    }
     if (signFeePayer && platformFeePayerIdentity === payerOwner) {
       throw deterministicError(
         'x402 platform fee payer must differ from the Agent Account signer',

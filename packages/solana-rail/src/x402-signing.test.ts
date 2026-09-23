@@ -174,6 +174,43 @@ describe('Solana x402 signing boundary', () => {
       }),
     ).rejects.toThrow(/does not match/i)
   })
+
+  it('rejects using the Agent Account signer as the x402 fee payer', async () => {
+    const payer = await generateKeyPairSigner(true)
+    const payerSecret = await exportSecret(payer)
+    const prepared: SolanaX402PreparedPayload = {
+      version: 1,
+      protocol: 'x402-v2',
+      payerOwner: payer.address,
+      recipientOwner: '11111111111111111111111111111112',
+      payerAta: '11111111111111111111111111111113',
+      recipientAta: '11111111111111111111111111111114',
+      settlementMint: mint,
+      tokenAmount: '1',
+      feePayerIdentity: payer.address,
+      transactionBase64: 'AQ==',
+      payloadHash: 'c'.repeat(64),
+      requirementHash: 'd'.repeat(64),
+      paymentPayloadJson: '{}',
+    }
+
+    await expect(
+      signSolanaX402PreparedEffect({
+        request: {
+          effectHash: 'e'.repeat(64),
+          keyVersion: 1,
+          network: 'mainnet-beta',
+          assetReference: mint,
+          destination: prepared.recipientOwner,
+          amountAtomic: 1n,
+          feePayerIdentity: payer.address,
+          preparedPayload: JSON.stringify(prepared),
+        },
+        payerSecret,
+      }),
+    ).rejects.toThrow(/fee payer must be different/i)
+    payerSecret.fill(0)
+  })
 })
 
 async function exportSecret(signer: {

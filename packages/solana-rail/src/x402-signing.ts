@@ -96,6 +96,13 @@ export async function signSolanaX402PreparedEffect(input: {
         'DETERMINISTIC',
       )
     }
+    if (payerSigner.address === payload.feePayerIdentity) {
+      throw new ExternalRailError(
+        'Agent Account signer and x402 fee payer must be different identities',
+        undefined,
+        'DETERMINISTIC',
+      )
+    }
     const feePayerKeyPair =
       feePayerSecretBytes === undefined
         ? undefined
