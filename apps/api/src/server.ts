@@ -182,20 +182,20 @@ async function startServer(): Promise<void> {
     routeCapabilityProvider,
     maxPageSize: limits.maxPageSize,
   })
-  const x402PaymentService = new X402PaymentService({
-    paymentService: v2PaymentService,
-    repository: database.v2,
-    resourceUrl: config.x402ResourceUrl ?? DEFAULT_X402_RESOURCE_URL,
-    settlementMint: config.solanaSettlementMint,
-    ...(x402Network === undefined
-      ? {}
-      : {
+  const x402PaymentService =
+    x402Network === undefined
+      ? undefined
+      : new X402PaymentService({
+          paymentService: v2PaymentService,
+          repository: database.v2,
+          resourceUrl: config.x402ResourceUrl ?? DEFAULT_X402_RESOURCE_URL,
+          settlementMint: config.solanaSettlementMint,
           network: x402Network,
           routeNetwork: config.solanaCluster,
-        }),
-    maxPaymentAtomic: config.x402MaxPaymentAtomic ?? DEFAULT_X402_MAX_PAYMENT_ATOMIC,
-    httpTimeoutMs: config.x402HttpTimeoutMs ?? DEFAULT_X402_HTTP_TIMEOUT_MS,
-  })
+          maxPaymentAtomic:
+            config.x402MaxPaymentAtomic ?? DEFAULT_X402_MAX_PAYMENT_ATOMIC,
+          httpTimeoutMs: config.x402HttpTimeoutMs ?? DEFAULT_X402_HTTP_TIMEOUT_MS,
+        })
   const v2ManagementService = new V2ManagementService({
     repository: database.v2Admin,
     financialRepository: database.v2,
@@ -245,7 +245,7 @@ async function startServer(): Promise<void> {
     v2ReceiveService,
     transactionService,
     v2PaymentService,
-    x402PaymentService,
+    ...(x402PaymentService === undefined ? {} : { x402PaymentService }),
     v2ManagementService,
     v2OperationsService,
     v2AdminRepository: database.v2Admin,

@@ -51,6 +51,69 @@ const DEFAULT_RPC_TIMEOUT_MS = 5_000
 const MAX_RESPONSE_BODY_BYTES = 8 * 1024
 const SOLANA_SPL_RAIL = 'SOLANA_SPL'
 
+interface X402OnChainTokenBalance {
+  readonly accountIndex: number
+  readonly mint: string
+  readonly owner?: string
+  readonly uiTokenAmount: { readonly amount: string }
+}
+
+interface X402OnChainInstruction {
+  readonly program?: string
+  readonly programId?: string
+  readonly parsed?: unknown
+}
+
+interface X402OnChainTransaction {
+  readonly meta: {
+    readonly err: unknown
+    readonly preTokenBalances?: readonly X402OnChainTokenBalance[]
+    readonly postTokenBalances?: readonly X402OnChainTokenBalance[]
+    readonly innerInstructions?:
+      | readonly {
+          readonly instructions: readonly X402OnChainInstruction[]
+        }[]
+      | null
+  } | null
+  readonly transaction: {
+    readonly message: {
+      readonly accountKeys?: readonly (
+        string | { readonly pubkey: string; readonly signer?: boolean }
+      )[]
+      readonly instructions?: readonly X402OnChainInstruction[]
+    }
+  }
+}
+
+interface X402TokenTransfer {
+  readonly source: string
+  readonly destination: string
+  readonly authority: string
+  readonly amount: string
+  readonly mint?: string
+}
+
+interface X402OnChainRpc {
+  getTransaction(
+    transactionId: string,
+    config: Readonly<Record<string, unknown>>,
+  ): {
+    send(options?: {
+      readonly abortSignal?: AbortSignal
+    }): Promise<X402OnChainTransaction | null>
+  }
+}
+
+type X402OnChainObservation =
+  | { readonly status: 'CONFIRMED'; readonly verification: 'EFFECT_VERIFIED' }
+  | {
+      readonly status: 'PENDING'
+      readonly reason?: 'TRANSACTION_UNAVAILABLE' | 'CONFIRMATION_PENDING'
+    }
+  | { readonly status: 'FAILED' }
+  | { readonly status: 'NOT_FOUND' }
+  | { readonly status: 'INVALID'; readonly reason: string }
+
 export interface X402OutgoingExecutorOptions {
   readonly rpc: SolanaRpc
   readonly rpcUrl: string
@@ -363,7 +426,37 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
   }): Promise<Awaited<ReturnType<NonNullable<V2OutgoingExecutor['reconcile']>>>> {
     assertCompatibleX402SolanaAdapterConfig(adapterConfig)
     const prepared = restorePreparedEffect(input.attempt)
-    if (prepared === undefined || input.signedPayload === undefined) {
+    if (prepared === undefined) {
+      return { status: 'UNKNOWN' }
+    }
+    const durable = parseSolanaX402PreparedPayload(prepared.preparedPayload)
+    if (input.attempt.externalId !== null && input.attempt.externalId !== undefined) {
+      const observed = await observeSettlementOnChain(input.attempt.externalId, durable)
+      if (observed.status === 'CONFIRMED') {
+        return {
+          status: 'CONFIRMED',
+          externalId: input.attempt.externalId,
+          evidenceMetadataJson: serializeProtocolMetadata({
+            protocol: X402_PROTOCOL,
+            resource_url: options.resourceUrl,
+            on_chain: observed,
+            recovery: 'PERSISTED_SETTLEMENT_SIGNATURE',
+          }),
+        }
+      }
+      return {
+        status: 'UNKNOWN',
+        externalId: input.attempt.externalId,
+        evidenceMetadataJson: serializeProtocolMetadata({
+          protocol: X402_PROTOCOL,
+          resource_url: options.resourceUrl,
+          on_chain: observed,
+          recovery: 'PERSISTED_SETTLEMENT_SIGNATURE',
+        }),
+      }
+    }
+
+    if (input.signedPayload === undefined) {
       return { status: 'UNKNOWN' }
     }
     if (
@@ -374,16 +467,23 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
         'Durable x402 signed payload hash does not match the attempt',
       )
     }
-    const durable = parseSolanaX402PreparedPayload(prepared.preparedPayload)
     validateSignedTransaction(input.signedPayload, durable, signFeePayer)
     const signedTransactionId = signFeePayer
       ? readFullySignedTransactionSignature(input.signedPayload, durable)
       : undefined
-    if (
-      signedTransactionId !== undefined &&
-      signedTransactionId !== input.attempt.expectedExternalId
-    ) {
-      const observed = await observeSettlementOnChain(signedTransactionId)
+
+    if (signFeePayer) {
+      if (signedTransactionId === undefined) {
+        return {
+          status: 'UNKNOWN',
+          evidenceMetadataJson: serializeProtocolMetadata({
+            protocol: X402_PROTOCOL,
+            resource_url: options.resourceUrl,
+            recovery: 'FULL_SIGNED_PAYLOAD_SIGNATURE_UNAVAILABLE',
+          }),
+        }
+      }
+      const observed = await observeSettlementOnChain(signedTransactionId, durable)
       if (observed.status === 'CONFIRMED') {
         return {
           status: 'CONFIRMED',
@@ -396,7 +496,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
           }),
         }
       }
-      if (observed.status === 'PENDING' || observed.status === 'FAILED') {
+      if (observed.status !== 'NOT_FOUND') {
         return {
           status: 'UNKNOWN',
           externalId: signedTransactionId,
@@ -408,32 +508,21 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
           }),
         }
       }
-    }
-    if (input.attempt.expectedExternalId !== null) {
-      const observed = await observeSettlementOnChain(input.attempt.expectedExternalId)
-      if (observed.status === 'CONFIRMED') {
-        return {
-          status: 'CONFIRMED',
-          externalId: input.attempt.expectedExternalId,
-          evidenceMetadataJson: serializeProtocolMetadata({
-            protocol: X402_PROTOCOL,
-            resource_url: options.resourceUrl,
-            on_chain: observed,
-          }),
-        }
-      }
-      if (observed.status === 'PENDING' || observed.status === 'FAILED') {
-        return {
-          status: 'UNKNOWN',
-          externalId: input.attempt.expectedExternalId,
-          evidenceMetadataJson: serializeProtocolMetadata({
-            protocol: X402_PROTOCOL,
-            resource_url: options.resourceUrl,
-            on_chain: observed,
-          }),
-        }
+    } else {
+      return {
+        status: 'UNKNOWN',
+        evidenceMetadataJson: serializeProtocolMetadata({
+          protocol: X402_PROTOCOL,
+          resource_url: options.resourceUrl,
+          recovery: 'PARTIAL_PAYLOAD_WITHOUT_SETTLEMENT_SIGNATURE',
+          on_chain: {
+            status: 'UNKNOWN',
+            reason: 'NO_SETTLEMENT_SIGNATURE',
+          },
+        }),
       }
     }
+
     const result = await sendPaidRequest(prepared, input.signedPayload)
     if (result.status === 'CONFIRMED') {
       return {
@@ -558,6 +647,29 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     } catch {
       return { status: 'UNKNOWN', evidenceMetadataJson: evidence }
     }
+    if (signFeePayer) {
+      const signedTransactionId = readFullySignedTransactionSignature(
+        signedPayload,
+        durable,
+      )
+      if (
+        signedTransactionId === undefined ||
+        parsed.settlement.transaction !== signedTransactionId
+      ) {
+        return {
+          status: 'UNKNOWN',
+          externalId: parsed.settlement.transaction,
+          evidenceMetadataJson: serializeProtocolMetadata({
+            protocol: X402_PROTOCOL,
+            resource_url: options.resourceUrl,
+            http_status: parsed.status,
+            response_body: parsed.body,
+            settlement: parsed.settlement,
+            protocol_error: 'SETTLEMENT_TRANSACTION_MISMATCH',
+          }),
+        }
+      }
+    }
     if (parsed.settlement.payer !== durable.payerOwner) {
       return {
         status: 'UNKNOWN',
@@ -573,7 +685,7 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
     }
     let onChain
     try {
-      onChain = await observeSettlementOnChain(parsed.settlement.transaction)
+      onChain = await observeSettlementOnChain(parsed.settlement.transaction, durable)
     } catch (error) {
       return {
         status: 'UNKNOWN',
@@ -651,18 +763,13 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
 
   async function observeSettlementOnChain(
     transactionId: string,
-  ): Promise<
-    | { readonly status: 'CONFIRMED' }
-    | { readonly status: 'PENDING' }
-    | { readonly status: 'FAILED' }
-    | { readonly status: 'NOT_FOUND' }
-    | { readonly status: 'INVALID' }
-  > {
+    durable: SolanaX402PreparedPayload,
+  ): Promise<X402OnChainObservation> {
     let transactionSignature
     try {
       transactionSignature = signature(transactionId)
     } catch {
-      return { status: 'INVALID' }
+      return { status: 'INVALID', reason: 'INVALID_TRANSACTION_SIGNATURE' }
     }
     const response = await withRpcTimeout((abortSignal) =>
       options.rpc
@@ -678,9 +785,132 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       status.confirmationStatus === 'confirmed' ||
       status.confirmationStatus === 'finalized'
     ) {
-      return { status: 'CONFIRMED' }
+      const rpc = options.rpc as unknown as X402OnChainRpc
+      const transaction = await withRpcTimeout((abortSignal) =>
+        rpc
+          .getTransaction(transactionSignature, {
+            encoding: 'jsonParsed',
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+          })
+          .send({ abortSignal }),
+      )
+      if (transaction === null) {
+        return { status: 'PENDING', reason: 'TRANSACTION_UNAVAILABLE' }
+      }
+      const verification = verifyX402SettlementTransaction(transaction, durable)
+      if (!verification.valid) {
+        return { status: 'INVALID', reason: verification.reason }
+      }
+      return { status: 'CONFIRMED', verification: 'EFFECT_VERIFIED' }
     }
-    return { status: 'PENDING' }
+    return { status: 'PENDING', reason: 'CONFIRMATION_PENDING' }
+  }
+
+  function verifyX402SettlementTransaction(
+    transaction: X402OnChainTransaction,
+    durable: SolanaX402PreparedPayload,
+  ): { readonly valid: true } | { readonly valid: false; readonly reason: string } {
+    const meta = transaction.meta
+    if (meta === null || meta.err !== null) {
+      return { valid: false, reason: 'TRANSACTION_FAILED' }
+    }
+    const accountKeys = transaction.transaction.message.accountKeys ?? []
+    const feePayer = readX402AccountKey(accountKeys[0])
+    if (
+      feePayer !== durable.feePayerIdentity ||
+      !hasX402Signer(accountKeys, feePayer)
+    ) {
+      return { valid: false, reason: 'FEE_PAYER_MISMATCH' }
+    }
+    if (!hasX402Signer(accountKeys, durable.payerOwner)) {
+      return { valid: false, reason: 'PAYER_SIGNATURE_MISSING' }
+    }
+    const preTokenBalances = meta.preTokenBalances ?? []
+    const postTokenBalances = meta.postTokenBalances ?? []
+    const sourcePre = findX402TokenBalance(
+      preTokenBalances,
+      accountKeys,
+      durable.payerAta,
+      durable.settlementMint,
+    )
+    const sourcePost = findX402TokenBalance(
+      postTokenBalances,
+      accountKeys,
+      durable.payerAta,
+      durable.settlementMint,
+    )
+    const recipientPre = findX402TokenBalance(
+      preTokenBalances,
+      accountKeys,
+      durable.recipientAta,
+      durable.settlementMint,
+    )
+    const recipientPost = findX402TokenBalance(
+      postTokenBalances,
+      accountKeys,
+      durable.recipientAta,
+      durable.settlementMint,
+    )
+    if (
+      sourcePre === undefined ||
+      sourcePost === undefined ||
+      recipientPre === undefined ||
+      recipientPost === undefined
+    ) {
+      return { valid: false, reason: 'TOKEN_BALANCE_PROOF_MISSING' }
+    }
+    if (
+      sourcePre.owner !== durable.payerOwner ||
+      sourcePost.owner !== durable.payerOwner ||
+      recipientPre.owner !== durable.recipientOwner ||
+      recipientPost.owner !== durable.recipientOwner
+    ) {
+      return { valid: false, reason: 'TOKEN_ACCOUNT_OWNER_MISMATCH' }
+    }
+    const amount = readX402TokenAmount(durable.tokenAmount)
+    const sourceBefore = readX402TokenAmount(sourcePre.uiTokenAmount.amount)
+    const sourceAfter = readX402TokenAmount(sourcePost.uiTokenAmount.amount)
+    const recipientBefore = readX402TokenAmount(recipientPre.uiTokenAmount.amount)
+    const recipientAfter = readX402TokenAmount(recipientPost.uiTokenAmount.amount)
+    if (
+      amount === undefined ||
+      sourceBefore === undefined ||
+      sourceAfter === undefined ||
+      recipientBefore === undefined ||
+      recipientAfter === undefined ||
+      sourceBefore - sourceAfter !== amount ||
+      recipientAfter - recipientBefore !== amount
+    ) {
+      return { valid: false, reason: 'TOKEN_BALANCE_DELTA_MISMATCH' }
+    }
+    const transfers = collectX402TokenTransfers(transaction)
+    const settlementTransfers = transfers.filter(
+      (transfer) =>
+        transfer.mint === durable.settlementMint ||
+        (transfer.mint === undefined &&
+          transfer.source === durable.payerAta &&
+          transfer.destination === durable.recipientAta),
+    )
+    if (settlementTransfers.length !== 1) {
+      return { valid: false, reason: 'SETTLEMENT_TRANSFER_COUNT_MISMATCH' }
+    }
+    const [settlementTransfer] = settlementTransfers
+    if (settlementTransfer === undefined) {
+      return { valid: false, reason: 'SETTLEMENT_TRANSFER_COUNT_MISMATCH' }
+    }
+    if (
+      settlementTransfer.source !== durable.payerAta ||
+      settlementTransfer.destination !== durable.recipientAta ||
+      (settlementTransfer.mint !== undefined &&
+        settlementTransfer.mint !== durable.settlementMint) ||
+      settlementTransfer.authority !== durable.payerOwner ||
+      readX402TokenAmount(settlementTransfer.amount) !== amount ||
+      !hasX402Signer(accountKeys, settlementTransfer.authority)
+    ) {
+      return { valid: false, reason: 'SETTLEMENT_TRANSFER_MISMATCH' }
+    }
+    return { valid: true }
   }
 
   async function validateSettlementMint(asset: {
@@ -862,6 +1092,120 @@ function assertRouteConfiguration(
     throw deterministicError(
       'x402 route configuration is incompatible with the configured Solana network and settlement asset',
     )
+  }
+}
+
+function readX402AccountKey(
+  key: string | { readonly pubkey: string; readonly signer?: boolean } | undefined,
+): string | undefined {
+  if (typeof key === 'string') return key
+  return key?.pubkey
+}
+
+function hasX402Signer(
+  accountKeys: readonly (
+    string | { readonly pubkey: string; readonly signer?: boolean }
+  )[],
+  expectedAddress: string | undefined,
+): boolean {
+  if (expectedAddress === undefined) return false
+  return accountKeys.some(
+    (key) =>
+      typeof key !== 'string' && key.pubkey === expectedAddress && key.signer === true,
+  )
+}
+
+function findX402TokenBalance(
+  balances: readonly X402OnChainTokenBalance[],
+  accountKeys: readonly (
+    string | { readonly pubkey: string; readonly signer?: boolean }
+  )[],
+  tokenAccount: string,
+  mint: string,
+): X402OnChainTokenBalance | undefined {
+  const matches = balances.filter(
+    (balance) =>
+      balance.mint === mint &&
+      readX402AccountKey(accountKeys[balance.accountIndex]) === tokenAccount,
+  )
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+function readX402TokenAmount(value: unknown): bigint | undefined {
+  if (typeof value !== 'string' || !/^\d+$/u.test(value)) return undefined
+  try {
+    return BigInt(value)
+  } catch {
+    return undefined
+  }
+}
+
+function collectX402TokenTransfers(
+  transaction: X402OnChainTransaction,
+): readonly X402TokenTransfer[] {
+  const outerInstructions = transaction.transaction.message.instructions ?? []
+  const innerInstructions = (transaction.meta?.innerInstructions ?? []).flatMap(
+    (entry) => entry.instructions,
+  )
+  return [...outerInstructions, ...innerInstructions]
+    .map(parseX402TokenTransfer)
+    .filter((transfer): transfer is X402TokenTransfer => transfer !== undefined)
+}
+
+function parseX402TokenTransfer(
+  instruction: X402OnChainInstruction,
+): X402TokenTransfer | undefined {
+  if (
+    instruction.program !== 'spl-token' &&
+    instruction.programId !== TOKEN_PROGRAM_ADDRESS
+  ) {
+    return undefined
+  }
+  if (
+    typeof instruction.parsed !== 'object' ||
+    instruction.parsed === null ||
+    Array.isArray(instruction.parsed)
+  ) {
+    return undefined
+  }
+  const parsed = instruction.parsed as Record<string, unknown>
+  if (parsed.type !== 'transfer' && parsed.type !== 'transferChecked') {
+    return undefined
+  }
+  const info = parsed.info
+  if (typeof info !== 'object' || info === null || Array.isArray(info)) {
+    return undefined
+  }
+  const values = info as Record<string, unknown>
+  const source = values.source
+  const destination = values.destination
+  const authority = values.authority
+  if (
+    typeof source !== 'string' ||
+    typeof destination !== 'string' ||
+    typeof authority !== 'string'
+  ) {
+    return undefined
+  }
+  const tokenAmount = values.tokenAmount
+  const amount =
+    parsed.type === 'transferChecked' &&
+    typeof tokenAmount === 'object' &&
+    tokenAmount !== null &&
+    !Array.isArray(tokenAmount) &&
+    typeof (tokenAmount as Record<string, unknown>).amount === 'string'
+      ? (tokenAmount as Record<string, unknown>).amount
+      : values.amount
+  if (typeof amount !== 'string' || readX402TokenAmount(amount) === undefined) {
+    return undefined
+  }
+  const mint = values.mint
+  return {
+    source,
+    destination,
+    authority,
+    amount,
+    ...(typeof mint === 'string' ? { mint } : {}),
   }
 }
 

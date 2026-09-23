@@ -138,24 +138,9 @@ describe('x402 outgoing executor', () => {
     expect(result.externalId).toBe(settlementTransaction)
   })
 
-  it('replays the same signed payload during reconciliation and never rebuilds a transaction', async () => {
+  it('does not replay a partially signed payload without a settlement signature', async () => {
     const fixture = await createFixture()
-    const headers: string[] = []
-    const settlement: SettleResponse = {
-      success: true,
-      transaction: settlementTransaction,
-      network: X402_SOLANA_MAINNET_NETWORK,
-      payer: fixture.payer.address,
-    }
-    const fetchImpl = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
-      headers.push(new Headers(init?.headers).get('PAYMENT-SIGNATURE') ?? '')
-      return new Response(JSON.stringify({ bitcoin: { usd: 100_000 } }), {
-        status: 200,
-        headers: {
-          [X402_PAYMENT_RESPONSE_HEADER]: encodePaymentResponseHeader(settlement),
-        },
-      })
-    })
+    const fetchImpl = vi.fn()
     const executor = createX402OutgoingExecutor({
       rpc: fixture.rpc,
       rpcUrl: 'https://rpc.example.test',
@@ -187,6 +172,7 @@ describe('x402 outgoing executor', () => {
       signedPayloadHash: sha256(fixture.signed.signedPayload),
       signedPayloadEncrypted: null,
       expectedExternalId: fixture.signed.externalId,
+      externalId: null,
       validityExpiresAt: fixture.prepared.validityExpiresAt ?? null,
       validitySlot: null,
       rowVersion: 1,
@@ -202,10 +188,110 @@ describe('x402 outgoing executor', () => {
       attempt,
       signedPayload: fixture.signed.signedPayload,
     })
-    expect(first.status).toBe('CONFIRMED')
-    expect(second.status).toBe('CONFIRMED')
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
-    expect(headers[0]).toBe(headers[1])
+    expect(first.status).toBe('UNKNOWN')
+    expect(second.status).toBe('UNKNOWN')
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('uses a persisted settlement signature instead of resending the payment', async () => {
+    const fixture = await createFixture()
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('provider must not be called during settlement recovery')
+    })
+    const executor = createX402OutgoingExecutor({
+      rpc: fixture.rpc,
+      rpcUrl: 'https://rpc.example.test',
+      settlementMint: mint,
+      resourceUrl,
+      maxPaymentAtomic: 100_000n,
+      fetchImpl,
+      getPayerPublicKey: async () => fixture.payer.address,
+      getDenomination: async () => null,
+      getSettlementAsset: async () => null,
+      getEconomicMapping: async () => null,
+      getSettlementRoute: async () => null,
+      getActiveKeyVersion: async () => null,
+      signPaymentEffect: async () => fixture.signed,
+    })
+    const attempt: V2PaymentAttemptSnapshot = {
+      id: 'att_persisted_settlement',
+      paymentId: 'pay_persisted_settlement',
+      attemptNumber: 1,
+      routeId: 'route_1',
+      status: 'RECONCILING',
+      outcome: 'UNKNOWN',
+      preparedEffectHash: fixture.prepared.effectHash,
+      preparedEffectJson: JSON.stringify({
+        ...fixture.prepared,
+        amountAtomic: fixture.prepared.amountAtomic.toString(),
+        validityExpiresAt: fixture.prepared.validityExpiresAt?.toISOString(),
+      }),
+      signedPayloadHash: sha256(fixture.signed.signedPayload),
+      signedPayloadEncrypted: null,
+      expectedExternalId: fixture.signed.externalId,
+      externalId: settlementTransaction,
+      validityExpiresAt: fixture.prepared.validityExpiresAt ?? null,
+      validitySlot: null,
+      rowVersion: 1,
+    }
+    const result = await executor.reconcile!({
+      view: {} as Parameters<NonNullable<typeof executor.reconcile>>[0]['view'],
+      attempt,
+      signedPayload: fixture.signed.signedPayload,
+    })
+    expect(result.status).toBe('CONFIRMED')
+    expect(result.externalId).toBe(settlementTransaction)
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('reconciles a persisted settlement signature without custody payload recovery', async () => {
+    const fixture = await createFixture()
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('provider must not be called during settlement recovery')
+    })
+    const executor = createX402OutgoingExecutor({
+      rpc: fixture.rpc,
+      rpcUrl: 'https://rpc.example.test',
+      settlementMint: mint,
+      resourceUrl,
+      maxPaymentAtomic: 100_000n,
+      fetchImpl,
+      getPayerPublicKey: async () => fixture.payer.address,
+      getDenomination: async () => null,
+      getSettlementAsset: async () => null,
+      getEconomicMapping: async () => null,
+      getSettlementRoute: async () => null,
+      getActiveKeyVersion: async () => null,
+      signPaymentEffect: async () => fixture.signed,
+    })
+    const attempt: V2PaymentAttemptSnapshot = {
+      id: 'att_persisted_without_payload',
+      paymentId: 'pay_persisted_without_payload',
+      attemptNumber: 1,
+      routeId: 'route_1',
+      status: 'RECONCILING',
+      outcome: 'UNKNOWN',
+      preparedEffectHash: fixture.prepared.effectHash,
+      preparedEffectJson: JSON.stringify({
+        ...fixture.prepared,
+        amountAtomic: fixture.prepared.amountAtomic.toString(),
+        validityExpiresAt: fixture.prepared.validityExpiresAt?.toISOString(),
+      }),
+      signedPayloadHash: sha256(fixture.signed.signedPayload),
+      signedPayloadEncrypted: null,
+      expectedExternalId: fixture.signed.externalId,
+      externalId: settlementTransaction,
+      validityExpiresAt: fixture.prepared.validityExpiresAt ?? null,
+      validitySlot: null,
+      rowVersion: 1,
+    }
+    const result = await executor.reconcile!({
+      view: {} as Parameters<NonNullable<typeof executor.reconcile>>[0]['view'],
+      attempt,
+    })
+    expect(result.status).toBe('CONFIRMED')
+    expect(result.externalId).toBe(settlementTransaction)
+    expect(fetchImpl).not.toHaveBeenCalled()
   })
 
   it('keeps a paid HTTP transport failure unknown', async () => {
@@ -447,6 +533,68 @@ async function createFixture(
       getSignatureStatuses: () => ({
         send: async () => ({
           value: [{ err: null, confirmationStatus: 'confirmed' }],
+        }),
+      }),
+      getTransaction: () => ({
+        send: async () => ({
+          meta: {
+            err: null,
+            preTokenBalances: [
+              {
+                accountIndex: 2,
+                mint: input.mint,
+                owner: payer.address,
+                uiTokenAmount: { amount: '1000000' },
+              },
+              {
+                accountIndex: 3,
+                mint: input.mint,
+                owner: feePayer.address,
+                uiTokenAmount: { amount: '0' },
+              },
+            ],
+            postTokenBalances: [
+              {
+                accountIndex: 2,
+                mint: input.mint,
+                owner: payer.address,
+                uiTokenAmount: { amount: '999000' },
+              },
+              {
+                accountIndex: 3,
+                mint: input.mint,
+                owner: feePayer.address,
+                uiTokenAmount: { amount: '1000' },
+              },
+            ],
+            innerInstructions: [],
+          },
+          transaction: {
+            message: {
+              accountKeys: [
+                { pubkey: feePayer.address, signer: true },
+                { pubkey: payer.address, signer: true },
+                payerAta[0],
+                recipientAta[0],
+              ],
+              instructions: [
+                {
+                  program: 'spl-token',
+                  programId: TOKEN_PROGRAM_ADDRESS,
+                  parsed: {
+                    type: 'transferChecked',
+                    info: {
+                      source: payerAta[0],
+                      destination: recipientAta[0],
+                      authority: payer.address,
+                      mint: input.mint,
+                      tokenAmount: { amount: '1000' },
+                    },
+                  },
+                },
+              ],
+            },
+          },
         }),
       }),
     } as unknown as SolanaRpc,
