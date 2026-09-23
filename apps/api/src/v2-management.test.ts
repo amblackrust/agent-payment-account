@@ -38,6 +38,28 @@ const credential: V2CredentialRecord = {
   revokedAt: null,
 }
 
+describe('V2ManagementService credential listing', () => {
+  it('projects an active credential as expired after its expiry timestamp', async () => {
+    const expiredCredential: V2CredentialRecord = {
+      ...credential,
+      expiresAt: new Date('2026-09-17T23:59:59.000Z'),
+    }
+    const repository = {
+      findAccount: async () => account,
+      listCredentials: async () => [expiredCredential],
+    } as unknown as V2AdminRepository
+    const service = new V2ManagementService({
+      repository,
+      financialRepository: {} as never,
+      now: () => new Date('2026-09-18T00:00:00.000Z'),
+    })
+
+    await expect(service.listCredentials(account.id)).resolves.toMatchObject([
+      { id: expiredCredential.id, status: 'EXPIRED' },
+    ])
+  })
+})
+
 describe('V2ManagementService credential rotation', () => {
   it('preserves the existing scope set unless a replacement set is explicit', async () => {
     const rotateCredential = vi.fn(

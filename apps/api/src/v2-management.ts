@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import {
+  AgentCredentialStatus,
   createDenomination,
   createCredentialId,
   createEconomicMapping,
@@ -110,10 +111,11 @@ export class V2ManagementService {
   public async listCredentials(accountId: string) {
     await this.requireAccount(accountId)
     const credentials = await this.options.repository.listCredentials(accountId)
+    const now = this.now()
     return credentials.map((credential) => ({
       id: credential.id,
       account_id: credential.accountId,
-      status: credential.status,
+      status: projectCredentialStatus(credential, now),
       scopes: [...credential.scopes],
       expires_at: credential.expiresAt?.toISOString() ?? null,
       rotated_from_id: credential.rotatedFromId,
@@ -782,6 +784,17 @@ export class V2ManagementService {
     }
     return { economicMapping, settlementAsset }
   }
+}
+
+function projectCredentialStatus(credential: V2CredentialRecord, now: Date): string {
+  if (
+    credential.status === AgentCredentialStatus.ACTIVE &&
+    credential.expiresAt !== null &&
+    credential.expiresAt <= now
+  ) {
+    return AgentCredentialStatus.EXPIRED
+  }
+  return credential.status
 }
 
 function serializeRotatedCredential(
