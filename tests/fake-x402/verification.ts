@@ -441,6 +441,11 @@ async function verifySplTransfer(
   }
 
   const transfers = collectTransfers(transaction)
+  const settlementTransfers = transfers.filter((transfer) => {
+    const sourceBalance = findTokenBalanceByAddress(transaction, transfer.source)
+    const mint = transfer.mint ?? sourceBalance?.mint
+    return mint === config.settlementMint
+  })
   const matchingTransfers = transfers.filter((transfer) => {
     const sourceBalance = findTokenBalanceByAddress(transaction, transfer.source)
     const mint = transfer.mint ?? sourceBalance?.mint
@@ -450,9 +455,9 @@ async function verifySplTransfer(
       mint === config.settlementMint
     )
   })
-  if (matchingTransfers.length !== 1) {
+  if (settlementTransfers.length !== 1 || matchingTransfers.length !== 1) {
     throw transferMismatch(
-      'The transaction does not contain exactly one matching SPL transfer',
+      'The transaction does not contain exactly one TEST_USDC transfer',
     )
   }
 

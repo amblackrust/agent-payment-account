@@ -90,13 +90,38 @@ describe('local fake x402 service', () => {
       await app.close()
     }
   })
+
+  it('rejects a confirmed transaction with an additional TEST_USDC transfer', async () => {
+    const fixture = await createFixture({ extraSettlementTransfer: true })
+    const app = createFakeX402App({
+      config: fixture.config,
+      rpc: fixture.rpc,
+    })
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/crypto/price?ids=bitcoin',
+        headers: { 'payment-signature': fixture.paymentSignature },
+      })
+      expect(response.statusCode).toBe(402)
+      expect(response.json()).toEqual({ error: 'TRANSFER_MISMATCH' })
+    } finally {
+      await app.close()
+    }
+  })
 })
 
-async function createFixture(input: { readonly destinationDelta?: bigint } = {}) {
+async function createFixture(
+  input: {
+    readonly destinationDelta?: bigint
+    readonly extraSettlementTransfer?: boolean
+  } = {},
+) {
   const payer = await generateKeyPairSigner(true)
   const destination = await generateKeyPairSigner(true)
+  const extraDestination = await generateKeyPairSigner(true)
   const facilitator = await generateKeyPairSigner(true)
-  const [payerAta, destinationAta] = await Promise.all([
+  const [payerAta, destinationAta, extraDestinationAta] = await Promise.all([
     findAssociatedTokenPda({
       owner: payer.address,
       tokenProgram: TOKEN_PROGRAM_ADDRESS,
@@ -104,6 +129,11 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
     }),
     findAssociatedTokenPda({
       owner: destination.address,
+      tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      mint: settlementMint as never,
+    }),
+    findAssociatedTokenPda({
+      owner: extraDestination.address,
       tokenProgram: TOKEN_PROGRAM_ADDRESS,
       mint: settlementMint as never,
     }),
@@ -128,6 +158,18 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
             amount: 1000n,
             decimals: 6,
           }),
+          ...(input.extraSettlementTransfer
+            ? [
+                getTransferCheckedInstruction({
+                  source: payerAta[0],
+                  mint: settlementMint as never,
+                  destination: extraDestinationAta[0],
+                  authority: createNoopSigner(payer.address),
+                  amount: 1n,
+                  decimals: 6,
+                }),
+              ]
+            : []),
         ],
         value,
       ),
@@ -192,7 +234,9 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
           accountIndex: 2,
           mint: settlementMint,
           owner: payer.address,
-          uiTokenAmount: { amount: '999000' },
+          uiTokenAmount: {
+            amount: input.extraSettlementTransfer ? '998999' : '999000',
+          },
         },
         {
           accountIndex: 3,
@@ -202,6 +246,16 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
             amount: (input.destinationDelta ?? 1000n).toString(),
           },
         },
+        ...(input.extraSettlementTransfer
+          ? [
+              {
+                accountIndex: 4,
+                mint: settlementMint,
+                owner: extraDestination.address,
+                uiTokenAmount: { amount: '1' },
+              },
+            ]
+          : []),
       ],
       innerInstructions: [],
     },
@@ -212,6 +266,9 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
           { pubkey: payer.address, signer: true },
           { pubkey: payerAta[0] },
           { pubkey: destinationAta[0] },
+          ...(input.extraSettlementTransfer
+            ? [{ pubkey: extraDestinationAta[0] }]
+            : []),
         ],
         instructions: [
           {
@@ -227,6 +284,23 @@ async function createFixture(input: { readonly destinationDelta?: bigint } = {})
               },
             },
           },
+          ...(input.extraSettlementTransfer
+            ? [
+                {
+                  program: 'spl-token',
+                  parsed: {
+                    type: 'transferChecked',
+                    info: {
+                      source: payerAta[0],
+                      destination: extraDestinationAta[0],
+                      authority: payer.address,
+                      mint: settlementMint,
+                      tokenAmount: { amount: '1' },
+                    },
+                  },
+                },
+              ]
+            : []),
         ],
       },
     },

@@ -371,15 +371,25 @@ async function ensureSolBalance(
       remaining > MAX_AIRDROP_SOL * LAMPORTS_PER_SOL
         ? MAX_AIRDROP_SOL * LAMPORTS_PER_SOL
         : remaining
-    runCommand('solana', [
-      'airdrop',
-      formatAtomicAmount(requestAmount, 9),
-      address,
-      '--url',
-      config.rpcUrl,
-      '--commitment',
-      'confirmed',
-    ])
+    try {
+      runCommand('solana', [
+        'airdrop',
+        formatAtomicAmount(requestAmount, 9),
+        address,
+        '--url',
+        config.rpcUrl,
+        '--commitment',
+        'confirmed',
+      ])
+    } catch (error) {
+      throw new DevnetX402SetupError(
+        `Devnet SOL faucet could not fund ${address} with ${formatAtomicAmount(
+          requestAmount,
+          9,
+        )} SOL. Request that amount from a Solana devnet faucet, then rerun the setup.`,
+        error,
+      )
+    }
     await waitFor(
       async () => (await getSolBalance(rpcClient, address)) >= balance + requestAmount,
       config.pollTimeoutMs,

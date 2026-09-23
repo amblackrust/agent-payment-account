@@ -30,7 +30,7 @@ function createTemporaryHome() {
   return path.join(directory, 'devnet-x402')
 }
 
-function createFakeDevnet() {
+function createFakeDevnet({ failAirdrop = false } = {}) {
   const addresses = {
     'platform-fee-payer.json': '11111111111111111111111111111111',
     'fake-service-destination.json': 'SysvarRent111111111111111111111111111111111',
@@ -53,6 +53,9 @@ function createFakeDevnet() {
       return addresses[path.basename(args[1])]
     }
     if (command === 'solana' && args[0] === 'airdrop') {
+      if (failAirdrop) {
+        throw new Error('airdrop request failed: faucet rate limit')
+      }
       const amount = parseSolAmount(args[1], 'fake airdrop')
       const address = args[2]
       balances.set(address, (balances.get(address) ?? 0n) + amount)
@@ -195,5 +198,24 @@ describe('devnet x402 setup helpers', () => {
     expect(
       readFileSync(path.join(home, 'platform-fee-payer.json'), 'utf8'),
     ).not.toContain(first.platformFeePayer.address)
+  })
+
+  it('reports the public funding requirement when the devnet faucet is rate-limited', async () => {
+    const home = createTemporaryHome()
+    const fake = createFakeDevnet({ failAirdrop: true })
+
+    await expect(
+      setupDevnetX402({
+        homeDirectory: home,
+        solTargetLamports: 100_000_000n,
+        tokenTargetAtomic: 1_000n,
+        pollIntervalMs: 1,
+        pollTimeoutMs: 100,
+        runCommand: fake.runCommand,
+        rpcClient: fake.rpcClient,
+      }),
+    ).rejects.toThrow(
+      `Devnet SOL faucet could not fund ${fake.addresses['platform-fee-payer.json']} with 0.1 SOL`,
+    )
   })
 })
