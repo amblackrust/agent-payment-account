@@ -127,6 +127,7 @@ describe('configuration', () => {
         NODE_ENV: 'production',
         RUNTIME_ROLE: 'api',
         RUNTIME_AUTHORITY_ID: 'runtime-api-1',
+        SOLANA_RPC_URL: 'https://rpc.example.test',
         SOLANA_FEE_PAYER_SECRET: undefined,
         X402_SIGN_FEE_PAYER: 'true',
         CUSTODY_BACKEND_IDENTITY: 'external-custody',
@@ -140,6 +141,7 @@ describe('configuration', () => {
       loadConfig({
         ...validEnvironment,
         NODE_ENV: 'production',
+        SOLANA_RPC_URL: 'https://rpc.example.test',
         SOLANA_FEE_PAYER_SECRET: undefined,
       }),
     ).toThrow('RUNTIME_ROLE')
@@ -151,6 +153,7 @@ describe('configuration', () => {
       NODE_ENV: 'production',
       RUNTIME_ROLE: 'api',
       RUNTIME_AUTHORITY_ID: 'runtime-api-1',
+      SOLANA_RPC_URL: 'https://rpc.example.test',
       SOLANA_FEE_PAYER_SECRET: undefined,
       CUSTODY_BACKEND_IDENTITY: 'external-custody',
       CUSTODY_BACKEND_MODE: 'EXTERNAL',
@@ -172,6 +175,21 @@ describe('configuration', () => {
         X402_RESOURCE_URL: 'http://provider.example.test/resource',
       }),
     ).toThrow(/HTTPS/u)
+  })
+
+  it('requires an HTTPS Solana RPC URL in production', () => {
+    expect(() =>
+      loadConfig({
+        ...validEnvironment,
+        NODE_ENV: 'production',
+        RUNTIME_ROLE: 'api',
+        RUNTIME_AUTHORITY_ID: 'runtime-api-1',
+        SOLANA_FEE_PAYER_SECRET: undefined,
+        SOLANA_RPC_URL: 'http://rpc.example.test',
+        CUSTODY_BACKEND_IDENTITY: 'external-custody',
+        CUSTODY_BACKEND_MODE: 'EXTERNAL',
+      }),
+    ).toThrow(/Solana RPC URL must use HTTPS/u)
   })
 
   it('does not require wallet or recovery keys for read-only worker roles', () => {
