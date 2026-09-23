@@ -114,4 +114,25 @@ describe('constrained custody boundary', () => {
     )
     await expect(boundary.signPaymentEffect(request)).rejects.toThrow('effect hash')
   })
+
+  it('rejects malformed provider signing responses at the boundary', async () => {
+    const boundary = new ConstrainedCustodyBoundary(
+      {
+        identity: 'test',
+        mode: 'LOCAL_TEST',
+        signPaymentEffect: async () =>
+          ({
+            effectHash: request.effectHash,
+            keyVersion: request.keyVersion,
+            signedPayload: 'not-bytes',
+            externalId: 42,
+          }) as never,
+      },
+      'test',
+    )
+
+    await expect(boundary.signPaymentEffect(request)).rejects.toThrow(
+      'incomplete signed effect',
+    )
+  })
 })
