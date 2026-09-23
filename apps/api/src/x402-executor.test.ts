@@ -382,6 +382,57 @@ describe('x402 outgoing executor', () => {
     expect(result.externalId).toBe(String(getSignatureFromTransaction(transaction)))
     expect(fetchImpl).not.toHaveBeenCalled()
   })
+
+  it('does not persist an untrusted provider signature after a mismatch', async () => {
+    const fixture = await createFixture({
+      x402Network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      mint: testMint,
+    })
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ bitcoin: { usd: 60_000 } }), {
+          status: 200,
+          headers: {
+            [X402_PAYMENT_RESPONSE_HEADER]: encodePaymentResponseHeader({
+              success: true,
+              transaction: settlementTransaction,
+              network: X402_SOLANA_DEVNET_NETWORK,
+              payer: fixture.payer.address,
+            }),
+          },
+        }),
+    )
+    const executor = createX402OutgoingExecutor({
+      rpc: fixture.rpc,
+      rpcUrl: 'https://rpc.example.test',
+      network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      settlementMint: testMint,
+      providerDestination: fixture.recipient.address,
+      signFeePayer: true,
+      platformFeePayerIdentity: fixture.recipient.address,
+      resourceUrl,
+      maxPaymentAtomic: 100_000n,
+      fetchImpl,
+      getPayerPublicKey: async () => fixture.payer.address,
+      getDenomination: async () => null,
+      getSettlementAsset: async () => null,
+      getEconomicMapping: async () => null,
+      getSettlementRoute: async () => null,
+      getActiveKeyVersion: async () => null,
+      signPaymentEffect: async () => fixture.fullySigned,
+    })
+
+    const result = await executor.submit({
+      prepared: fixture.prepared,
+      signed: fixture.fullySigned,
+    })
+
+    expect(result.status).toBe('UNKNOWN')
+    expect(result.externalId).toBeUndefined()
+    expect(result.evidenceMetadataJson).toContain('SETTLEMENT_TRANSACTION_MISMATCH')
+  })
 })
 
 async function createFixture(

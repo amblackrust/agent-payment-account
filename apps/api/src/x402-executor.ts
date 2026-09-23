@@ -658,7 +658,6 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       ) {
         return {
           status: 'UNKNOWN',
-          externalId: parsed.settlement.transaction,
           evidenceMetadataJson: serializeProtocolMetadata({
             protocol: X402_PROTOCOL,
             resource_url: options.resourceUrl,
