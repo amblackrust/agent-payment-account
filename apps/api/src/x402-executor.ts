@@ -918,12 +918,14 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       return { valid: false, reason: 'TOKEN_BALANCE_DELTA_MISMATCH' }
     }
     const transfers = collectX402TokenTransfers(transaction)
+    const transferMints = transfers.map((transfer) =>
+      resolveX402TransferMint(transaction, transfer),
+    )
+    if (transferMints.some((mint) => mint === undefined)) {
+      return { valid: false, reason: 'TRANSFER_MINT_PROOF_MISSING' }
+    }
     const settlementTransfers = transfers.filter(
-      (transfer) =>
-        transfer.mint === durable.settlementMint ||
-        (transfer.mint === undefined &&
-          transfer.source === durable.payerAta &&
-          transfer.destination === durable.recipientAta),
+      (_transfer, index) => transferMints[index] === durable.settlementMint,
     )
     if (settlementTransfers.length !== 1) {
       return { valid: false, reason: 'SETTLEMENT_TRANSFER_COUNT_MISMATCH' }
@@ -1230,6 +1232,24 @@ function collectX402TokenTransfers(
   return [...outerInstructions, ...innerInstructions]
     .map(parseX402TokenTransfer)
     .filter((transfer): transfer is X402TokenTransfer => transfer !== undefined)
+}
+
+function resolveX402TransferMint(
+  transaction: X402OnChainTransaction,
+  transfer: X402TokenTransfer,
+): string | undefined {
+  if (transfer.mint !== undefined) return transfer.mint
+  const balances = [
+    ...(transaction.meta?.preTokenBalances ?? []),
+    ...(transaction.meta?.postTokenBalances ?? []),
+  ].filter(
+    (balance) =>
+      readX402AccountKey(
+        transaction.transaction.message.accountKeys?.[balance.accountIndex],
+      ) === transfer.source,
+  )
+  const mints = [...new Set(balances.map((balance) => balance.mint))]
+  return mints.length === 1 ? mints[0] : undefined
 }
 
 function parseX402TokenTransfer(

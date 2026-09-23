@@ -490,6 +490,62 @@ describe('x402 outgoing executor', () => {
     expect(result.externalId).toBeUndefined()
     expect(result.evidenceMetadataJson).toContain('TRANSACTION_MESSAGE_MISMATCH')
   })
+
+  it('rejects an additional legacy SPL transfer without an inline mint', async () => {
+    const fixture = await createFixture({
+      x402Network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      mint: testMint,
+      extraUncheckedSettlementTransfer: true,
+    })
+    const transaction = getTransactionDecoder().decode(
+      fixture.fullySigned.signedPayload,
+    )
+    const transactionId = String(getSignatureFromTransaction(transaction))
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ bitcoin: { usd: 60_000 } }), {
+          status: 200,
+          headers: {
+            [X402_PAYMENT_RESPONSE_HEADER]: encodePaymentResponseHeader({
+              success: true,
+              transaction: transactionId,
+              network: X402_SOLANA_DEVNET_NETWORK,
+              payer: fixture.payer.address,
+            }),
+          },
+        }),
+    )
+    const executor = createX402OutgoingExecutor({
+      rpc: fixture.rpc,
+      rpcUrl: 'https://rpc.example.test',
+      network: X402_SOLANA_DEVNET_NETWORK,
+      routeNetwork: 'devnet',
+      settlementMint: testMint,
+      providerDestination: fixture.recipient.address,
+      signFeePayer: true,
+      platformFeePayerIdentity: fixture.recipient.address,
+      resourceUrl,
+      maxPaymentAtomic: 100_000n,
+      fetchImpl,
+      getPayerPublicKey: async () => fixture.payer.address,
+      getDenomination: async () => null,
+      getSettlementAsset: async () => null,
+      getEconomicMapping: async () => null,
+      getSettlementRoute: async () => null,
+      getActiveKeyVersion: async () => null,
+      signPaymentEffect: async () => fixture.fullySigned,
+    })
+
+    const result = await executor.submit({
+      prepared: fixture.prepared,
+      signed: fixture.fullySigned,
+    })
+
+    expect(result.status).toBe('UNKNOWN')
+    expect(result.externalId).toBeUndefined()
+    expect(result.evidenceMetadataJson).toContain('SETTLEMENT_TRANSFER_COUNT_MISMATCH')
+  })
 })
 
 async function createFixture(
@@ -498,6 +554,7 @@ async function createFixture(
     readonly routeNetwork: string
     readonly mint: string
     readonly useMismatchedWire?: boolean
+    readonly extraUncheckedSettlementTransfer?: boolean
   } = {
     x402Network: X402_SOLANA_MAINNET_NETWORK,
     routeNetwork: 'mainnet-beta',
@@ -513,7 +570,8 @@ async function createFixture(
 }> {
   const payer = await generateKeyPairSigner(true)
   const feePayer = await generateKeyPairSigner(true)
-  const [payerAta, recipientAta] = await Promise.all([
+  const extraDestination = await generateKeyPairSigner(true)
+  const [payerAta, recipientAta, extraDestinationAta] = await Promise.all([
     findAssociatedTokenPda({
       owner: payer.address,
       tokenProgram: TOKEN_PROGRAM_ADDRESS,
@@ -521,6 +579,11 @@ async function createFixture(
     }),
     findAssociatedTokenPda({
       owner: feePayer.address,
+      tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      mint: input.mint as never,
+    }),
+    findAssociatedTokenPda({
+      owner: extraDestination.address,
       tokenProgram: TOKEN_PROGRAM_ADDRESS,
       mint: input.mint as never,
     }),
@@ -725,6 +788,9 @@ async function createFixture(
                       { pubkey: payer.address, signer: true },
                       payerAta[0],
                       recipientAta[0],
+                      ...(input.extraUncheckedSettlementTransfer
+                        ? [extraDestinationAta[0]]
+                        : []),
                     ],
                     instructions: [
                       {
@@ -741,6 +807,23 @@ async function createFixture(
                           },
                         },
                       },
+                      ...(input.extraUncheckedSettlementTransfer
+                        ? [
+                            {
+                              program: 'spl-token',
+                              programId: TOKEN_PROGRAM_ADDRESS,
+                              parsed: {
+                                type: 'transfer',
+                                info: {
+                                  source: payerAta[0],
+                                  destination: extraDestinationAta[0],
+                                  authority: payer.address,
+                                  amount: '1',
+                                },
+                              },
+                            },
+                          ]
+                        : []),
                     ],
                   },
                 },
