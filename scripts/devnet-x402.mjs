@@ -829,6 +829,7 @@ export async function statusDevnetX402(options = {}) {
 
   let agentAta
   let fakeServiceAta
+  let fakeServiceAtaReady = false
   let agentTokenBalance
   if (mintReady && agentAddress !== undefined && fakeServiceAddress !== undefined) {
     agentAta = await associatedTokenAddress(
@@ -844,6 +845,16 @@ export async function statusDevnetX402(options = {}) {
       runCommand,
     )
     const agentAccount = await getAccountInfo(rpcClient, agentAta, 'jsonParsed')
+    const fakeServiceAccount = await getAccountInfo(
+      rpcClient,
+      fakeServiceAta,
+      'jsonParsed',
+    )
+    fakeServiceAtaReady = tokenAccountIsReady(
+      fakeServiceAccount,
+      mintAddress,
+      fakeServiceAddress,
+    )
     if (tokenAccountIsReady(agentAccount, mintAddress, agentAddress)) {
       agentTokenBalance = await getTokenBalance(rpcClient, agentAta)
     }
@@ -858,6 +869,7 @@ export async function statusDevnetX402(options = {}) {
       mintReady &&
       agentAta !== undefined &&
       fakeServiceAta !== undefined &&
+      fakeServiceAtaReady &&
       agentTokenBalance !== undefined &&
       feePayerSol !== undefined &&
       feePayerSol >= resolved.solTargetLamports &&

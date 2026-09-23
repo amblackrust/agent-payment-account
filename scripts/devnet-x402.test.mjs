@@ -12,6 +12,7 @@ import {
   parseTestUsdcAmount,
   resolveDevnetX402Config,
   resolveDevnetX402Paths,
+  statusDevnetX402,
   setupDevnetX402,
 } from './devnet-x402.mjs'
 
@@ -132,7 +133,7 @@ function createFakeDevnet({ failAirdrop = false } = {}) {
     },
   }
 
-  return { addresses, balances, commands, runCommand, rpcClient }
+  return { addresses, balances, commands, runCommand, rpcClient, tokenAccounts }
 }
 
 describe('devnet x402 setup helpers', () => {
@@ -198,6 +199,29 @@ describe('devnet x402 setup helpers', () => {
     expect(
       readFileSync(path.join(home, 'platform-fee-payer.json'), 'utf8'),
     ).not.toContain(first.platformFeePayer.address)
+  })
+
+  it('does not report ready when the fake service token account is missing', async () => {
+    const home = createTemporaryHome()
+    const fake = createFakeDevnet()
+    const options = {
+      homeDirectory: home,
+      agentAddress: 'So11111111111111111111111111111111111111112',
+      solTargetLamports: 1_000_000_000n,
+      tokenTargetAtomic: 1_000_000n,
+      pollIntervalMs: 1,
+      pollTimeoutMs: 100,
+      runCommand: fake.runCommand,
+      rpcClient: fake.rpcClient,
+    }
+
+    const setup = await setupDevnetX402(options)
+    expect((await statusDevnetX402(options)).ready).toBe(true)
+
+    fake.tokenAccounts.delete(setup.fakeService.tokenAccount)
+
+    const status = await statusDevnetX402(options)
+    expect(status.ready).toBe(false)
   })
 
   it('reports the public funding requirement when the devnet faucet is rate-limited', async () => {
