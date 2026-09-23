@@ -400,7 +400,12 @@ export class V2OutgoingWorker {
       if (!(await this.ensureActiveBeforeEffect(claim, currentView, currentAttempt)))
         return
       if (!(await this.acquireCapacity(claim, 'rail'))) return
-      const result = await this.options.executor.submit({ prepared, signed })
+      let result: Awaited<ReturnType<V2OutgoingExecutor['submit']>>
+      try {
+        result = await this.options.executor.submit({ prepared, signed })
+      } finally {
+        signed.signedPayload.fill(0)
+      }
       this.logger?.info(
         {
           worker: this.options.owner,

@@ -126,6 +126,7 @@ describe('V2 outgoing worker', () => {
     let finalizedInput: Record<string, unknown> | undefined
     const costEstimates: unknown[] = []
     const reconciledCosts: unknown[] = []
+    const signedPayload = new Uint8Array([1, 2, 3])
     const baseView = view()
     let latestAttempt = baseView.attempts[0]
     const signingRequest: V2SigningRequestRecord = {
@@ -245,7 +246,7 @@ describe('V2 outgoing worker', () => {
           return {
             effectHash: 'a'.repeat(64),
             keyVersion: 1,
-            signedPayload: new Uint8Array([1, 2, 3]),
+            signedPayload,
             externalId: 'expected-external-1',
           }
         },
@@ -283,6 +284,7 @@ describe('V2 outgoing worker', () => {
     expect(costEstimates).toHaveLength(1)
     expect(reconciledCosts).toHaveLength(1)
     expect((reconciledCosts[0] as { actualAmount: bigint }).actualAmount).toBe(4n)
+    expect(signedPayload).toEqual(new Uint8Array([0, 0, 0]))
     expect(completed).toBe(true)
   })
 
