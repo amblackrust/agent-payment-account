@@ -246,7 +246,7 @@ describe('V2 outgoing worker', () => {
             effectHash: 'a'.repeat(64),
             keyVersion: 1,
             signedPayload: new Uint8Array([1, 2, 3]),
-            externalId: 'external-1',
+            externalId: 'expected-external-1',
           }
         },
         submit: async () => ({
@@ -272,7 +272,8 @@ describe('V2 outgoing worker', () => {
 
     expect(signCount).toBe(1)
     expect(finalized).toBe(true)
-    expect(finalizedInput?.expectedExternalId).toBe('external-1')
+    expect(finalizedInput?.expectedExternalId).toBe('expected-external-1')
+    expect(finalizedInput?.externalId).toBe('external-1')
     expect(finalizedInput?.payloadHash).toBe(
       createHash('sha256')
         .update(new Uint8Array([1, 2, 3]))

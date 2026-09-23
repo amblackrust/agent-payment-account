@@ -513,11 +513,7 @@ export class V2OutgoingWorker {
         settlementState: 'CONFIRMED',
         outcomeState: 'CONFIRMED',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
-        ...evidenceFields(
-          attempt,
-          prepared,
-          result.externalId ?? attempt.expectedExternalId ?? undefined,
-        ),
+        ...evidenceFields(attempt, prepared, attempt.expectedExternalId ?? undefined),
         ...(result.evidenceMetadataJson === undefined
           ? {}
           : {
@@ -525,7 +521,7 @@ export class V2OutgoingWorker {
                 evidenceFields(
                   attempt,
                   prepared,
-                  result.externalId ?? attempt.expectedExternalId ?? undefined,
+                  attempt.expectedExternalId ?? undefined,
                 ).metadataJson,
                 result.evidenceMetadataJson,
               ),
@@ -560,12 +556,16 @@ export class V2OutgoingWorker {
         attemptId: attempt.id,
         outcome: 'SUBMITTED',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
-        ...evidenceFields(attempt, prepared, result.externalId),
+        ...evidenceFields(attempt, prepared, attempt.expectedExternalId ?? undefined),
         ...(result.evidenceMetadataJson === undefined
           ? {}
           : {
               metadataJson: mergeEvidenceMetadata(
-                evidenceFields(attempt, prepared, result.externalId).metadataJson,
+                evidenceFields(
+                  attempt,
+                  prepared,
+                  attempt.expectedExternalId ?? undefined,
+                ).metadataJson,
                 result.evidenceMetadataJson,
               ),
             }),
@@ -603,12 +603,16 @@ export class V2OutgoingWorker {
         attemptId: attempt.id,
         outcome: 'UNKNOWN',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
-        ...evidenceFields(attempt, prepared, result.externalId),
+        ...evidenceFields(attempt, prepared, attempt.expectedExternalId ?? undefined),
         ...(result.evidenceMetadataJson === undefined
           ? {}
           : {
               metadataJson: mergeEvidenceMetadata(
-                evidenceFields(attempt, prepared, result.externalId).metadataJson,
+                evidenceFields(
+                  attempt,
+                  prepared,
+                  attempt.expectedExternalId ?? undefined,
+                ).metadataJson,
                 result.evidenceMetadataJson,
               ),
             }),
@@ -702,11 +706,7 @@ export class V2OutgoingWorker {
         settlementState: 'CONFIRMED',
         outcomeState: 'CONFIRMED',
         ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
-        ...evidenceFields(
-          attempt,
-          undefined,
-          result.externalId ?? attempt.expectedExternalId ?? undefined,
-        ),
+        ...evidenceFields(attempt, undefined, attempt.expectedExternalId ?? undefined),
         ...(result.evidenceMetadataJson === undefined
           ? {}
           : {
@@ -714,7 +714,7 @@ export class V2OutgoingWorker {
                 evidenceFields(
                   attempt,
                   undefined,
-                  result.externalId ?? attempt.expectedExternalId ?? undefined,
+                  attempt.expectedExternalId ?? undefined,
                 ).metadataJson,
                 result.evidenceMetadataJson,
               ),
@@ -768,12 +768,16 @@ export class V2OutgoingWorker {
       attemptId: attempt.id,
       outcome: 'UNKNOWN',
       ...(result.externalId === undefined ? {} : { externalId: result.externalId }),
-      ...evidenceFields(attempt, undefined, result.externalId),
+      ...evidenceFields(attempt, undefined, attempt.expectedExternalId ?? undefined),
       ...(result.evidenceMetadataJson === undefined
         ? {}
         : {
             metadataJson: mergeEvidenceMetadata(
-              evidenceFields(attempt, undefined, result.externalId).metadataJson,
+              evidenceFields(
+                attempt,
+                undefined,
+                attempt.expectedExternalId ?? undefined,
+              ).metadataJson,
               result.evidenceMetadataJson,
             ),
           }),
