@@ -109,12 +109,32 @@ describe('local fake x402 service', () => {
       await app.close()
     }
   })
+
+  it('rejects a token transfer whose mint cannot be proven from the transaction', async () => {
+    const fixture = await createFixture({ ambiguousTransfer: true })
+    const app = createFakeX402App({
+      config: fixture.config,
+      rpc: fixture.rpc,
+    })
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/crypto/price?ids=bitcoin',
+        headers: { 'payment-signature': fixture.paymentSignature },
+      })
+      expect(response.statusCode).toBe(402)
+      expect(response.json()).toEqual({ error: 'TRANSFER_MISMATCH' })
+    } finally {
+      await app.close()
+    }
+  })
 })
 
 async function createFixture(
   input: {
     readonly destinationDelta?: bigint
     readonly extraSettlementTransfer?: boolean
+    readonly ambiguousTransfer?: boolean
   } = {},
 ) {
   const payer = await generateKeyPairSigner(true)
@@ -296,6 +316,22 @@ async function createFixture(
                       authority: payer.address,
                       mint: settlementMint,
                       tokenAmount: { amount: '1' },
+                    },
+                  },
+                },
+              ]
+            : []),
+          ...(input.ambiguousTransfer
+            ? [
+                {
+                  program: 'spl-token',
+                  parsed: {
+                    type: 'transfer',
+                    info: {
+                      source: blockhash,
+                      destination: extraDestinationAta[0],
+                      authority: payer.address,
+                      amount: '1',
                     },
                   },
                 },

@@ -441,20 +441,22 @@ async function verifySplTransfer(
   }
 
   const transfers = collectTransfers(transaction)
-  const settlementTransfers = transfers.filter((transfer) => {
+  const transferMints = transfers.map((transfer) => {
     const sourceBalance = findTokenBalanceByAddress(transaction, transfer.source)
-    const mint = transfer.mint ?? sourceBalance?.mint
-    return mint === config.settlementMint
+    return transfer.mint ?? sourceBalance?.mint
   })
-  const matchingTransfers = transfers.filter((transfer) => {
-    const sourceBalance = findTokenBalanceByAddress(transaction, transfer.source)
-    const mint = transfer.mint ?? sourceBalance?.mint
-    return (
+  if (transferMints.some((mint) => mint === undefined)) {
+    throw transferMismatch('A token transfer is missing a provable mint')
+  }
+  const settlementTransfers = transfers.filter(
+    (_transfer, index) => transferMints[index] === config.settlementMint,
+  )
+  const matchingTransfers = transfers.filter(
+    (transfer, index) =>
       transfer.destination === destinationAta[0] &&
       transfer.amount === config.amountAtomic &&
-      mint === config.settlementMint
-    )
-  })
+      transferMints[index] === config.settlementMint,
+  )
   if (settlementTransfers.length !== 1 || matchingTransfers.length !== 1) {
     throw transferMismatch(
       'The transaction does not contain exactly one TEST_USDC transfer',
