@@ -1391,10 +1391,13 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           signature,
           reason: 'TRANSACTION_UNAVAILABLE',
         })
-        const now = new Date()
+        // Other integration files share the same database and may have their
+        // own pending issues. Give this freshly-created issue a scheduling
+        // window and assert only on its claim, not on the global batch.
+        const now = new Date(Date.now() + 1_000)
         const concurrentClaims = await Promise.all([
-          database.claimIncomingReconciliationIssues(10, now),
-          database.claimIncomingReconciliationIssues(10, now),
+          database.claimIncomingReconciliationIssues(100, now),
+          database.claimIncomingReconciliationIssues(100, now),
         ])
         const claimed = concurrentClaims
           .flat()
@@ -1403,7 +1406,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(claimed).toHaveLength(1)
         expect(claimed[0]).toMatchObject({ accountId, retryCount: 1 })
         expect(
-          (await database.claimIncomingReconciliationIssues(10, now)).some(
+          (await database.claimIncomingReconciliationIssues(100, now)).some(
             (issue) => issue.signature === signature,
           ),
         ).toBe(false)
@@ -1411,7 +1414,7 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         expect(
           (
             await database.claimIncomingReconciliationIssues(
-              10,
+              100,
               new Date(now.getTime() + 10 * 60_000),
             )
           ).some((issue) => issue.signature === signature),
@@ -1456,23 +1459,25 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           expectedRetryCount <= 8;
           expectedRetryCount += 1
         ) {
-          const claimed = await database.claimIncomingReconciliationIssues(1, now)
-          expect(claimed).toHaveLength(1)
-          expect(claimed[0]).toMatchObject({
+          const claimed = await database.claimIncomingReconciliationIssues(100, now)
+          const currentIssue = claimed.find((issue) => issue.id === issueId)
+          expect(currentIssue).toMatchObject({
             id: issueId,
             retryCount: expectedRetryCount,
           })
           now = new Date(now.getTime() + 10 * 60_000)
         }
 
-        const recovered = await database.claimIncomingReconciliationIssues(1, now)
-        expect(recovered).toHaveLength(1)
-        expect(recovered[0]).toMatchObject({ id: issueId, retryCount: 9 })
+        const recovered = await database.claimIncomingReconciliationIssues(100, now)
+        expect(recovered.find((issue) => issue.id === issueId)).toMatchObject({
+          id: issueId,
+          retryCount: 9,
+        })
         const exhausted = await database.claimIncomingReconciliationIssues(
-          1,
+          100,
           new Date(now.getTime() + 10 * 60_000),
         )
-        expect(exhausted).toHaveLength(0)
+        expect(exhausted.some((issue) => issue.id === issueId)).toBe(false)
         const status = await sql.query<{ status: string; recovery_count: number }>(
           'SELECT status, recovery_count FROM incoming_reconciliation_issues WHERE id = $1',
           [issueId],

@@ -49,14 +49,14 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         )
 
         const claims = await database.v2Operations.claimWebhookDeliveries({
-          limit: 1,
+          limit: 100,
           owner: 'replacement-worker',
           leaseSeconds: 30,
           maxAttempts: 3,
           now: new Date(),
         })
 
-        expect(claims).toEqual([])
+        expect(claims.filter((claim) => claim.id === deliveryId)).toEqual([])
         const persisted = await sql.query<{
           status: string
           attempt_count: number
