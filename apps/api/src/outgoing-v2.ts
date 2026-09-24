@@ -915,7 +915,7 @@ export class V2OutgoingWorker {
           settlementState: 'NOT_SUBMITTED',
           outcomeState: 'PROVED_NO_EFFECT',
           failureCode: decision.reasonCode,
-          failureMessageSafe: 'Outgoing execution failed before submission',
+          failureMessageSafe: failureMessageSafe(error),
           ...evidenceFields(attempt),
           reservation: 'RELEASE',
           evidenceOutcome: 'PROVED_NO_EFFECT',
@@ -1429,6 +1429,16 @@ function paymentIdFromClaim(claim: V2WorkItemClaim): string {
     throw new InvalidStateError('Outgoing work item payload has no payment id')
   }
   return payload.payment_id
+}
+
+function failureMessageSafe(error: unknown): string {
+  if (!(error instanceof ExternalRailError)) {
+    return 'Outgoing execution failed before submission'
+  }
+  const detail = error.message.trim().slice(0, 256)
+  return detail.length === 0
+    ? 'Outgoing execution failed before submission'
+    : `Outgoing execution failed before submission: ${detail}`
 }
 
 function platformCostRecordId(attemptId: string, effectHash: string): string {
