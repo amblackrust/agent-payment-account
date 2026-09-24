@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import type { DatabaseClient } from '@agent-payment/db'
 import { DependencyUnavailableError } from '@agent-payment/core'
 import type { SolanaCluster, SolanaRail } from '@agent-payment/solana-rail'
@@ -42,7 +44,7 @@ export function createFundingProvisioner(input: {
         )
       }
       await input.database.v2Admin.upsertFundingDestination({
-        id: `funding_${accountId}_${route.id}_${asset.id}`,
+        id: createFundingDestinationId(accountId, route.id, asset.id),
         accountId,
         routeId: route.id,
         network: route.network,
@@ -58,4 +60,14 @@ export function createFundingProvisioner(input: {
       })
     },
   }
+}
+
+function createFundingDestinationId(
+  accountId: string,
+  routeId: string,
+  assetId: string,
+): string {
+  const identity = [accountId, routeId, assetId].join('\u0000')
+  const digest = createHash('sha256').update(identity, 'utf8').digest('hex')
+  return `funding_${digest.slice(0, 56)}`
 }

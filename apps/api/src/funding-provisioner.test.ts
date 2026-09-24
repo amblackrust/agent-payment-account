@@ -152,7 +152,11 @@ function createProvisioningHarness(ataStatus: 'MISSING' | 'PRESENT') {
   }
 }
 
-function createDirectProvisioner(ataStatus: 'MISSING' | 'PRESENT') {
+function createDirectProvisioner(
+  ataStatus: 'MISSING' | 'PRESENT',
+  routeOverride: SettlementRoute = route,
+  assetOverride = asset,
+) {
   const rail = createRail(ataStatus)
   const upsertFundingDestination = vi.fn(
     async (input: Parameters<V2AdminRepository['upsertFundingDestination']>[0]) => ({
@@ -163,8 +167,8 @@ function createDirectProvisioner(ataStatus: 'MISSING' | 'PRESENT') {
   )
   const database = {
     v2: {
-      listActiveSettlementRoutes: async () => [route],
-      findSettlementAsset: async () => asset,
+      listActiveSettlementRoutes: async () => [routeOverride],
+      findSettlementAsset: async () => assetOverride,
     },
     v2Admin: { upsertFundingDestination },
   } as unknown as Pick<DatabaseClient, 'v2' | 'v2Admin'>
@@ -204,6 +208,27 @@ describe('createFundingProvisioner', () => {
         destination: 'token-account',
       }),
     )
+  })
+
+  it('keeps the persisted destination identifier within the database limit', async () => {
+    const longRoute: SettlementRoute = {
+      ...route,
+      id: 'route_' + 'r'.repeat(58),
+    }
+    const longAsset = {
+      ...asset,
+      id: 'asset_' + 'a'.repeat(58),
+    }
+    const harness = createDirectProvisioner('PRESENT', longRoute, longAsset)
+
+    await harness.provisioner.provision({
+      accountId: 'account_' + 'c'.repeat(56),
+      owner: 'owner_1',
+    })
+
+    const [input] = harness.upsertFundingDestination.mock.calls[0] ?? []
+    expect(input?.id).toMatch(/^funding_[0-9a-f]{56}$/u)
+    expect(input?.id).toHaveLength(64)
   })
 })
 
