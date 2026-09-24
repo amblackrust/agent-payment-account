@@ -66,25 +66,39 @@ export class ConstrainedCustodyBoundary {
   ): Promise<ConstrainedSignedEffect> {
     validateEffectSigningRequest(request)
     const signed = await this.backend.signPaymentEffect(request)
-    if (
-      signed === null ||
-      typeof signed !== 'object' ||
-      typeof signed.effectHash !== 'string' ||
-      typeof signed.keyVersion !== 'number' ||
-      !(signed.signedPayload instanceof Uint8Array) ||
-      typeof signed.externalId !== 'string' ||
-      signed.signedPayload.byteLength === 0 ||
-      signed.externalId.length === 0
-    ) {
-      throw new CustodyUnavailableError('Custody returned an incomplete signed effect')
+    try {
+      if (
+        signed === null ||
+        typeof signed !== 'object' ||
+        typeof signed.effectHash !== 'string' ||
+        typeof signed.keyVersion !== 'number' ||
+        !(signed.signedPayload instanceof Uint8Array) ||
+        typeof signed.externalId !== 'string' ||
+        signed.signedPayload.byteLength === 0 ||
+        signed.externalId.length === 0
+      ) {
+        throw new CustodyUnavailableError(
+          'Custody returned an incomplete signed effect',
+        )
+      }
+      if (signed.effectHash !== request.effectHash) {
+        throw new CustodyUnavailableError('Custody returned a mismatched effect hash')
+      }
+      if (signed.keyVersion !== request.keyVersion) {
+        throw new CustodyUnavailableError('Custody returned a mismatched key version')
+      }
+      return signed
+    } catch (error) {
+      if (
+        signed !== null &&
+        typeof signed === 'object' &&
+        'signedPayload' in signed &&
+        signed.signedPayload instanceof Uint8Array
+      ) {
+        signed.signedPayload.fill(0)
+      }
+      throw error
     }
-    if (signed.effectHash !== request.effectHash) {
-      throw new CustodyUnavailableError('Custody returned a mismatched effect hash')
-    }
-    if (signed.keyVersion !== request.keyVersion) {
-      throw new CustodyUnavailableError('Custody returned a mismatched key version')
-    }
-    return signed
   }
 }
 

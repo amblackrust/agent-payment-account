@@ -99,6 +99,7 @@ describe('constrained custody boundary', () => {
   })
 
   it('rejects provider responses that change the constrained effect', async () => {
+    const signedPayload = Uint8Array.from([1, 2, 3])
     const boundary = new ConstrainedCustodyBoundary(
       {
         identity: 'test',
@@ -106,13 +107,14 @@ describe('constrained custody boundary', () => {
         signPaymentEffect: async () => ({
           effectHash: 'b'.repeat(64),
           keyVersion: 1,
-          signedPayload: Uint8Array.from([1]),
+          signedPayload,
           externalId: 'sig',
         }),
       },
       'test',
     )
     await expect(boundary.signPaymentEffect(request)).rejects.toThrow('effect hash')
+    expect(signedPayload).toEqual(new Uint8Array([0, 0, 0]))
   })
 
   it('rejects malformed provider signing responses at the boundary', async () => {

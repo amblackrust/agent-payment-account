@@ -346,87 +346,86 @@ export class V2OutgoingWorker {
           throw error
         }
       }
-      if (!signedPayloadIsDurable) {
-        await this.options.repository.updateAttemptOutcome({
-          attemptId: attempt.id,
-          currentOutcome: attempt.outcome,
-          nextOutcome: attempt.outcome,
-          currentRowVersion: preparedAttempt.rowVersion,
-          status: 'EXECUTING',
-          signedPayloadHash: hashBytes(signed.signedPayload),
-          expectedExternalId: signed.externalId,
-          signedPayloadEncrypted: serializeEncryptedPayload(
-            this.options.signedPayloadCipher.encrypt(signed.signedPayload),
-          ),
-        })
-      }
-      if (signingRequest.status === 'PENDING') {
-        await this.options.custody.completeSigningRequest(
-          signingRequest.id,
-          prepared.effectHash,
-          'SIGNED',
-        )
-      }
-      const currentView = await this.options.repository.findPaymentView(
-        claim.accountId,
-        paymentId,
-      )
-      if (currentView === null) {
-        await this.options.repository.failWorkItem({
-          id: claim.id,
-          owner: this.options.owner,
-          errorCode: 'PAYMENT_NOT_FOUND_AFTER_SIGNING',
-          errorSafe: 'Payment disappeared after signing',
-        })
-        return
-      }
-      const currentAttempt = currentView.attempts.at(-1)
-      if (currentAttempt === undefined) {
-        await this.options.repository.failWorkItem({
-          id: claim.id,
-          owner: this.options.owner,
-          errorCode: 'PAYMENT_ATTEMPT_NOT_FOUND_AFTER_SIGNING',
-          errorSafe: 'Payment attempt disappeared after signing',
-        })
-        return
-      }
-      if (
-        currentAttempt.id !== prepared.attemptId ||
-        currentAttempt.preparedEffectHash !== prepared.effectHash
-      ) {
-        await this.options.repository.completeWorkItem(claim.id, this.options.owner)
-        return
-      }
-      if (!(await this.ensureActiveBeforeEffect(claim, currentView, currentAttempt)))
-        return
-      if (!(await this.acquireCapacity(claim, 'rail'))) return
-      let result: Awaited<ReturnType<V2OutgoingExecutor['submit']>>
       try {
-        result = await this.options.executor.submit({ prepared, signed })
+        if (!signedPayloadIsDurable) {
+          await this.options.repository.updateAttemptOutcome({
+            attemptId: attempt.id,
+            currentOutcome: attempt.outcome,
+            nextOutcome: attempt.outcome,
+            currentRowVersion: preparedAttempt.rowVersion,
+            status: 'EXECUTING',
+            signedPayloadHash: hashBytes(signed.signedPayload),
+            expectedExternalId: signed.externalId,
+            signedPayloadEncrypted: serializeEncryptedPayload(
+              this.options.signedPayloadCipher.encrypt(signed.signedPayload),
+            ),
+          })
+        }
+        if (signingRequest.status === 'PENDING') {
+          await this.options.custody.completeSigningRequest(
+            signingRequest.id,
+            prepared.effectHash,
+            'SIGNED',
+          )
+        }
+        const currentView = await this.options.repository.findPaymentView(
+          claim.accountId,
+          paymentId,
+        )
+        if (currentView === null) {
+          await this.options.repository.failWorkItem({
+            id: claim.id,
+            owner: this.options.owner,
+            errorCode: 'PAYMENT_NOT_FOUND_AFTER_SIGNING',
+            errorSafe: 'Payment disappeared after signing',
+          })
+          return
+        }
+        const currentAttempt = currentView.attempts.at(-1)
+        if (currentAttempt === undefined) {
+          await this.options.repository.failWorkItem({
+            id: claim.id,
+            owner: this.options.owner,
+            errorCode: 'PAYMENT_ATTEMPT_NOT_FOUND_AFTER_SIGNING',
+            errorSafe: 'Payment attempt disappeared after signing',
+          })
+          return
+        }
+        if (
+          currentAttempt.id !== prepared.attemptId ||
+          currentAttempt.preparedEffectHash !== prepared.effectHash
+        ) {
+          await this.options.repository.completeWorkItem(claim.id, this.options.owner)
+          return
+        }
+        if (!(await this.ensureActiveBeforeEffect(claim, currentView, currentAttempt)))
+          return
+        if (!(await this.acquireCapacity(claim, 'rail'))) return
+        const result = await this.options.executor.submit({ prepared, signed })
+        this.logger?.info(
+          {
+            worker: this.options.owner,
+            paymentId: view.payment.id,
+            attemptId: attempt.id,
+            dependency: 'rail',
+            state: result.status,
+            ...(view.payment.correlationId === undefined ||
+            view.payment.correlationId === null
+              ? {}
+              : { correlationId: view.payment.correlationId }),
+          },
+          'Settlement rail submission observed',
+        )
+        await this.handleSubmissionResult(
+          claim,
+          currentView,
+          currentAttempt,
+          prepared,
+          result,
+        )
       } finally {
         signed.signedPayload.fill(0)
       }
-      this.logger?.info(
-        {
-          worker: this.options.owner,
-          paymentId: view.payment.id,
-          attemptId: attempt.id,
-          dependency: 'rail',
-          state: result.status,
-          ...(view.payment.correlationId === undefined ||
-          view.payment.correlationId === null
-            ? {}
-            : { correlationId: view.payment.correlationId }),
-        },
-        'Settlement rail submission observed',
-      )
-      await this.handleSubmissionResult(
-        claim,
-        currentView,
-        currentAttempt,
-        prepared,
-        result,
-      )
     } catch (error) {
       await this.handleFailure(claim, error)
     }
