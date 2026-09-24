@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { buildChildEnvironment } from './run-with-root-env.mjs'
 
 describe('root environment launcher', () => {
-  it('keeps project values while dropping unrelated shell secrets', () => {
+  it('prefers local project values while dropping shell secrets', () => {
     const environment = buildChildEnvironment(
       {
         DATABASE_URL: 'postgresql://local.example.test/app',
@@ -27,13 +27,32 @@ describe('root environment launcher', () => {
       PATH: '/usr/bin',
       HOME: '/tmp/developer',
       COREPACK_HOME: '/tmp/corepack',
-      DATABASE_URL: 'postgresql://local.example.test/app',
+      DATABASE_URL: 'postgresql://shell.example.test/app',
       NODE_ENV: 'development',
       WALLET_MASTER_KEY: 'local-wallet-key',
     })
     expect(environment).not.toHaveProperty('ADMIN_API_KEY')
     expect(environment).not.toHaveProperty('NODE_OPTIONS')
     expect(environment).not.toHaveProperty('UNRELATED_SECRET')
+  })
+
+  it('allows an explicit database URL to override local dotenv', () => {
+    const environment = buildChildEnvironment(
+      {
+        DATABASE_URL: 'postgresql://local.example.test/app',
+        NODE_ENV: 'development',
+      },
+      {
+        PATH: '/usr/bin',
+        DATABASE_URL: 'postgresql://shell.example.test/app',
+      },
+      true,
+    )
+
+    expect(environment).toMatchObject({
+      DATABASE_URL: 'postgresql://shell.example.test/app',
+      NODE_ENV: 'development',
+    })
   })
 
   it('allows the explicitly required database variable when optional .env is absent', () => {

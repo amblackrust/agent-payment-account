@@ -71,6 +71,7 @@ const projectVariableNames = [
   'BACKUP_INTERVAL_SECONDS',
   'ALLOW_MAINNET',
 ]
+const explicitLocalOverrideNames = new Set(['DATABASE_URL'])
 export function buildChildEnvironment(
   parsedEnvironment,
   sourceEnvironment,
@@ -79,7 +80,10 @@ export function buildChildEnvironment(
 ) {
   const childEnvironment = buildChildProcessEnvironment({}, sourceEnvironment)
   for (const name of projectVariableNames) {
-    const value = parsedEnvironment[name]
+    const value =
+      explicitLocalOverrideNames.has(name) && sourceEnvironment[name] !== undefined
+        ? sourceEnvironment[name]
+        : parsedEnvironment[name]
     if (value !== undefined) childEnvironment[name] = value
   }
   if (!environmentExists && fallbackVariable !== undefined) {
