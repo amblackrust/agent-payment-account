@@ -837,11 +837,13 @@ async function matchIncomingPaymentInTransaction(
     select: { signature: true },
   })
   if (incoming === null) return null
+  // Legacy incoming and receive amounts use cents, while V2 payments use the
+  // denomination scale. The exact transaction signature, account, and reference
+  // bind the payment; receive matching below still compares incoming amounts.
   const managedPayment = await transaction.payment.findFirst({
     where: {
       status: 'CONFIRMED',
       recipientManagedAccountId: input.accountId,
-      amountAtomic: input.amountAtomic,
       externalReference: input.reference,
       attempts: { some: { railTransactionId: incoming.signature } },
     },
@@ -2594,7 +2596,6 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
                 AND payment.status = 'CONFIRMED'
                 AND payment.recipient_managed_account_id = incoming.account_id
                 AND payment.external_reference = incoming.reference
-                AND payment.amount_atomic = incoming.amount_atomic
                 AND payment.created_at >= receive.created_at
                 AND payment.confirmed_at IS NOT NULL
                 AND (receive.expires_at IS NULL OR receive.expires_at > payment.confirmed_at)
