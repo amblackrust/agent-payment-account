@@ -1390,14 +1390,21 @@ function restoreSignedEffect(
     nonce: parsed.nonce,
     authTag: parsed.authTag,
   })
-  if (hashBytes(signedPayload) !== expectedPayloadHash) {
-    throw new InvalidStateError('Durable signed effect hash does not match its payload')
-  }
-  return {
-    effectHash: prepared.effectHash,
-    keyVersion: prepared.keyVersion,
-    signedPayload,
-    externalId: expectedExternalId,
+  try {
+    if (hashBytes(signedPayload) !== expectedPayloadHash) {
+      throw new InvalidStateError(
+        'Durable signed effect hash does not match its payload',
+      )
+    }
+    return {
+      effectHash: prepared.effectHash,
+      keyVersion: prepared.keyVersion,
+      signedPayload,
+      externalId: expectedExternalId,
+    }
+  } catch (error) {
+    signedPayload.fill(0)
+    throw error
   }
 }
 
