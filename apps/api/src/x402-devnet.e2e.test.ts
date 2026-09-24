@@ -293,9 +293,12 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
         },
       )
       expect(policy.status).toBe(200)
-      expect(
-        requireString(asRecord(policy.body, 'policy').status, 'policy status'),
-      ).toBe('ACTIVE')
+      const initialPolicy = asRecord(policy.body, 'policy')
+      expect(requireString(initialPolicy.status, 'policy status')).toBe('ACTIVE')
+      const initialPolicyVersion = requireInteger(
+        initialPolicy.version,
+        'initial policy version',
+      )
 
       const fundingDestination = await requestJson(
         `${apiBaseUrl()}/v2/accounts/${accountId}/funding-destination`,
@@ -334,10 +337,16 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
             rolling_budget: '1',
             rolling_window_seconds: 3_600,
             transaction_count_cap: 10,
+            version: initialPolicyVersion,
           }),
         },
       )
       expect(deniedPolicy.status).toBe(200)
+      const deniedPolicyRecord = asRecord(deniedPolicy.body, 'denied policy')
+      const deniedPolicyVersion = requireInteger(
+        deniedPolicyRecord.version,
+        'denied policy version',
+      )
       const denied = await requestJson(`${apiBaseUrl()}/v2/external-payments/x402`, {
         method: 'POST',
         headers: {
@@ -369,6 +378,7 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
             rolling_budget: '1',
             rolling_window_seconds: 3_600,
             transaction_count_cap: 10,
+            version: deniedPolicyVersion,
           }),
         },
       )
@@ -1092,6 +1102,13 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 function requireString(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0) {
     throw new Error(`${label} must be a non-empty string`)
+  }
+  return value
+}
+
+function requireInteger(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new Error(`${label} must be an integer`)
   }
   return value
 }
