@@ -40,6 +40,11 @@ const DENOMINATION_ID = 'devnet_x402_usd'
 const SETTLEMENT_ASSET_ID = 'devnet_x402_test_usdc'
 const ECONOMIC_MAPPING_ID = 'devnet_x402_usd_to_test_usdc'
 const SETTLEMENT_ROUTE_ID = 'devnet_x402_solana_route'
+const DEVNET_RPC_RATE_LIMIT_MAX_RETRIES = 5
+const DEVNET_RPC_RATE_LIMIT_BASE_DELAY_MS = 1_000
+const DEVNET_RPC_RATE_LIMIT_MAX_DELAY_MS = 15_000
+const DEVNET_E2E_HOOK_TIMEOUT_MS = 480_000
+const DEVNET_E2E_API_READINESS_TIMEOUT_MS = 120_000
 
 interface HttpResult {
   readonly status: number
@@ -151,7 +156,11 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
           ALLOW_MAINNET: 'false',
         },
       )
-      await waitForHttp(`${apiBaseUrl()}/health/ready`, apiProcess, 60_000)
+      await waitForHttp(
+        `${apiBaseUrl()}/health/ready`,
+        apiProcess,
+        DEVNET_E2E_API_READINESS_TIMEOUT_MS,
+      )
 
       const initialProvisioning = await requestJson(`${apiBaseUrl()}/v2/accounts`, {
         method: 'POST',
@@ -439,7 +448,10 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
           'x402 payment confirmation',
         )
       } catch (error) {
-        const diagnostics = state?.apiProcess.diagnostics() ?? ''
+        const diagnostics = [
+          `API:\n${apiProcess?.diagnostics() ?? ''}`,
+          `Fake x402:\n${fakeProcess?.diagnostics() ?? ''}`,
+        ].join('\n')
         throw new Error(
           `${error instanceof Error ? error.message : 'x402 payment confirmation failed'}\nAPI diagnostics:\n${diagnostics}`,
           { cause: error },
@@ -574,16 +586,40 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
         solTargetLamports: 100_000_000n,
       })
       expect(lowBalanceSetup.agentAccount?.tokenAccount).toBeTruthy()
-      const lowBalanceCompleted = await requestJson(`${apiBaseUrl()}/v2/accounts`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-admin-api-key': adminApiKey,
-          'idempotency-key': lowBalanceAccountIdempotencyKey,
-        },
-        body: JSON.stringify({ name: lowBalanceAccountName }),
-      })
-      expect(lowBalanceCompleted.status).toBe(201)
+      let lowBalanceCompleted: HttpResult | undefined
+      let lastLowBalanceResponse: HttpResult | undefined
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const response = await requestJson(`${apiBaseUrl()}/v2/accounts`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-admin-api-key': adminApiKey,
+            'idempotency-key': lowBalanceAccountIdempotencyKey,
+          },
+          body: JSON.stringify({ name: lowBalanceAccountName }),
+        })
+        lastLowBalanceResponse = response
+        if (response.status === 201) {
+          lowBalanceCompleted = response
+          break
+        }
+        if (response.status !== 502) {
+          throw new Error(
+            `Low-balance provisioning returned HTTP ${response.status}: ${JSON.stringify(response.body)}`,
+          )
+        }
+        const delayMs = Math.min(15_000, 1_000 * 2 ** attempt)
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+      }
+      if (lowBalanceCompleted === undefined) {
+        throw new Error(
+          [
+            'Low-balance provisioning remained transiently unavailable',
+            `last response: ${JSON.stringify(lastLowBalanceResponse?.body)}`,
+            `API diagnostics:\n${apiProcess?.diagnostics() ?? ''}`,
+          ].join('\n'),
+        )
+      }
       const lowBalanceResponse = asRecord(
         lowBalanceCompleted.body,
         'low-balance account response',
@@ -687,14 +723,25 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
           ALLOW_MAINNET: 'false',
         },
       )
-      await waitForHttp(`${apiBaseUrl()}/health/ready`, apiProcess, 60_000)
-      const afterRestart = await requestJson(
-        `${apiBaseUrl()}/v2/payments/${paymentId}`,
-        {
+      await waitForHttp(
+        `${apiBaseUrl()}/health/ready`,
+        apiProcess,
+        DEVNET_E2E_API_READINESS_TIMEOUT_MS,
+      )
+      let afterRestart: HttpResult
+      try {
+        afterRestart = await requestJson(`${apiBaseUrl()}/v2/payments/${paymentId}`, {
           method: 'GET',
           headers: agentHeaders(apiKey),
-        },
-      )
+        })
+      } catch (error) {
+        throw new Error(
+          `Payment read after API restart failed: ${
+            error instanceof Error ? error.message : String(error)
+          }\nAPI diagnostics:\n${apiProcess.diagnostics()}`,
+          { cause: error },
+        )
+      }
       expect(afterRestart.status).toBe(200)
       expect(asRecord(afterRestart.body, 'payment after restart').status).toBe(
         'CONFIRMED',
@@ -771,7 +818,7 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
         `${apiBaseUrl()}/v2/accounts/${accountId}/credentials/${accountCredentialId}/revoke`,
         {
           method: 'POST',
-          headers: adminHeaders(adminApiKey),
+          headers: { 'x-admin-api-key': adminApiKey },
         },
       )
       expect(credentialRevocation.status).toBe(200)
@@ -876,7 +923,7 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       await database.disconnect()
       throw error
     }
-  }, 240_000)
+  }, DEVNET_E2E_HOOK_TIMEOUT_MS)
 
   afterAll(async () => {
     if (state !== undefined) {
@@ -996,6 +1043,7 @@ function startProcess(
       NO_DNA: '1',
       ...environment,
     },
+    detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let output = ''
@@ -1011,17 +1059,42 @@ function startProcess(
   }
 }
 
-async function stopProcess(process: RunningProcess): Promise<void> {
-  if (process.child.exitCode !== null || process.child.signalCode !== null) return
-  process.child.kill('SIGTERM')
+async function stopProcess(runningProcess: RunningProcess): Promise<void> {
+  if (
+    runningProcess.child.exitCode !== null ||
+    runningProcess.child.signalCode !== null
+  ) {
+    return
+  }
+  const pid = runningProcess.child.pid
+  if (pid !== undefined) {
+    try {
+      globalThis.process.kill(-pid, 'SIGTERM')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  } else {
+    runningProcess.child.kill('SIGTERM')
+  }
   await new Promise<void>((resolve) => {
     const timeout = setTimeout(() => {
-      if (process.child.exitCode === null && process.child.signalCode === null) {
-        process.child.kill('SIGKILL')
+      if (
+        runningProcess.child.exitCode === null &&
+        runningProcess.child.signalCode === null
+      ) {
+        if (pid !== undefined) {
+          try {
+            globalThis.process.kill(-pid, 'SIGKILL')
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+          }
+        } else {
+          runningProcess.child.kill('SIGKILL')
+        }
       }
       resolve()
     }, 10_000)
-    process.child.once('exit', () => {
+    runningProcess.child.once('exit', () => {
       clearTimeout(timeout)
       resolve()
     })
@@ -1033,23 +1106,30 @@ async function waitForHttp(
   process: RunningProcess,
   timeoutMs: number,
 ): Promise<void> {
-  await waitForCondition(
-    async () => {
-      if (process.child.exitCode !== null || process.child.signalCode !== null) {
-        throw new Error(
-          `Child process exited while waiting for ${url}: ${process.diagnostics()}`,
-        )
-      }
-      try {
-        const response = await fetch(url, { signal: AbortSignal.timeout(1_000) })
-        return response.ok
-      } catch {
-        return false
-      }
-    },
-    timeoutMs,
-    `HTTP readiness at ${url}`,
-  )
+  try {
+    await waitForCondition(
+      async () => {
+        if (process.child.exitCode !== null || process.child.signalCode !== null) {
+          throw new Error(
+            `Child process exited while waiting for ${url}: ${process.diagnostics()}`,
+          )
+        }
+        try {
+          const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+          return response.ok
+        } catch {
+          return false
+        }
+      },
+      timeoutMs,
+      `HTTP readiness at ${url}`,
+    )
+  } catch (error) {
+    throw new Error(
+      `${error instanceof Error ? error.message : 'HTTP readiness failed'}\nProcess diagnostics:\n${process.diagnostics()}`,
+      { cause: error },
+    )
+  }
 }
 
 async function waitForCondition(
@@ -1154,16 +1234,51 @@ async function readRpc(
   method: string,
   params: readonly unknown[],
 ): Promise<unknown> {
-  const response = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-    signal: AbortSignal.timeout(30_000),
-  })
-  const payload: unknown = await response.json()
-  const object = asRecord(payload, 'Solana RPC response')
-  if (object.error !== undefined) throw new Error(`Solana RPC ${method} failed`)
-  return object.result
+  for (let attempt = 0; attempt <= DEVNET_RPC_RATE_LIMIT_MAX_RETRIES; attempt += 1) {
+    const response = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (response.status === 429 && attempt < DEVNET_RPC_RATE_LIMIT_MAX_RETRIES) {
+      await waitForDevnetRpcRateLimit(response, attempt)
+      continue
+    }
+    if (!response.ok)
+      throw new Error(`Solana RPC ${method} returned HTTP ${response.status}`)
+    const payload: unknown = await response.json()
+    const object = asRecord(payload, 'Solana RPC response')
+    if (object.error !== undefined) throw new Error(`Solana RPC ${method} failed`)
+    return object.result
+  }
+  throw new Error(`Solana RPC rate limit persisted: ${method}`)
+}
+
+async function waitForDevnetRpcRateLimit(
+  response: Response,
+  attempt: number,
+): Promise<void> {
+  const retryAfter = response.headers.get('retry-after')
+  const retryAfterMs = parseRetryAfterMs(retryAfter)
+  const exponentialDelay = Math.min(
+    DEVNET_RPC_RATE_LIMIT_MAX_DELAY_MS,
+    DEVNET_RPC_RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt,
+  )
+  const delayMs = Math.min(
+    DEVNET_RPC_RATE_LIMIT_MAX_DELAY_MS,
+    Math.max(exponentialDelay, retryAfterMs ?? 0),
+  )
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+}
+
+function parseRetryAfterMs(value: string | null): number | undefined {
+  if (value === null) return undefined
+  const seconds = Number(value.trim())
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000)
+  const timestamp = Date.parse(value)
+  if (Number.isNaN(timestamp)) return undefined
+  return Math.max(0, timestamp - Date.now())
 }
 
 async function readTokenAccountBalance(

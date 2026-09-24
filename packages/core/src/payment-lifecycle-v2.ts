@@ -76,6 +76,10 @@ export function assertAttemptProgression(
       'PRE_EFFECT_ABORTED',
       'PROVED_NO_EFFECT',
       'SUBMITTED',
+      // A rail can observe a confirmed transaction before the worker persists
+      // the intermediate SUBMITTED observation. The authoritative confirmation
+      // is still safe to terminalize directly.
+      'CONFIRMED',
       'UNKNOWN',
       'FAILED',
     ],

@@ -871,6 +871,7 @@ export class V2OutgoingWorker {
   private async handleFailure(claim: V2WorkItemClaim, error: unknown): Promise<void> {
     const decision = classifyWorkFailure(error, 'RAIL')
     const view = await this.loadClaimView(claim)
+    const errorDetail = errorDetailSafe(error)
     this.options.metrics?.incrementCounter('mux_worker_failures_total', {
       result: decision.classification,
     })
@@ -886,9 +887,7 @@ export class V2OutgoingWorker {
         view?.payment.correlationId === null
           ? {}
           : { correlationId: view.payment.correlationId }),
-        ...(error instanceof ExternalRailError
-          ? { errorDetail: error.message.slice(0, 256) }
-          : {}),
+        ...(errorDetail === undefined ? {} : { errorDetail }),
       },
       'Outgoing work item failed',
     )
@@ -1439,6 +1438,25 @@ function failureMessageSafe(error: unknown): string {
   return detail.length === 0
     ? 'Outgoing execution failed before submission'
     : `Outgoing execution failed before submission: ${detail}`
+}
+
+function errorDetailSafe(error: unknown): string | undefined {
+  if (error instanceof ExternalRailError) return redactErrorDetail(error.message)
+  if (!(error instanceof Error)) return undefined
+  const detail = error.message.trim()
+  if (detail.length === 0) return error.name.slice(0, 256)
+  return redactErrorDetail(`${error.name}: ${detail}`)
+}
+
+function redactErrorDetail(detail: string): string {
+  return detail
+    .replace(
+      /(authorization|api[-_ ]?key|secret|private[-_ ]?key|password|token)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      '$1$2[REDACTED]',
+    )
+    .replace(/\bhttps?:\/\/[^\s/@]+:[^\s/@]+@/giu, 'https://[REDACTED]@')
+    .replace(/\b[0-9a-f]{128}\b/giu, '[REDACTED_HEX_SECRET]')
+    .slice(0, 256)
 }
 
 function platformCostRecordId(attemptId: string, effectHash: string): string {

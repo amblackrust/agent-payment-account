@@ -48,6 +48,9 @@ import {
 
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000
 const DEFAULT_RPC_TIMEOUT_MS = 5_000
+const RPC_RATE_LIMIT_MAX_RETRIES = 5
+const RPC_RATE_LIMIT_BASE_DELAY_MS = 1_000
+const RPC_RATE_LIMIT_MAX_DELAY_MS = 15_000
 const MAX_RESPONSE_BODY_BYTES = 8 * 1024
 const SOLANA_SPL_RAIL = 'SOLANA_SPL'
 
@@ -1026,22 +1029,36 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
   async function withRpcTimeout<T>(
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), rpcTimeoutMs)
-    try {
-      return await operation(controller.signal)
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new ExternalRailError(
-          'x402 Solana RPC request timed out',
-          error,
-          'RETRYABLE',
-        )
+    for (let attempt = 0; attempt <= RPC_RATE_LIMIT_MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), rpcTimeoutMs)
+      try {
+        return await operation(controller.signal)
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new ExternalRailError(
+            'x402 Solana RPC request timed out',
+            error,
+            'RETRYABLE',
+          )
+        }
+        if (!isRpcRateLimitedError(error) || attempt === RPC_RATE_LIMIT_MAX_RETRIES) {
+          throw new ExternalRailError(
+            'x402 Solana RPC request failed',
+            error,
+            'RETRYABLE',
+          )
+        }
+        await waitForRpcRateLimit(attempt)
+      } finally {
+        clearTimeout(timeout)
       }
-      throw new ExternalRailError('x402 Solana RPC request failed', error, 'RETRYABLE')
-    } finally {
-      clearTimeout(timeout)
     }
+    throw new ExternalRailError(
+      'x402 Solana RPC request failed',
+      undefined,
+      'RETRYABLE',
+    )
   }
 
   async function createPaymentPayload(
@@ -1078,6 +1095,15 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
       }
       return selected
     })
+    coreClient.setSpendControls({
+      allowedAssets: [
+        {
+          network: x402Network,
+          asset: settlementMint,
+          maxAmountPerPayment: options.maxPaymentAtomic.toString(),
+        },
+      ],
+    })
     coreClient.register(
       x402Network,
       new ExactSvmScheme(createNoopSigner(payerOwner), { rpcUrl: options.rpcUrl }),
@@ -1087,6 +1113,29 @@ export function createX402OutgoingExecutor(options: X402OutgoingExecutorOptions)
   }
 
   return { prepare, sign, submit, reconcile, checkReadiness }
+}
+
+function isRpcRateLimitedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const context = (error as { readonly context?: unknown }).context
+  if (
+    typeof context === 'object' &&
+    context !== null &&
+    !Array.isArray(context) &&
+    (context as { readonly statusCode?: unknown }).statusCode === 429
+  ) {
+    return true
+  }
+  const detail = `${error.name} ${error.message}`.toLowerCase()
+  return detail.includes('429') || detail.includes('too many requests')
+}
+
+async function waitForRpcRateLimit(attempt: number): Promise<void> {
+  const delayMs = Math.min(
+    RPC_RATE_LIMIT_MAX_DELAY_MS,
+    RPC_RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt,
+  )
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
 }
 
 function assertRouteConfiguration(

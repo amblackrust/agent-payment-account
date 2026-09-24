@@ -35,23 +35,43 @@ const asset = {
   version: 1,
 }
 
-function createRail(ataStatus: 'MISSING' | 'PRESENT'): SolanaRail {
-  return {
+function createRail(
+  ataStatus: 'MISSING' | 'PRESENT',
+  options: {
+    readonly atomicBalance?: bigint
+    readonly rejectUsdBalance?: boolean
+  } = {},
+): SolanaRail {
+  const rail: SolanaRail = {
     checkReadiness: vi.fn(async () => undefined),
     getReceiveDestination: vi.fn(async (owner) => ({
       owner,
       tokenAccount: 'token-account',
       settlementMint,
     })),
-    getSettlementBalance: vi.fn(async () => ({
-      currency: 'USD' as const,
-      settled: moneyFromAtomicUnits(0n),
-      tokenAtomicUnits: 0n,
+    getSettlementBalance: vi.fn(async () => {
+      if (options.rejectUsdBalance === true) {
+        throw new Error('USD projection should not be used for atomic readiness')
+      }
+      return {
+        currency: 'USD' as const,
+        settled: moneyFromAtomicUnits(0n),
+        tokenAtomicUnits: 0n,
+        tokenDecimals: 6,
+        ata: 'token-account',
+        ataStatus,
+      }
+    }),
+  }
+  if (options.atomicBalance !== undefined) {
+    rail.getSettlementAtomicBalance = vi.fn(async () => ({
+      tokenAtomicUnits: options.atomicBalance ?? 0n,
       tokenDecimals: 6,
       ata: 'token-account',
       ataStatus,
-    })),
+    }))
   }
+  return rail
 }
 
 function createProvisioningHarness(ataStatus: 'MISSING' | 'PRESENT') {
@@ -156,8 +176,12 @@ function createDirectProvisioner(
   ataStatus: 'MISSING' | 'PRESENT',
   routeOverride: SettlementRoute = route,
   assetOverride = asset,
+  railOptions: {
+    readonly atomicBalance?: bigint
+    readonly rejectUsdBalance?: boolean
+  } = {},
 ) {
-  const rail = createRail(ataStatus)
+  const rail = createRail(ataStatus, railOptions)
   const upsertFundingDestination = vi.fn(
     async (input: Parameters<V2AdminRepository['upsertFundingDestination']>[0]) => ({
       ...input,
@@ -207,6 +231,19 @@ describe('createFundingProvisioner', () => {
         readiness: 'READY',
         destination: 'token-account',
       }),
+    )
+  })
+
+  it('uses atomic readiness when a sub-cent token balance cannot be represented as USD cents', async () => {
+    const harness = createDirectProvisioner('PRESENT', route, asset, {
+      atomicBalance: 500n,
+      rejectUsdBalance: true,
+    })
+
+    await harness.provisioner.provision({ accountId: 'acct_1', owner: 'owner_1' })
+
+    expect(harness.upsertFundingDestination).toHaveBeenCalledWith(
+      expect.objectContaining({ readiness: 'READY' }),
     )
   })
 

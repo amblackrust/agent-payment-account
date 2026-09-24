@@ -24,6 +24,11 @@ const MAX_AIRDROP_SOL = 2n
 const MAX_TOKEN_TARGET = 1_000_000n * 10n ** BigInt(TEST_USDC_DECIMALS)
 const COMMAND_TIMEOUT_MS = 120_000
 const RPC_TIMEOUT_MS = 20_000
+const RPC_RATE_LIMIT_MAX_RETRIES = 5
+const RPC_RATE_LIMIT_BASE_DELAY_MS = 1_000
+const RPC_RATE_LIMIT_MAX_DELAY_MS = 15_000
+const CLI_BLOCKHASH_MAX_RETRIES = 3
+const CLI_BLOCKHASH_BASE_DELAY_MS = 1_000
 const POLL_INTERVAL_MS = 500
 const POLL_TIMEOUT_MS = 45_000
 
@@ -267,39 +272,69 @@ function checkPrerequisites() {
 function createRpcClient(rpcUrl) {
   return {
     async request(method, params = []) {
-      let response
-      try {
-        response = await fetch(rpcUrl, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-          signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
-        })
-      } catch (error) {
-        throw new DevnetX402SetupError(`Devnet RPC request failed: ${method}.`, error)
+      for (let attempt = 0; attempt <= RPC_RATE_LIMIT_MAX_RETRIES; attempt += 1) {
+        let response
+        try {
+          response = await fetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+            signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
+          })
+        } catch (error) {
+          throw new DevnetX402SetupError(`Devnet RPC request failed: ${method}.`, error)
+        }
+        if (response.status === 429 && attempt < RPC_RATE_LIMIT_MAX_RETRIES) {
+          await waitForRpcRateLimit(response, attempt)
+          continue
+        }
+        if (!response.ok) {
+          throw new DevnetX402SetupError(`Devnet RPC returned HTTP ${response.status}.`)
+        }
+        let payload
+        try {
+          payload = await response.json()
+        } catch (error) {
+          throw new DevnetX402SetupError(
+            `Devnet RPC returned invalid JSON: ${method}.`,
+            error,
+          )
+        }
+        if (
+          payload === null ||
+          typeof payload !== 'object' ||
+          payload.error !== undefined
+        ) {
+          throw new DevnetX402SetupError(`Devnet RPC rejected ${method}.`)
+        }
+        return payload.result
       }
-      if (!response.ok) {
-        throw new DevnetX402SetupError(`Devnet RPC returned HTTP ${response.status}.`)
-      }
-      let payload
-      try {
-        payload = await response.json()
-      } catch (error) {
-        throw new DevnetX402SetupError(
-          `Devnet RPC returned invalid JSON: ${method}.`,
-          error,
-        )
-      }
-      if (
-        payload === null ||
-        typeof payload !== 'object' ||
-        payload.error !== undefined
-      ) {
-        throw new DevnetX402SetupError(`Devnet RPC rejected ${method}.`)
-      }
-      return payload.result
+      throw new DevnetX402SetupError(`Devnet RPC rate limit persisted: ${method}.`)
     },
   }
+}
+
+async function waitForRpcRateLimit(response, attempt) {
+  const retryAfter = response.headers.get('retry-after')
+  const retryAfterMs = parseRetryAfterMs(retryAfter)
+  const exponentialDelay = Math.min(
+    RPC_RATE_LIMIT_MAX_DELAY_MS,
+    RPC_RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt,
+  )
+  const delayMs = Math.min(
+    RPC_RATE_LIMIT_MAX_DELAY_MS,
+    Math.max(exponentialDelay, retryAfterMs ?? 0),
+  )
+  await new Promise((resolve) => setTimeout(resolve, delayMs))
+}
+
+function parseRetryAfterMs(value) {
+  if (value === null) return undefined
+  const seconds = Number(value.trim())
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000)
+  const timestamp = Date.parse(value)
+  if (Number.isNaN(timestamp)) return undefined
+  return Math.max(0, timestamp - Date.now())
 }
 
 async function request(rpcClient, method, params) {
@@ -371,8 +406,10 @@ async function ensureSolBalance(
       remaining > MAX_AIRDROP_SOL * LAMPORTS_PER_SOL
         ? MAX_AIRDROP_SOL * LAMPORTS_PER_SOL
         : remaining
-    try {
-      runCommand('solana', [
+    await runCommandWithConfirmationRecovery(
+      runCommand,
+      'solana',
+      [
         'airdrop',
         formatAtomicAmount(requestAmount, 9),
         address,
@@ -380,8 +417,11 @@ async function ensureSolBalance(
         config.rpcUrl,
         '--commitment',
         'confirmed',
-      ])
-    } catch (error) {
+      ],
+      async () => (await getSolBalance(rpcClient, address)) >= balance + requestAmount,
+      config.pollTimeoutMs,
+      config.pollIntervalMs,
+    ).catch((error) => {
       throw new DevnetX402SetupError(
         `Devnet SOL faucet could not fund ${address} with ${formatAtomicAmount(
           requestAmount,
@@ -389,7 +429,7 @@ async function ensureSolBalance(
         )} SOL. Request that amount from a Solana devnet faucet, then rerun the setup.`,
         error,
       )
-    }
+    })
     await waitFor(
       async () => (await getSolBalance(rpcClient, address)) >= balance + requestAmount,
       config.pollTimeoutMs,
@@ -453,21 +493,28 @@ async function ensureMint(
   }
   if (await mintIsReady(rpcClient, mintAddress)) return
 
-  runCommand('spl-token', [
-    'create-token',
-    config.mintPath,
-    '--decimals',
-    String(TEST_USDC_DECIMALS),
-    '--fee-payer',
-    feePayerPath,
-    '--mint-authority',
-    feePayerAddress,
-    '--url',
-    config.rpcUrl,
-    '--output',
-    'json-compact',
-    '--verbose',
-  ])
+  await runCommandWithConfirmationRecovery(
+    runCommand,
+    'spl-token',
+    [
+      'create-token',
+      config.mintPath,
+      '--decimals',
+      String(TEST_USDC_DECIMALS),
+      '--fee-payer',
+      feePayerPath,
+      '--mint-authority',
+      feePayerAddress,
+      '--url',
+      config.rpcUrl,
+      '--output',
+      'json-compact',
+      '--verbose',
+    ],
+    async () => mintIsReady(rpcClient, mintAddress),
+    config.pollTimeoutMs,
+    config.pollIntervalMs,
+  )
   await waitFor(
     () => mintIsReady(rpcClient, mintAddress),
     config.pollTimeoutMs,
@@ -557,19 +604,35 @@ async function ensureAta(
   }
   if (existing !== null) return ataAddress
 
-  runCommand('spl-token', [
-    'create-account',
-    mintAddress,
-    '--owner',
-    ownerAddress,
-    '--fee-payer',
-    feePayerPath,
-    '--url',
-    config.rpcUrl,
-    '--output',
-    'json-compact',
-    '--verbose',
-  ])
+  await runCommandWithConfirmationRecovery(
+    runCommand,
+    'spl-token',
+    [
+      'create-account',
+      mintAddress,
+      '--owner',
+      ownerAddress,
+      '--fee-payer',
+      feePayerPath,
+      '--url',
+      config.rpcUrl,
+      '--output',
+      'json-compact',
+      '--verbose',
+    ],
+    async () => {
+      const observed = await getAccountInfo(rpcClient, ataAddress, 'jsonParsed')
+      if (observed === null) return false
+      if (!tokenAccountIsReady(observed, mintAddress, ownerAddress)) {
+        throw new DevnetX402SetupError(
+          'Existing ATA identity points to an incompatible token account.',
+        )
+      }
+      return true
+    },
+    config.pollTimeoutMs,
+    config.pollIntervalMs,
+  )
   await waitFor(
     async () =>
       tokenAccountIsReady(
@@ -615,21 +678,28 @@ async function ensureTokenBalance(
   const topUp = amountToTopUp(balance, targetAtomic)
   if (topUp === 0n) return balance
 
-  runCommand('spl-token', [
-    'mint',
-    mintAddress,
-    formatAtomicAmount(topUp, TEST_USDC_DECIMALS),
-    tokenAccountAddress,
-    '--mint-authority',
-    feePayerPath,
-    '--fee-payer',
-    feePayerPath,
-    '--url',
-    config.rpcUrl,
-    '--output',
-    'json-compact',
-    '--verbose',
-  ])
+  await runCommandWithConfirmationRecovery(
+    runCommand,
+    'spl-token',
+    [
+      'mint',
+      mintAddress,
+      formatAtomicAmount(topUp, TEST_USDC_DECIMALS),
+      tokenAccountAddress,
+      '--mint-authority',
+      feePayerPath,
+      '--fee-payer',
+      feePayerPath,
+      '--url',
+      config.rpcUrl,
+      '--output',
+      'json-compact',
+      '--verbose',
+    ],
+    async () => (await getTokenBalance(rpcClient, tokenAccountAddress)) >= targetAtomic,
+    config.pollTimeoutMs,
+    config.pollIntervalMs,
+  )
   await waitFor(
     async () => (await getTokenBalance(rpcClient, tokenAccountAddress)) >= targetAtomic,
     config.pollTimeoutMs,
@@ -638,6 +708,70 @@ async function ensureTokenBalance(
   )
   balance = await getTokenBalance(rpcClient, tokenAccountAddress)
   return balance
+}
+
+async function runCommandWithTransientRetry(runCommand, command, args) {
+  for (let attempt = 0; attempt <= CLI_BLOCKHASH_MAX_RETRIES; attempt += 1) {
+    try {
+      return runCommand(command, args)
+    } catch (error) {
+      if (!isBlockhashNotFoundError(error) || attempt === CLI_BLOCKHASH_MAX_RETRIES) {
+        throw error
+      }
+      const delayMs = CLI_BLOCKHASH_BASE_DELAY_MS * 2 ** attempt
+      await new Promise((resolve) => setTimeout(resolve, delayMs))
+    }
+  }
+  throw new DevnetX402SetupError(`${command} command failed after transient retries.`)
+}
+
+async function runCommandWithConfirmationRecovery(
+  runCommand,
+  command,
+  args,
+  postcondition,
+  postconditionTimeoutMs,
+  postconditionPollIntervalMs,
+) {
+  try {
+    await runCommandWithTransientRetry(runCommand, command, args)
+    return
+  } catch (error) {
+    if (!isTransactionConfirmationUncertainError(error)) throw error
+    try {
+      await waitFor(
+        postcondition,
+        postconditionTimeoutMs,
+        postconditionPollIntervalMs,
+        `${command} transaction effect`,
+      )
+      return
+    } catch (postconditionError) {
+      throw new DevnetX402SetupError(
+        `${command} confirmation outcome is unknown; refusing to resubmit the command automatically.`,
+        postconditionError,
+      )
+    }
+  }
+}
+
+function isBlockhashNotFoundError(error) {
+  if (!(error instanceof Error)) return false
+  const detail = `${error.name} ${error.message}`.toLowerCase()
+  return detail.includes('blockhashnotfound') || detail.includes('blockhash not found')
+}
+
+function isTransactionConfirmationUncertainError(error) {
+  if (!(error instanceof Error)) return false
+  const detail = `${error.name} ${error.message}`.toLowerCase()
+  return (
+    detail.includes('unable to confirm transaction') ||
+    detail.includes('transaction expiration') ||
+    detail.includes('transaction expired') ||
+    detail.includes('transaction was not confirmed') ||
+    detail.includes('transaction confirmation timed out') ||
+    detail.includes('timed out waiting for transaction confirmation')
+  )
 }
 
 function publicSetupResult({

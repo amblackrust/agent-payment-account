@@ -37,7 +37,10 @@ export function createFundingProvisioner(input: {
       }
       await input.rail.checkReadiness?.()
       const destination = await input.rail.getReceiveDestination(owner)
-      const balance = await input.rail.getSettlementBalance(owner)
+      const balance =
+        input.rail.getSettlementAtomicBalance === undefined
+          ? await input.rail.getSettlementBalance(owner)
+          : await input.rail.getSettlementAtomicBalance(owner)
       if (balance.ataStatus !== 'PRESENT') {
         throw new DependencyUnavailableError(
           'Funding destination token account is not ready',

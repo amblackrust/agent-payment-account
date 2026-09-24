@@ -31,7 +31,12 @@ function createTemporaryHome() {
   return path.join(directory, 'devnet-x402')
 }
 
-function createFakeDevnet({ failAirdrop = false } = {}) {
+function createFakeDevnet({
+  failAirdrop = false,
+  uncertainAirdrop = false,
+  uncertainMintCreation = false,
+  uncertainMint = false,
+} = {}) {
   const addresses = {
     'platform-fee-payer.json': '11111111111111111111111111111111',
     'fake-service-destination.json': 'SysvarRent111111111111111111111111111111111',
@@ -60,6 +65,10 @@ function createFakeDevnet({ failAirdrop = false } = {}) {
       const amount = parseSolAmount(args[1], 'fake airdrop')
       const address = args[2]
       balances.set(address, (balances.get(address) ?? 0n) + amount)
+      if (uncertainAirdrop) {
+        uncertainAirdrop = false
+        throw new Error('unable to confirm transaction')
+      }
       return ''
     }
     if (command === 'spl-token' && args[0] === 'address') {
@@ -72,6 +81,10 @@ function createFakeDevnet({ failAirdrop = false } = {}) {
     }
     if (command === 'spl-token' && args[0] === 'create-token') {
       mintReady = true
+      if (uncertainMintCreation) {
+        uncertainMintCreation = false
+        throw new Error('unable to confirm transaction')
+      }
       return ''
     }
     if (command === 'spl-token' && args[0] === 'create-account') {
@@ -86,6 +99,10 @@ function createFakeDevnet({ failAirdrop = false } = {}) {
       const amount = parseTestUsdcAmount(args[2], 'fake mint')
       const ata = args[3]
       tokenBalances.set(ata, (tokenBalances.get(ata) ?? 0n) + amount)
+      if (uncertainMint) {
+        uncertainMint = false
+        throw new Error('transaction confirmation timed out')
+      }
       return ''
     }
     throw new Error(`Unexpected fake command: ${command} ${args.join(' ')}`)
@@ -241,5 +258,41 @@ describe('devnet x402 setup helpers', () => {
     ).rejects.toThrow(
       `Devnet SOL faucet could not fund ${fake.addresses['platform-fee-payer.json']} with 0.1 SOL`,
     )
+  })
+
+  it('does not repeat setup effects after an uncertain CLI confirmation', async () => {
+    const home = createTemporaryHome()
+    const fake = createFakeDevnet({
+      uncertainAirdrop: true,
+      uncertainMintCreation: true,
+      uncertainMint: true,
+    })
+
+    await setupDevnetX402({
+      homeDirectory: home,
+      agentAddress: 'So11111111111111111111111111111111111111112',
+      solTargetLamports: 1_000_000_000n,
+      tokenTargetAtomic: 1_000_000n,
+      pollIntervalMs: 1,
+      pollTimeoutMs: 100,
+      runCommand: fake.runCommand,
+      rpcClient: fake.rpcClient,
+    })
+
+    expect(
+      fake.commands.filter(
+        ({ command, args }) => command === 'spl-token' && args[0] === 'create-token',
+      ),
+    ).toHaveLength(1)
+    expect(
+      fake.commands.filter(
+        ({ command, args }) => command === 'solana' && args[0] === 'airdrop',
+      ),
+    ).toHaveLength(1)
+    expect(
+      fake.commands.filter(
+        ({ command, args }) => command === 'spl-token' && args[0] === 'mint',
+      ),
+    ).toHaveLength(1)
   })
 })

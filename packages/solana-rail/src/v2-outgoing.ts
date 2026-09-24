@@ -50,6 +50,9 @@ const CONFIRMATION_COMMITMENT = 'confirmed' as const
 const DEFAULT_MIN_FEE_PAYER_BALANCE_LAMPORTS = 1_000_000n
 const SOLANA_SECRET_KEY_BYTES = 64
 const SOLANA_SPL_RAIL = 'SOLANA_SPL'
+const RPC_RATE_LIMIT_MAX_RETRIES = 5
+const RPC_RATE_LIMIT_BASE_DELAY_MS = 1_000
+const RPC_RATE_LIMIT_MAX_DELAY_MS = 15_000
 
 export interface SolanaV2PaymentView {
   readonly payment: {
@@ -250,36 +253,42 @@ export function createSolanaV2OutgoingExecutor(
   async function withRpcTimeout<T>(
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
-    const controller = new AbortController()
-    let timeout: NodeJS.Timeout | undefined
-    let timedOut = false
-    const timeoutPromise = new Promise<never>((_resolve, reject) => {
-      timeout = setTimeout(() => {
-        timedOut = true
-        controller.abort()
-        reject(
-          new CoreExternalRailError(
+    for (let attempt = 0; attempt <= RPC_RATE_LIMIT_MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController()
+      let timeout: NodeJS.Timeout | undefined
+      let timedOut = false
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          timedOut = true
+          controller.abort()
+          reject(
+            new CoreExternalRailError(
+              'Solana RPC request timed out',
+              undefined,
+              'RETRYABLE',
+            ),
+          )
+        }, rpcTimeoutMs)
+      })
+      try {
+        return await Promise.race([operation(controller.signal), timeoutPromise])
+      } catch (error) {
+        if (timedOut || controller.signal.aborted) {
+          throw new CoreExternalRailError(
             'Solana RPC request timed out',
             undefined,
             'RETRYABLE',
-          ),
-        )
-      }, rpcTimeoutMs)
-    })
-    try {
-      return await Promise.race([operation(controller.signal), timeoutPromise])
-    } catch (error) {
-      if (timedOut || controller.signal.aborted) {
-        throw new CoreExternalRailError(
-          'Solana RPC request timed out',
-          undefined,
-          'RETRYABLE',
-        )
+          )
+        }
+        if (!isRpcRateLimitedError(error) || attempt === RPC_RATE_LIMIT_MAX_RETRIES) {
+          throw toExternalRailError(error)
+        }
+        await waitForRpcRateLimit(attempt)
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
       }
-      throw toExternalRailError(error)
-    } finally {
-      if (timeout !== undefined) clearTimeout(timeout)
     }
+    throw new CoreExternalRailError('Solana RPC request failed', undefined, 'RETRYABLE')
   }
 
   async function getTokenDecimals(): Promise<number> {
@@ -1278,4 +1287,27 @@ function toExternalRailError(error: unknown): CoreExternalRailError {
     error,
     'RETRYABLE',
   )
+}
+
+function isRpcRateLimitedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const context = (error as { readonly context?: unknown }).context
+  if (
+    typeof context === 'object' &&
+    context !== null &&
+    !Array.isArray(context) &&
+    (context as { readonly statusCode?: unknown }).statusCode === 429
+  ) {
+    return true
+  }
+  const detail = `${error.name} ${error.message}`.toLowerCase()
+  return detail.includes('429') || detail.includes('too many requests')
+}
+
+async function waitForRpcRateLimit(attempt: number): Promise<void> {
+  const delayMs = Math.min(
+    RPC_RATE_LIMIT_MAX_DELAY_MS,
+    RPC_RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt,
+  )
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
 }

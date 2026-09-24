@@ -15,6 +15,9 @@ import {
 export type SolanaRpc = ReturnType<typeof createSolanaRpc>
 
 export const DEFAULT_RPC_TIMEOUT_MS = 5_000
+const RPC_RATE_LIMIT_MAX_RETRIES = 5
+const RPC_RATE_LIMIT_BASE_DELAY_MS = 1_000
+const RPC_RATE_LIMIT_MAX_DELAY_MS = 15_000
 
 export type SolanaCluster = 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
 
@@ -193,34 +196,42 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
   async function withRpcTimeout<T>(
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
-    const controller = new AbortController()
-    let timedOut = false
-    let timeout: NodeJS.Timeout | undefined
-    const timeoutPromise = new Promise<never>((_resolve, reject) => {
-      timeout = setTimeout(() => {
-        timedOut = true
-        controller.abort()
-        reject(
-          new ExternalRailError('Solana RPC request timed out', undefined, 'RETRYABLE'),
-        )
-      }, timeoutMs)
-    })
-    try {
-      return await Promise.race([operation(controller.signal), timeoutPromise])
-    } catch (error) {
-      if (timedOut || controller.signal.aborted) {
-        throw new ExternalRailError(
-          'Solana RPC request timed out',
-          undefined,
-          'RETRYABLE',
-        )
-      }
-      throw toExternalRailError(error)
-    } finally {
-      if (timeout !== undefined) {
-        clearTimeout(timeout)
+    for (let attempt = 0; attempt <= RPC_RATE_LIMIT_MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController()
+      let timedOut = false
+      let timeout: NodeJS.Timeout | undefined
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          timedOut = true
+          controller.abort()
+          reject(
+            new ExternalRailError(
+              'Solana RPC request timed out',
+              undefined,
+              'RETRYABLE',
+            ),
+          )
+        }, timeoutMs)
+      })
+      try {
+        return await Promise.race([operation(controller.signal), timeoutPromise])
+      } catch (error) {
+        if (timedOut || controller.signal.aborted) {
+          throw new ExternalRailError(
+            'Solana RPC request timed out',
+            undefined,
+            'RETRYABLE',
+          )
+        }
+        if (!isRpcRateLimitedError(error) || attempt === RPC_RATE_LIMIT_MAX_RETRIES) {
+          throw toExternalRailError(error)
+        }
+        await waitForRpcRateLimit(attempt)
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
       }
     }
+    throw new ExternalRailError('Solana RPC request failed', undefined, 'RETRYABLE')
   }
 
   async function validateSettlementMetadata(): Promise<SettlementMetadata> {
@@ -339,6 +350,29 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
       }
     },
   }
+}
+
+function isRpcRateLimitedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const context = (error as { readonly context?: unknown }).context
+  if (
+    typeof context === 'object' &&
+    context !== null &&
+    !Array.isArray(context) &&
+    (context as { readonly statusCode?: unknown }).statusCode === 429
+  ) {
+    return true
+  }
+  const detail = `${error.name} ${error.message}`.toLowerCase()
+  return detail.includes('429') || detail.includes('too many requests')
+}
+
+async function waitForRpcRateLimit(attempt: number): Promise<void> {
+  const delayMs = Math.min(
+    RPC_RATE_LIMIT_MAX_DELAY_MS,
+    RPC_RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt,
+  )
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
 }
 
 export { tokenToUsdMoney }
