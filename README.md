@@ -81,7 +81,7 @@ Expected readiness response:
 { "status": "ok" }
 ```
 
-`local:setup` creates a local-only environment: PostgreSQL, a detached Solana validator, a platform fee payer funded with fake SOL, a 6-decimal classic SPL test mint, generated API and wallet-encryption secrets, a root `.env`, and the committed database migrations. It does not use mainnet, real money, or an external faucet.
+`local:setup` creates a local-only environment: PostgreSQL, a detached Solana validator, a platform fee payer funded with fake SOL, a 6-decimal classic SPL test mint, generated API and wallet-encryption secrets, a root `.env`, the committed database migrations, and a matching localnet settlement route. It does not use mainnet, real money, or an external faucet. If it finds a runtime identity or payment/funding references to the old devnet x402 route, it stops before changing settlement records. With no such references, it retires that route while preserving its records.
 
 Stop project-owned local infrastructure without deleting the database volume, ledger, keypairs, or `.env`:
 
@@ -90,6 +90,15 @@ pnpm local:down
 ```
 
 Running `pnpm local:setup` again preserves existing local secrets and state.
+
+The devnet x402 E2E test requires a separate, migrated database:
+
+```bash
+export DEVNET_X402_DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:5432/agent_payment_devnet_x402?schema=public'
+pnpm test:e2e:devnet-x402
+```
+
+The test persists devnet accounts and payments for inspection. It refuses the local application's `DATABASE_URL` and does not fall back to it.
 
 ## Basic Usage
 

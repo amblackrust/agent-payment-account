@@ -219,6 +219,12 @@ export interface V2WorkItemClaim {
 }
 
 export interface V2DatabaseRepository {
+  ensureLocalSettlementConfiguration(input: {
+    readonly settlementMint: string
+  }): Promise<{
+    readonly createdLocalRoute: boolean
+    readonly retiredDevnetRoute: boolean
+  }>
   createDenomination(input: {
     readonly id: string
     readonly symbol: string
@@ -469,8 +475,274 @@ export interface V2DatabaseRepository {
   }): Promise<void>
 }
 
+const LOCAL_DENOMINATION = {
+  id: 'localnet_usd',
+  symbol: 'USD',
+  maxScale: 6,
+} as const
+const LOCAL_SETTLEMENT_ASSET_ID = 'localnet_spl_test_usdc'
+const LOCAL_ECONOMIC_MAPPING_ID = 'localnet_usd_to_spl_test_usdc'
+const LOCAL_SETTLEMENT_ROUTE_ID = 'localnet_solana_route'
+const STALE_DEVNET_ROUTE = {
+  id: 'devnet_x402_solana_route',
+  rail: 'SOLANA_SPL',
+  railVersion: 'v2-devnet',
+  network: 'devnet',
+  settlementAssetId: 'devnet_x402_test_usdc',
+  economicMappingId: 'devnet_x402_usd_to_test_usdc',
+  priority: 1,
+  configVersion: 'devnet-x402-v1',
+} as const
+
 export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepository {
   return {
+    async ensureLocalSettlementConfiguration({ settlementMint }) {
+      const normalizedMint = settlementMint.trim()
+      if (normalizedMint.length === 0 || normalizedMint.length > 255) {
+        throw new Error('Local settlement mint must contain 1 to 255 characters')
+      }
+
+      return prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT pg_advisory_xact_lock(764895321) IS NULL AS locked
+        `
+
+        const runtimeMetadata = await transaction.runtimeMetadata.findMany({
+          where: { key: { in: ['runtime_identity', 'runtime_authority'] } },
+          select: { key: true },
+        })
+        const hasRuntimeMetadata = runtimeMetadata.length > 0
+
+        const localDenomination = await transaction.denomination.findUnique({
+          where: { id: LOCAL_DENOMINATION.id },
+        })
+        const sharedDenomination =
+          localDenomination === null
+            ? await transaction.denomination.findFirst({
+                where: {
+                  symbol: LOCAL_DENOMINATION.symbol,
+                  maxScale: LOCAL_DENOMINATION.maxScale,
+                  status: 'ACTIVE',
+                },
+                orderBy: { version: 'desc' },
+              })
+            : null
+        const denomination = localDenomination ?? sharedDenomination
+        const denominationId = denomination?.id ?? LOCAL_DENOMINATION.id
+        const denominationVersion =
+          denomination === null
+            ? ((
+                await transaction.denomination.findFirst({
+                  where: { symbol: LOCAL_DENOMINATION.symbol },
+                  orderBy: { version: 'desc' },
+                  select: { version: true },
+                })
+              )?.version ?? 0) + 1
+            : undefined
+        const asset = await transaction.settlementAsset.findUnique({
+          where: { id: LOCAL_SETTLEMENT_ASSET_ID },
+        })
+        const mapping = await transaction.economicMapping.findUnique({
+          where: { id: LOCAL_ECONOMIC_MAPPING_ID },
+        })
+        const localRoute = await transaction.settlementRoute.findUnique({
+          where: { id: LOCAL_SETTLEMENT_ROUTE_ID },
+        })
+        const devnetRoute = await transaction.settlementRoute.findUnique({
+          where: { id: STALE_DEVNET_ROUTE.id },
+        })
+        const activeRoutes = await transaction.settlementRoute.findMany({
+          where: { status: 'ACTIVE' },
+          orderBy: [{ priority: 'asc' }, { id: 'asc' }],
+        })
+
+        if (
+          denomination !== null &&
+          (denomination.symbol !== LOCAL_DENOMINATION.symbol ||
+            denomination.maxScale !== LOCAL_DENOMINATION.maxScale ||
+            denomination.status !== 'ACTIVE')
+        ) {
+          throw new Error(
+            `Local denomination ${LOCAL_DENOMINATION.id} exists with incompatible fields`,
+          )
+        }
+        if (
+          asset !== null &&
+          (asset.rail !== 'SOLANA_SPL' ||
+            asset.network !== 'localnet' ||
+            asset.assetReference !== normalizedMint ||
+            asset.decimals !== 6 ||
+            asset.status !== 'ACTIVE')
+        ) {
+          throw new Error(
+            `Local settlement asset ${LOCAL_SETTLEMENT_ASSET_ID} exists with incompatible fields`,
+          )
+        }
+        if (
+          mapping !== null &&
+          (mapping.denominationId !== denominationId ||
+            mapping.settlementAssetId !== LOCAL_SETTLEMENT_ASSET_ID ||
+            mapping.numerator !== 1n ||
+            mapping.denominator !== 1n ||
+            mapping.status !== 'ACTIVE')
+        ) {
+          throw new Error(
+            `Local economic mapping ${LOCAL_ECONOMIC_MAPPING_ID} exists with incompatible fields`,
+          )
+        }
+        if (
+          localRoute !== null &&
+          (localRoute.rail !== 'SOLANA_SPL' ||
+            localRoute.railVersion !== 'v2-localnet' ||
+            localRoute.network !== 'localnet' ||
+            localRoute.settlementAssetId !== LOCAL_SETTLEMENT_ASSET_ID ||
+            localRoute.economicMappingId !== LOCAL_ECONOMIC_MAPPING_ID ||
+            localRoute.status !== 'ACTIVE' ||
+            localRoute.priority !== 1 ||
+            localRoute.configVersion !== 'localnet-v1')
+        ) {
+          throw new Error(
+            `Local settlement route ${LOCAL_SETTLEMENT_ROUTE_ID} exists with incompatible fields`,
+          )
+        }
+        if (
+          devnetRoute !== null &&
+          (devnetRoute.rail !== STALE_DEVNET_ROUTE.rail ||
+            devnetRoute.railVersion !== STALE_DEVNET_ROUTE.railVersion ||
+            devnetRoute.network !== STALE_DEVNET_ROUTE.network ||
+            devnetRoute.settlementAssetId !== STALE_DEVNET_ROUTE.settlementAssetId ||
+            devnetRoute.economicMappingId !== STALE_DEVNET_ROUTE.economicMappingId ||
+            devnetRoute.priority !== STALE_DEVNET_ROUTE.priority ||
+            devnetRoute.configVersion !== STALE_DEVNET_ROUTE.configVersion ||
+            !['ACTIVE', 'RETIRED'].includes(devnetRoute.status))
+        ) {
+          throw new Error(
+            `Settlement route ${STALE_DEVNET_ROUTE.id} exists with incompatible fields; refusing to change it`,
+          )
+        }
+
+        const unexpectedActiveRoute = activeRoutes.find(
+          (route) =>
+            route.id !== LOCAL_SETTLEMENT_ROUTE_ID &&
+            route.id !== STALE_DEVNET_ROUTE.id,
+        )
+        if (unexpectedActiveRoute !== undefined) {
+          throw new Error(
+            `Active settlement route ${unexpectedActiveRoute.id} is not part of local setup; refusing to change routes`,
+          )
+        }
+
+        const localRouteIsReady =
+          denomination !== null &&
+          asset !== null &&
+          mapping !== null &&
+          localRoute !== null &&
+          activeRoutes.length === 1 &&
+          activeRoutes[0]?.id === LOCAL_SETTLEMENT_ROUTE_ID
+
+        if (hasRuntimeMetadata) {
+          if (localRouteIsReady) {
+            return { createdLocalRoute: false, retiredDevnetRoute: false }
+          }
+          throw new Error(
+            'Runtime identity or authority already exists; refusing to modify settlement configuration',
+          )
+        }
+
+        let devnetReferences = 0
+        if (devnetRoute !== null && !localRouteIsReady) {
+          const payments = await transaction.payment.count({
+            where: {
+              OR: [
+                { routeId: STALE_DEVNET_ROUTE.id },
+                { settlementAssetId: STALE_DEVNET_ROUTE.settlementAssetId },
+                { economicMappingId: STALE_DEVNET_ROUTE.economicMappingId },
+              ],
+            },
+          })
+          const attempts = await transaction.paymentAttempt.count({
+            where: { routeId: STALE_DEVNET_ROUTE.id },
+          })
+          const signingRequests = await transaction.signingRequest.count({
+            where: { routeId: STALE_DEVNET_ROUTE.id },
+          })
+          const fundingDestinations = await transaction.fundingDestination.count({
+            where: { routeId: STALE_DEVNET_ROUTE.id },
+          })
+          devnetReferences = payments + attempts + signingRequests + fundingDestinations
+        }
+        if (devnetReferences > 0) {
+          throw new Error(
+            `Settlement route ${STALE_DEVNET_ROUTE.id} has ${devnetReferences} payment or funding references; refusing to change the database`,
+          )
+        }
+
+        if (localRouteIsReady && devnetRoute?.status !== 'ACTIVE') {
+          return { createdLocalRoute: false, retiredDevnetRoute: false }
+        }
+
+        if (denomination === null) {
+          await transaction.denomination.create({
+            data: {
+              id: LOCAL_DENOMINATION.id,
+              symbol: LOCAL_DENOMINATION.symbol,
+              maxScale: LOCAL_DENOMINATION.maxScale,
+              version: denominationVersion ?? 1,
+            },
+          })
+        }
+        if (asset === null) {
+          await transaction.settlementAsset.create({
+            data: {
+              id: LOCAL_SETTLEMENT_ASSET_ID,
+              rail: 'SOLANA_SPL',
+              network: 'localnet',
+              assetReference: normalizedMint,
+              decimals: 6,
+            },
+          })
+        }
+        if (mapping === null) {
+          await transaction.economicMapping.create({
+            data: {
+              id: LOCAL_ECONOMIC_MAPPING_ID,
+              denominationId,
+              settlementAssetId: LOCAL_SETTLEMENT_ASSET_ID,
+              numerator: 1n,
+              denominator: 1n,
+            },
+          })
+        }
+        if (localRoute === null) {
+          await transaction.settlementRoute.create({
+            data: {
+              id: LOCAL_SETTLEMENT_ROUTE_ID,
+              rail: 'SOLANA_SPL',
+              railVersion: 'v2-localnet',
+              network: 'localnet',
+              settlementAssetId: LOCAL_SETTLEMENT_ASSET_ID,
+              economicMappingId: LOCAL_ECONOMIC_MAPPING_ID,
+              priority: 1,
+              configVersion: 'localnet-v1',
+            },
+          })
+        }
+
+        const retiredDevnetRoute = devnetRoute?.status === 'ACTIVE'
+        if (retiredDevnetRoute) {
+          await transaction.settlementRoute.update({
+            where: { id: STALE_DEVNET_ROUTE.id },
+            data: { status: 'RETIRED' },
+          })
+        }
+
+        return {
+          createdLocalRoute: localRoute === null,
+          retiredDevnetRoute,
+        }
+      })
+    },
+
     async createDenomination(input) {
       const denomination = await prisma.denomination.create({
         data: {

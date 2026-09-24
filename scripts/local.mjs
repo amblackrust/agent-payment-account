@@ -24,6 +24,13 @@ const mintPath = path.join(localDirectory, 'mint.json')
 const validatorStatePath = path.join(localDirectory, 'solana-validator.json')
 const validatorLogPath = path.join(localDirectory, 'solana-validator.log')
 const environmentPath = path.join(repositoryRoot, '.env')
+const localSettlementConfigurationScript = path.join(
+  repositoryRoot,
+  'apps',
+  'api',
+  'scripts',
+  'ensure-local-settlement-configuration.ts',
+)
 const rpcUrl = 'http://127.0.0.1:8899'
 const tokenProgramAddress = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 const settlementDecimals = 6
@@ -664,6 +671,25 @@ async function setup() {
     environment: { DATABASE_URL: environment.DATABASE_URL },
   })
   console.log('✓ Database migrations applied')
+
+  run('pnpm', ['db:generate'])
+  run(
+    'pnpm',
+    [
+      '--filter',
+      '@agent-payment/api',
+      'exec',
+      'tsx',
+      localSettlementConfigurationScript,
+    ],
+    {
+      environment: {
+        DATABASE_URL: environment.DATABASE_URL,
+        SOLANA_SETTLEMENT_MINT: mintAddress,
+        NODE_OPTIONS: '--conditions=development',
+      },
+    },
+  )
 
   console.log(`\nSettlement mint: ${mintAddress}`)
   console.log(`Fee payer address: ${feePayerAddress}`)

@@ -1,10 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import type { Readable } from 'node:stream'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 
+import { parse as parseDotenv } from 'dotenv'
 import { createDatabaseClient } from '@agent-payment/db'
 import type { SettlementRoute } from '@agent-payment/core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -15,8 +16,13 @@ const enabled = process.env.DEVNET_X402_E2E === '1'
 const repositoryRoot = path.resolve(
   fileURLToPath(new URL('../../../', import.meta.url)),
 )
-const databaseUrl =
-  process.env.DEVNET_X402_DATABASE_URL?.trim() || process.env.DATABASE_URL?.trim()
+const databaseUrl = process.env.DEVNET_X402_DATABASE_URL?.trim()
+const localEnvironmentPath = path.join(repositoryRoot, '.env')
+const localEnvironment = existsSync(localEnvironmentPath)
+  ? parseDotenv(readFileSync(localEnvironmentPath, 'utf8'))
+  : {}
+const comparisonDatabaseUrl =
+  process.env.DATABASE_URL?.trim() || localEnvironment.DATABASE_URL?.trim()
 const apiPort = Number(process.env.DEVNET_X402_API_PORT ?? 3_842)
 const fakePort = Number(process.env.DEVNET_X402_FAKE_PORT ?? 4_542)
 const adminApiKey = `devnet-x402-admin-${randomBytes(16).toString('hex')}`
@@ -100,10 +106,9 @@ let state: E2EState | undefined
 describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
   beforeAll(async () => {
     if (databaseUrl === undefined || databaseUrl.length === 0) {
-      throw new Error(
-        'DEVNET_X402_E2E=1 requires DEVNET_X402_DATABASE_URL or DATABASE_URL',
-      )
+      throw new Error('DEVNET_X402_E2E=1 requires a dedicated DEVNET_X402_DATABASE_URL')
     }
+    assertDedicatedDatabase(databaseUrl, comparisonDatabaseUrl)
     assertPort(apiPort, 'DEVNET_X402_API_PORT')
     assertPort(fakePort, 'DEVNET_X402_FAKE_PORT')
     if (apiPort === fakePort) {
@@ -1029,6 +1034,35 @@ async function seedDevnetFinancialIdentity(
   } finally {
     await database.disconnect()
   }
+}
+
+function assertDedicatedDatabase(
+  devnetDatabaseUrl: string,
+  localDatabaseUrl: string | undefined,
+): void {
+  if (localDatabaseUrl === undefined || localDatabaseUrl.length === 0) return
+  if (databaseTarget(devnetDatabaseUrl) === databaseTarget(localDatabaseUrl)) {
+    throw new Error(
+      'DEVNET_X402_DATABASE_URL points to the local application database; use a separate database for devnet E2E',
+    )
+  }
+}
+
+function databaseTarget(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('Database URLs must use a PostgreSQL URL format')
+  }
+  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
+    throw new Error('Database URLs must use a PostgreSQL URL format')
+  }
+  const databaseName = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+  if (databaseName.length === 0) {
+    throw new Error('Database URLs must include a database name')
+  }
+  return JSON.stringify([url.hostname.toLowerCase(), url.port || '5432', databaseName])
 }
 
 function startProcess(
