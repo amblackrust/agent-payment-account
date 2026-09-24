@@ -11,6 +11,7 @@ import {
   ValidationError,
 } from '@agent-payment/core'
 import { PrismaClient, type Prisma } from './generated/client/client.js'
+import { reservationAmountInUsdAtomic } from './reservation-amount.js'
 import { createV2DatabaseRepository, type V2DatabaseRepository } from './v2.js'
 import { createV2AdminRepository, type V2AdminRepository } from './v2-admin.js'
 import {
@@ -21,6 +22,43 @@ import { createTimelineEvent } from './timeline.js'
 import { enqueueWebhookEvent } from './webhook-events.js'
 
 const MAX_INCOMING_ISSUE_RETRIES = 8
+const TERMINAL_RESERVATION_PAYMENT_STATUSES = [
+  'CONFIRMED',
+  'REJECTED_BY_POLICY',
+  'REJECTED',
+  'PROVED_NO_EFFECT',
+  'FAILED',
+  'EXPIRED',
+] as const
+
+async function getOutstandingReservationAtomic(
+  client: PrismaClient | Prisma.TransactionClient,
+  ownerAccountId: string,
+  currency: string,
+): Promise<bigint> {
+  const reservations = await client.outgoingReservation.findMany({
+    where: {
+      ownerAccountId,
+      currency,
+      status: 'ACTIVE',
+      lifecycleState: 'HELD',
+      payment: { status: { notIn: [...TERMINAL_RESERVATION_PAYMENT_STATUSES] } },
+    },
+    select: {
+      amountAtomic: true,
+      payment: { select: { amountScale: true } },
+    },
+  })
+  return reservations.reduce(
+    (total, reservation) =>
+      total +
+      reservationAmountInUsdAtomic(
+        reservation.amountAtomic,
+        reservation.payment.amountScale,
+      ),
+    0n,
+  )
+}
 export { createV2DatabaseRepository } from './v2.js'
 export { createV2AdminRepository } from './v2-admin.js'
 export {
@@ -1423,15 +1461,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           return { payment: toPaymentRecord(existingPayment), created: false }
         }
 
-        const activeReservations = await transaction.outgoingReservation.aggregate({
-          where: {
-            ownerAccountId: input.ownerAccountId,
-            status: 'ACTIVE',
-            currency: input.currency,
-          },
-          _sum: { amountAtomic: true },
-        })
-        const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
+        const reservedAtomic = await getOutstandingReservationAtomic(
+          transaction,
+          input.ownerAccountId,
+          input.currency,
+        )
         if (input.amountAtomic > input.settledAtomic - reservedAtomic) {
           throw new InsufficientFundsError()
         }
@@ -1552,15 +1586,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           _sum: { amountAtomic: true },
         })
         const refundedAtomic = refunds._sum.amountAtomic ?? 0n
-        const activeReservations = await transaction.outgoingReservation.aggregate({
-          where: {
-            ownerAccountId: input.ownerAccountId,
-            status: 'ACTIVE',
-            currency: input.currency,
-          },
-          _sum: { amountAtomic: true },
-        })
-        const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
+        const reservedAtomic = await getOutstandingReservationAtomic(
+          transaction,
+          input.ownerAccountId,
+          input.currency,
+        )
         if (input.amountAtomic > original.amountAtomic - refundedAtomic) {
           throw new ConflictError('Refund amount exceeds the original payment amount')
         }
@@ -1648,11 +1678,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       ownerAccountId,
       currency,
     ): Promise<bigint> {
-      const result = await prisma.outgoingReservation.aggregate({
-        where: { ownerAccountId, currency, status: 'ACTIVE' },
-        _sum: { amountAtomic: true },
-      })
-      return result._sum.amountAtomic ?? 0n
+      return getOutstandingReservationAtomic(prisma, ownerAccountId, currency)
     },
     async reserveFeeSponsorship(input): Promise<void> {
       const now = input.now ?? new Date()
