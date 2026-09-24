@@ -10,3 +10,4 @@ coverage/
 *.log
 docker-data/
 .local/
+test-ledger/
