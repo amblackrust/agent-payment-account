@@ -356,6 +356,18 @@ function writeLocalEnvironment(existing, generated) {
   return { ...existing.values, ...values }
 }
 
+function hasCompleteLocalEnvironment(existing, generated) {
+  const expectedValues = {
+    ...localEnvironmentDefaults,
+    SOLANA_SETTLEMENT_MINT: generated.mintAddress,
+    SOLANA_FEE_PAYER_SECRET: generated.feePayerSecret,
+    SOLANA_FEE_PAYER_IDENTITY: generated.feePayerAddress,
+  }
+  return Object.entries(expectedValues).every(
+    ([key, value]) => existing.values[key] === value,
+  )
+}
+
 async function rpc(method, params = [], timeoutMs = 2_000) {
   const response = await fetch(rpcUrl, {
     method: 'POST',
@@ -549,7 +561,8 @@ async function ensureSettlementMint(address, feePayerAddress) {
 
 async function apiReady() {
   try {
-    const response = await fetch('http://127.0.0.1:3000/ready', {
+    const apiUrl = process.env.LOCAL_API_URL ?? 'http://127.0.0.1:3000'
+    const response = await fetch(new URL('/ready', apiUrl), {
       signal: AbortSignal.timeout(2_000),
     })
     if (!response.ok) return false
@@ -639,7 +652,7 @@ async function stopValidator() {
   return true
 }
 
-async function setup() {
+async function setup({ infrastructureOnly = false } = {}) {
   console.log('Mux local setup\n')
   checkPrerequisites()
   console.log('✓ Prerequisites available')
@@ -650,13 +663,23 @@ async function setup() {
   const feePayerSecret = ensureFeePayer(existingEnvironment.values)
   const feePayerAddress = publicKey(feePayerPath)
   const mintAddress = ensureMintKeypair(existingEnvironment.values)
-  const environment = writeLocalEnvironment(existingEnvironment, {
+  const generatedEnvironment = {
     feePayerSecret,
     feePayerAddress,
     mintAddress,
-  })
+  }
+  const preserveExistingEnvironment =
+    infrastructureOnly &&
+    hasCompleteLocalEnvironment(existingEnvironment, generatedEnvironment)
+  const environment = preserveExistingEnvironment
+    ? existingEnvironment.values
+    : writeLocalEnvironment(existingEnvironment, generatedEnvironment)
   console.log('✓ Platform fee payer ready')
-  console.log('✓ Local environment written')
+  console.log(
+    preserveExistingEnvironment
+      ? '✓ Existing local environment preserved'
+      : '✓ Local environment written',
+  )
 
   await Promise.all([ensurePostgres(), ensureValidator()])
   console.log('✓ PostgreSQL running')
@@ -667,33 +690,39 @@ async function setup() {
   await ensureSettlementMint(mintAddress, feePayerAddress)
   console.log('✓ Settlement mint ready')
 
-  run('pnpm', ['db:migrate:deploy'], {
-    environment: { DATABASE_URL: environment.DATABASE_URL },
-  })
-  console.log('✓ Database migrations applied')
+  if (!infrastructureOnly) {
+    run('pnpm', ['db:migrate:deploy'], {
+      environment: { DATABASE_URL: environment.DATABASE_URL },
+    })
+    console.log('✓ Database migrations applied')
 
-  run('pnpm', ['db:generate'])
-  run(
-    'pnpm',
-    [
-      '--filter',
-      '@agent-payment/api',
-      'exec',
-      'tsx',
-      localSettlementConfigurationScript,
-    ],
-    {
-      environment: {
-        DATABASE_URL: environment.DATABASE_URL,
-        SOLANA_SETTLEMENT_MINT: mintAddress,
-        NODE_OPTIONS: '--conditions=development',
+    run('pnpm', ['db:generate'])
+    run(
+      'pnpm',
+      [
+        '--filter',
+        '@agent-payment/api',
+        'exec',
+        'tsx',
+        localSettlementConfigurationScript,
+      ],
+      {
+        environment: {
+          DATABASE_URL: environment.DATABASE_URL,
+          SOLANA_SETTLEMENT_MINT: mintAddress,
+          NODE_OPTIONS: '--conditions=development',
+        },
       },
-    },
-  )
+    )
+  }
 
   console.log(`\nSettlement mint: ${mintAddress}`)
   console.log(`Fee payer address: ${feePayerAddress}`)
-  console.log('\nLocal environment ready.\n\nStart Mux:\n\n  pnpm dev')
+  if (infrastructureOnly) {
+    console.log('\nLocal infrastructure ready. Database contents were not changed.')
+  } else {
+    console.log('\nLocal environment ready.\n\nStart Mux:\n\n  pnpm dev')
+  }
 }
 
 async function down() {
@@ -711,10 +740,17 @@ async function down() {
 }
 
 const action = process.argv[2]
+const setupOption = process.argv[3]
 
 try {
-  if (action === 'setup') await setup()
-  else if (action === 'status') await showStatus()
+  if (action === 'setup') {
+    if (setupOption !== undefined && setupOption !== '--infrastructure-only') {
+      throw new LocalSetupError(
+        'Usage: node scripts/local.mjs setup [--infrastructure-only]',
+      )
+    }
+    await setup({ infrastructureOnly: setupOption === '--infrastructure-only' })
+  } else if (action === 'status') await showStatus()
   else if (action === 'down') await down()
   else throw new LocalSetupError('Usage: node scripts/local.mjs <setup|status|down>')
 } catch (error) {

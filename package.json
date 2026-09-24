@@ -31,6 +31,7 @@
     "backup:verify": "node scripts/backup-verify.mjs verify",
     "backup:complete-reconciliation": "node scripts/backup-verify.mjs complete-reconciliation",
     "local:setup": "node scripts/local.mjs setup",
+    "local:setup:infrastructure": "node scripts/local.mjs setup --infrastructure-only",
     "local:status": "node scripts/local.mjs status",
     "local:down": "node scripts/local.mjs down"
   },
