@@ -9,6 +9,8 @@ import { createDatabaseClient } from '@agent-payment/db'
 import type { SettlementRoute } from '@agent-payment/core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
+import { fingerprintWalletMasterKey } from './custody.js'
+
 const enabled = process.env.DEVNET_X402_E2E === '1'
 const repositoryRoot = path.resolve(
   fileURLToPath(new URL('../../../', import.meta.url)),
@@ -227,6 +229,21 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       expect(requireString(accountResponse.id, 'completed account id')).toBe(accountId)
       expect(requireString(accountResponse.status, 'account status')).toBe('ACTIVE')
 
+      await database.v2Admin.createCustodyKeyVersion({
+        id: `custody_${accountId}_v1`,
+        accountId,
+        keyVersion: 1,
+        backendIdentity: 'devnet-local-test-custody',
+        keyReference: `agent:${accountId}:v1`,
+        rootKeyFingerprint: fingerprintWalletMasterKey(runtimeWalletKey),
+      })
+      expect(
+        await database.v2Admin.findActiveCustodyKeyVersion(accountId),
+      ).toMatchObject({
+        keyVersion: 1,
+        backendIdentity: 'devnet-local-test-custody',
+      })
+
       fakeProcess = startProcess(
         ['--filter', '@agent-payment/fake-x402', 'exec', 'tsx', 'server.ts'],
         {
@@ -407,10 +424,13 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       try {
         await waitForCondition(
           async () => {
-            const result = await requestJson(`${apiBaseUrl()}/v2/payments/${paymentId}`, {
-              method: 'GET',
-              headers: agentHeaders(apiKey),
-            })
+            const result = await requestJson(
+              `${apiBaseUrl()}/v2/payments/${paymentId}`,
+              {
+                method: 'GET',
+                headers: agentHeaders(apiKey),
+              },
+            )
             if (result.status !== 200) return false
             confirmedPayment = result
             return asRecord(result.body, 'payment poll').status === 'CONFIRMED'
