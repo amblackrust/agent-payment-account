@@ -3,6 +3,7 @@ import {
   classifyWorkFailure,
   computeRetryAt,
   CustodyUnavailableError,
+  ExternalRailError,
   InvalidStateError,
   type AgentAccountLifecycleStatus,
 } from '@agent-payment/core'
@@ -885,6 +886,9 @@ export class V2OutgoingWorker {
         view?.payment.correlationId === null
           ? {}
           : { correlationId: view.payment.correlationId }),
+        ...(error instanceof ExternalRailError
+          ? { errorDetail: error.message.slice(0, 256) }
+          : {}),
       },
       'Outgoing work item failed',
     )

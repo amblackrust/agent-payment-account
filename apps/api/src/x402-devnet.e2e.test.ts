@@ -404,19 +404,27 @@ describe.skipIf(!enabled)('V2 fake x402 Solana devnet E2E', () => {
       const paymentId = requireString(createdPayment.id, 'payment id')
 
       let confirmedPayment: HttpResult | undefined
-      await waitForCondition(
-        async () => {
-          const result = await requestJson(`${apiBaseUrl()}/v2/payments/${paymentId}`, {
-            method: 'GET',
-            headers: agentHeaders(apiKey),
-          })
-          if (result.status !== 200) return false
-          confirmedPayment = result
-          return asRecord(result.body, 'payment poll').status === 'CONFIRMED'
-        },
-        120_000,
-        'x402 payment confirmation',
-      )
+      try {
+        await waitForCondition(
+          async () => {
+            const result = await requestJson(`${apiBaseUrl()}/v2/payments/${paymentId}`, {
+              method: 'GET',
+              headers: agentHeaders(apiKey),
+            })
+            if (result.status !== 200) return false
+            confirmedPayment = result
+            return asRecord(result.body, 'payment poll').status === 'CONFIRMED'
+          },
+          120_000,
+          'x402 payment confirmation',
+        )
+      } catch (error) {
+        const diagnostics = state?.apiProcess.diagnostics() ?? ''
+        throw new Error(
+          `${error instanceof Error ? error.message : 'x402 payment confirmation failed'}\nAPI diagnostics:\n${diagnostics}`,
+          { cause: error },
+        )
+      }
       const confirmed = asRecord(confirmedPayment?.body, 'confirmed payment')
       expect(confirmed.status).toBe('CONFIRMED')
       expect(confirmed.policy_decision).toBe('ALLOW')
