@@ -316,6 +316,11 @@ export interface V2DatabaseRepository {
   ): Promise<V2IdempotencyRecord | null>
   createV2Payment(input: V2PaymentCreateInput): Promise<V2PaymentCreateResult>
   findPayment(accountId: string, paymentId: string): Promise<V2PaymentSnapshot | null>
+  /**
+   * Trusted service lookup used only while authorizing a managed-recipient
+   * refund. Ordinary payment reads remain payer-scoped.
+   */
+  findPaymentForRefund(paymentId: string): Promise<V2PaymentSnapshot | null>
   findPaymentView(accountId: string, paymentId: string): Promise<V2PaymentView | null>
   listPaymentViews(input: {
     readonly accountId: string
@@ -426,6 +431,17 @@ export interface V2DatabaseRepository {
     readonly errorCode: string
     readonly errorSafe: string
     readonly nextKind?: string
+  }): Promise<void>
+  /**
+   * Returns a claimed item to the durable queue without consuming an
+   * execution-attempt budget. Used when no external effect was possible.
+   */
+  deferWorkItem(input: {
+    readonly id: string
+    readonly owner: string
+    readonly retryAt: Date
+    readonly errorCode: string
+    readonly errorSafe: string
   }): Promise<void>
   failWorkItem(input: {
     readonly id: string
@@ -1714,6 +1730,11 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
       return payment === null ? null : toV2PaymentSnapshot(payment)
     },
 
+    async findPaymentForRefund(paymentId) {
+      const payment = await prisma.payment.findUnique({ where: { id: paymentId } })
+      return payment === null ? null : toV2PaymentSnapshot(payment)
+    },
+
     async findPaymentView(accountId, paymentId) {
       const payment = await prisma.payment.findFirst({
         where: { id: paymentId, payerAccountId: accountId },
@@ -2658,6 +2679,11 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
               AND (
                 (status IN ('AVAILABLE', 'RETRY_WAIT') AND attempt_count < max_attempts)
                 OR (
+                  status = 'RETRY_WAIT'
+                  AND attempt_count >= max_attempts
+                  AND lease_recovery_count < 1
+                )
+                OR (
                   status = 'CLAIMED'
                   AND (
                     attempt_count < max_attempts
@@ -2744,16 +2770,7 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
 
     async retryWorkItem(input) {
       await prisma.$transaction(async (transaction) => {
-        const now = new Date()
-        const item = await transaction.durableWorkItem.findFirst({
-          where: {
-            id: input.id,
-            status: 'CLAIMED',
-            leaseOwner: input.owner,
-            leaseExpiresAt: { gt: now },
-          },
-        })
-        if (item === null) throw new ConflictError('Work item lease is no longer owned')
+        const item = await lockOwnedWorkItem(transaction, input.id, input.owner)
         const exhausted = item.attemptCount >= item.maxAttempts
         if (exhausted) {
           await markWorkItemExhausted(
@@ -2780,18 +2797,32 @@ export function createV2DatabaseRepository(prisma: PrismaClient): V2DatabaseRepo
       })
     },
 
-    async failWorkItem(input) {
+    async deferWorkItem(input) {
       await prisma.$transaction(async (transaction) => {
-        const now = new Date()
-        const item = await transaction.durableWorkItem.findFirst({
-          where: {
-            id: input.id,
-            status: 'CLAIMED',
-            leaseOwner: input.owner,
-            leaseExpiresAt: { gt: now },
+        const item = await lockOwnedWorkItem(transaction, input.id, input.owner)
+        const recoveringExpiredLease =
+          item.attemptCount >= item.maxAttempts && item.leaseRecoveryCount > 0
+        await transaction.durableWorkItem.update({
+          where: { id: item.id },
+          data: {
+            status: 'RETRY_WAIT',
+            retryAfter: input.retryAt,
+            availableAt: input.retryAt,
+            lastErrorCode: input.errorCode,
+            lastErrorSafe: input.errorSafe,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            ...(recoveringExpiredLease
+              ? { leaseRecoveryCount: { decrement: 1 } }
+              : { attemptCount: { decrement: 1 } }),
           },
         })
-        if (item === null) throw new ConflictError('Work item lease is no longer owned')
+      })
+    },
+
+    async failWorkItem(input) {
+      await prisma.$transaction(async (transaction) => {
+        const item = await lockOwnedWorkItem(transaction, input.id, input.owner)
         await markWorkItemExhausted(transaction, item, input.errorCode, input.errorSafe)
       })
     },
@@ -3359,6 +3390,30 @@ async function markWorkItemExhausted(
       detailsJson: JSON.stringify({ error_code: errorCode, error_safe: errorSafe }),
     },
   })
+}
+
+async function lockOwnedWorkItem(
+  transaction: Prisma.TransactionClient,
+  id: string,
+  owner: string,
+) {
+  const locked = await transaction.$queryRaw<readonly { id: string }[]>`
+    SELECT id FROM "durable_work_items" WHERE id = ${id} FOR UPDATE
+  `
+  if (locked.length === 0) {
+    throw new ConflictError('Work item lease is no longer owned')
+  }
+
+  const item = await transaction.durableWorkItem.findFirst({
+    where: {
+      id,
+      status: 'CLAIMED',
+      leaseOwner: owner,
+      leaseExpiresAt: { gt: new Date() },
+    },
+  })
+  if (item === null) throw new ConflictError('Work item lease is no longer owned')
+  return item
 }
 
 async function findWorkPayment(

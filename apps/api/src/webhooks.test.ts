@@ -46,6 +46,7 @@ function repository(
     claimWebhookDeliveries: async () => [currentClaim],
     markWebhookDelivered: async () => undefined,
     retryWebhookDelivery: async () => undefined,
+    deferWebhookDelivery: async () => undefined,
     ...overrides,
   } as V2OperationsRepository
 }
@@ -265,14 +266,14 @@ describe('webhook delivery worker', () => {
   })
 
   it('defers delivery when the shared webhook capacity is exhausted', async () => {
-    const retries: unknown[] = []
+    const deferrals: unknown[] = []
     const currentClaim = claim()
     const retryAt = new Date('2026-09-18T00:01:00.000Z')
     const sendMock = vi.fn()
     const worker = new WebhookDeliveryWorker({
       repository: repository(currentClaim, {
-        retryWebhookDelivery: async (input) => {
-          retries.push(input)
+        deferWebhookDelivery: async (input) => {
+          deferrals.push(input)
         },
       }),
       signingKeys: { getKey: async () => new TextEncoder().encode('webhook-secret') },
@@ -289,12 +290,11 @@ describe('webhook delivery worker', () => {
     await worker.runOnce()
 
     expect(sendMock).not.toHaveBeenCalled()
-    expect(retries).toHaveLength(1)
-    expect(retries[0]).toMatchObject({
+    expect(deferrals).toHaveLength(1)
+    expect(deferrals[0]).toMatchObject({
       id: currentClaim.id,
       retryAt,
       errorSafe: 'Webhook delivery capacity is temporarily exhausted',
-      maxAttempts: 3,
     })
   })
 

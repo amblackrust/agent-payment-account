@@ -19,6 +19,7 @@ const masterKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 describe('AccountService', () => {
   it('creates a Kit signer, persists only encrypted secret material and returns one API key', async () => {
     let persisted: CreateAgentAccountInput | undefined
+    let separateReceiveRequestCalls = 0
     const repository: AccountRepository & ReceiveRepository = {
       createAgentAccount: async (input) => {
         persisted = input
@@ -37,8 +38,9 @@ describe('AccountService', () => {
       findAccountByCredentialHash: async () => null,
       markCredentialUsed: async () => undefined,
       revokeCredential: async () => false,
-      createReceiveRequest: async (input) =>
-        ({
+      createReceiveRequest: async (input) => {
+        separateReceiveRequestCalls += 1
+        return {
           id: input.id,
           accountId: input.accountId,
           amountAtomic: null,
@@ -50,7 +52,8 @@ describe('AccountService', () => {
           expiresAt: null,
           paidAt: null,
           matchedIncomingPaymentId: null,
-        }) satisfies ReceiveRequestRecord,
+        } satisfies ReceiveRequestRecord
+      },
       findReceiveRequestForOwner: async () => null,
       listReceiveRequests: async () => [],
       matchIncomingPayment: async () => null,
@@ -79,6 +82,12 @@ describe('AccountService', () => {
     expect(result.apiKey).toMatch(/^apa_[A-Za-z0-9_-]+$/)
     expect(JSON.stringify(result)).not.toContain('encryptedSolanaSecret')
     expect(result.destination.owner).toBe(persisted?.solanaPublicKey)
+    expect(persisted?.initialReceiveRequest).toMatchObject({
+      id: result.receiveId,
+      currency: 'USD',
+      reference: `account:${persisted?.id}`,
+    })
+    expect(separateReceiveRequestCalls).toBe(0)
 
     const encrypted = persisted as CreateAgentAccountInput
     const secret = new WalletSecretCipher(masterKey).decrypt({

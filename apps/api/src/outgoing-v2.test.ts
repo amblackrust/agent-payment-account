@@ -548,4 +548,74 @@ describe('V2 outgoing worker', () => {
       route: { id: 'route_2' },
     })
   })
+
+  it('defers capacity denial without preparing or consuming execution budget', async () => {
+    let claimCount = 0
+    let prepared = 0
+    let signed = 0
+    let submitted = 0
+    let retried = 0
+    const deferred: unknown[] = []
+    const repository = {
+      claimWorkItem: async () => {
+        if (claimCount++ > 0) return null
+        return {
+          id: 'work_capacity_1',
+          kind: 'OUTGOING_PAYMENT',
+          resourceType: 'PAYMENT',
+          resourceId: 'pay_1',
+          attemptCount: 1,
+          payloadJson: '{}',
+          accountId: 'acct_1',
+        }
+      },
+      findPaymentView: async () => view(),
+      deferWorkItem: async (input: unknown) => {
+        deferred.push(input)
+      },
+      retryWorkItem: async () => {
+        retried += 1
+      },
+    }
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'ACTIVE' },
+      executor: {
+        prepare: async () => {
+          prepared += 1
+          throw new Error('capacity should defer before prepare')
+        },
+        sign: async () => {
+          signed += 1
+          throw new Error('capacity should defer before sign')
+        },
+        submit: async () => {
+          submitted += 1
+          return { status: 'CONFIRMED' as const }
+        },
+      },
+      capacity: {
+        acquire: async (dependency: string) => ({
+          allowed: dependency !== 'rail',
+          count: dependency === 'rail' ? 10 : 1,
+          retryAt: new Date('2026-09-18T00:01:00.000Z'),
+        }),
+      },
+      owner: 'worker-capacity',
+      custody: {} as never,
+      signedPayloadCipher: {} as never,
+    })
+
+    await worker.runOnce()
+
+    expect(prepared).toBe(0)
+    expect(signed).toBe(0)
+    expect(submitted).toBe(0)
+    expect(retried).toBe(0)
+    expect(deferred).toHaveLength(1)
+    expect(deferred[0]).toMatchObject({
+      id: 'work_capacity_1',
+      errorCode: 'CAPACITY_BACKPRESSURE',
+    })
+  })
 })

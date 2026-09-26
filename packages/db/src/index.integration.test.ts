@@ -49,6 +49,467 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('creates the V1 default receive request atomically and rolls back on failure', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const credentialId = `cred_${randomUUID().replaceAll('-', '')}`
+      const receiveId = `recv_${randomUUID().replaceAll('-', '')}`
+      const keyHash = `${accountId}_atomic_hash`
+      const invalidReference = 'x'.repeat(256)
+
+      try {
+        await expect(
+          database.createAgentAccount({
+            id: accountId,
+            name: 'atomic-provisioning-agent',
+            solanaPublicKey: `${accountId}_public`,
+            encryptedSolanaSecret: 'ciphertext',
+            encryptionNonce: 'bm9uY2U=',
+            encryptionAuthTag: 'dGFn',
+            credentialId,
+            keyHash,
+            keyPrefix: 'apa_integration',
+            initialReceiveRequest: {
+              id: receiveId,
+              currency: 'USD',
+              reference: invalidReference,
+            },
+          }),
+        ).rejects.toThrow()
+
+        expect(await database.findAccountByCredentialHash(keyHash)).toBeNull()
+        expect(await database.listReceiveRequests(accountId)).toHaveLength(0)
+
+        const retried = await database.createAgentAccount({
+          id: accountId,
+          name: 'atomic-provisioning-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId,
+          keyHash,
+          keyPrefix: 'apa_integration',
+          initialReceiveRequest: {
+            id: receiveId,
+            currency: 'USD',
+            reference: `account:${accountId}`,
+          },
+        })
+        const requests = await database.listReceiveRequests(accountId)
+
+        expect(retried.id).toBe(accountId)
+        expect(requests).toHaveLength(1)
+        expect(requests[0]).toMatchObject({
+          id: receiveId,
+          accountId,
+          reference: `account:${accountId}`,
+          status: 'OPEN',
+        })
+      } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('globally prunes stale rate-limit history in bounded batches', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const subjectId = `ip:rate-retention-${randomUUID()}`
+      const otherSubjectId = `ip:rate-retention-other-${randomUUID()}`
+      const bucket = `request-${randomUUID()}`
+      const windowSeconds = 60
+      const currentWindow = new Date('2026-09-18T00:10:00.000Z')
+      const staleWindow = new Date(currentWindow.getTime() - 3 * 24 * 60 * 60 * 1_000)
+      let sqlConnected = false
+
+      try {
+        await sql.connect()
+        sqlConnected = true
+        const staleSeed = randomUUID()
+        await sql.query(
+          `INSERT INTO rate_limit_buckets
+             (id, subject_type, subject_id, bucket, window_started_at, request_count, updated_at)
+           SELECT 'rate-stale-' || $1 || '-' || item::text,
+                  'HTTP_CLIENT',
+                  'ip:inactive-' || $1 || '-' || item::text,
+                  'request-stale', $2, 1, $2
+             FROM generate_series(1, 40) AS item`,
+          [staleSeed, staleWindow],
+        )
+        for (const windowStartedAt of ['2026-09-18 00:08:00', '2026-09-18 00:09:00']) {
+          await sql.query(
+            `INSERT INTO rate_limit_buckets
+               (id, subject_type, subject_id, bucket, window_started_at, request_count, updated_at)
+             VALUES ($1, 'HTTP_CLIENT', $2, $3, $4, 1, $4),
+                    ($5, 'HTTP_CLIENT', $6, $3, $4, 1, $4)`,
+            [
+              `rate-target-${randomUUID()}`,
+              subjectId,
+              bucket,
+              windowStartedAt,
+              `rate-other-${randomUUID()}`,
+              otherSubjectId,
+            ],
+          )
+        }
+
+        const first = await database.v2Admin.consumeRateLimit({
+          subjectType: 'HTTP_CLIENT',
+          subjectId,
+          bucket,
+          windowSeconds,
+          limit: 20,
+          now: currentWindow,
+        })
+        const remainingAfterOneBatch = await sql.query<{ count: number }>(
+          `SELECT COUNT(*)::int AS count FROM rate_limit_buckets
+            WHERE subject_type = 'HTTP_CLIENT'
+              AND subject_id LIKE 'ip:inactive-' || $1 || '-%'
+              AND window_started_at < $2`,
+          [staleSeed, new Date(currentWindow.getTime() - 2 * 24 * 60 * 60 * 1_000)],
+        )
+        expect(first).toMatchObject({ allowed: true, count: 1 })
+        expect(remainingAfterOneBatch.rows[0]?.count).toBe(8)
+
+        const concurrent = await Promise.all(
+          Array.from({ length: 20 }, () =>
+            database.v2Admin.consumeRateLimit({
+              subjectType: 'HTTP_CLIENT',
+              subjectId,
+              bucket,
+              windowSeconds,
+              limit: 20,
+              now: currentWindow,
+            }),
+          ),
+        )
+        expect(concurrent.filter((result) => !result.allowed)).toHaveLength(1)
+        expect(concurrent.find((result) => !result.allowed)?.count).toBe(21)
+
+        await expect(
+          database.v2Admin.consumeRateLimit({
+            subjectType: 'HTTP_CLIENT',
+            subjectId,
+            bucket,
+            windowSeconds: 86_401,
+            limit: 20,
+            now: currentWindow,
+          }),
+        ).rejects.toThrow('Rate limit window')
+
+        const retained = await sql.query<{
+          window_started_at: string
+          request_count: number
+        }>(
+          `SELECT window_started_at::text AS window_started_at, request_count
+             FROM rate_limit_buckets
+            WHERE subject_type = 'HTTP_CLIENT' AND subject_id = $1 AND bucket = $2
+            ORDER BY window_started_at`,
+          [subjectId, bucket],
+        )
+        const other = await sql.query(
+          `SELECT COUNT(*)::int AS count
+             FROM rate_limit_buckets
+            WHERE subject_type = 'HTTP_CLIENT' AND subject_id = $1 AND bucket = $2`,
+          [otherSubjectId, bucket],
+        )
+        const stale = await sql.query<{ count: number }>(
+          `SELECT COUNT(*)::int AS count FROM rate_limit_buckets
+            WHERE subject_type = 'HTTP_CLIENT'
+              AND subject_id LIKE 'ip:inactive-' || $1 || '-%'
+              AND window_started_at < $2`,
+          [staleSeed, new Date(currentWindow.getTime() - 2 * 24 * 60 * 60 * 1_000)],
+        )
+
+        expect(retained.rows).toHaveLength(3)
+        expect(retained.rows.map((row) => row.window_started_at)).toEqual([
+          '2026-09-18 00:08:00',
+          '2026-09-18 00:09:00',
+          '2026-09-18 00:10:00',
+        ])
+        expect(retained.rows.at(-1)?.request_count).toBe(21)
+        expect(other.rows[0]?.count).toBe(2)
+        expect(stale.rows[0]?.count).toBe(0)
+      } finally {
+        if (sqlConnected) await sql.end()
+        await database.disconnect()
+      }
+    })
+
+    it('keeps trusted refund reads separate from payer-scoped payment reads', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const payerAccountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const recipientAccountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const paymentId = `pay_${randomUUID().replaceAll('-', '')}`
+      let sqlConnected = false
+
+      try {
+        await database.createAgentAccount({
+          id: payerAccountId,
+          name: 'refund-scope-payer',
+          solanaPublicKey: `${payerAccountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${payerAccountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.createAgentAccount({
+          id: recipientAccountId,
+          name: 'refund-scope-recipient',
+          solanaPublicKey: `${recipientAccountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${recipientAccountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await sql.connect()
+        sqlConnected = true
+        await sql.query(
+          `INSERT INTO payments
+             (id, payer_account_id, recipient_managed_account_id, kind,
+              amount_atomic, currency, status, updated_at)
+           VALUES ($1, $2, $3, 'PAY', 125, 'USD', 'CONFIRMED', NOW())`,
+          [paymentId, payerAccountId, recipientAccountId],
+        )
+
+        expect(await database.v2.findPayment(payerAccountId, paymentId)).not.toBeNull()
+        expect(
+          await database.v2.findPaymentView(payerAccountId, paymentId),
+        ).not.toBeNull()
+        expect(await database.v2.findPayment(recipientAccountId, paymentId)).toBeNull()
+        expect(
+          await database.v2.findPaymentView(recipientAccountId, paymentId),
+        ).toBeNull()
+        expect(await database.v2.findPaymentForRefund(paymentId)).toMatchObject({
+          id: paymentId,
+          payerAccountId,
+          recipientManagedAccountId: recipientAccountId,
+          status: 'CONFIRMED',
+        })
+      } finally {
+        if (sqlConnected) await sql.end()
+        await database.disconnect()
+      }
+    })
+
+    it('does not consume work-item retries for repeated capacity deferrals', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const workItemId = `work_${randomUUID().replaceAll('-', '')}`
+      const kind = `CAPACITY_TEST_${randomUUID().replaceAll('-', '')}`
+      const workResourceId = `resource_${randomUUID().replaceAll('-', '')}`
+      const recoveryWorkItemId = `work_${randomUUID().replaceAll('-', '')}`
+      const recoveryKind = `RECOVERY_TEST_${randomUUID().replaceAll('-', '')}`
+      const recoveryResourceId = `resource_${randomUUID().replaceAll('-', '')}`
+      const failedWorkItemId = `work_${randomUUID().replaceAll('-', '')}`
+      const failedKind = `FAILURE_TEST_${randomUUID().replaceAll('-', '')}`
+      const failedResourceId = `resource_${randomUUID().replaceAll('-', '')}`
+      let sqlConnected = false
+
+      try {
+        await sql.connect()
+        sqlConnected = true
+        await sql.query(
+          `INSERT INTO durable_work_items
+             (id, kind, resource_type, resource_id, status, available_at,
+              attempt_count, max_attempts, lease_recovery_count, updated_at)
+           VALUES ($1, $2, 'CAPACITY_TEST', $3, 'AVAILABLE', NOW() - INTERVAL '1 second',
+                   0, 3, 0, NOW())`,
+          [workItemId, kind, workResourceId],
+        )
+
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          const owner = `capacity-owner-${attempt}`
+          const claim = await database.v2.claimWorkItem({
+            kind,
+            owner,
+            leaseSeconds: 60,
+          })
+          expect(claim).toMatchObject({ id: workItemId, attemptCount: 1 })
+          await database.v2.deferWorkItem({
+            id: workItemId,
+            owner,
+            retryAt: new Date(Date.now() - 1_000),
+            errorCode: 'CAPACITY_BACKPRESSURE',
+            errorSafe: 'Test capacity backpressure',
+          })
+        }
+
+        const deferredState = await sql.query<{
+          status: string
+          attempt_count: number
+          lease_recovery_count: number
+        }>(
+          'SELECT status, attempt_count, lease_recovery_count FROM durable_work_items WHERE id = $1',
+          [workItemId],
+        )
+        expect(deferredState.rows[0]).toMatchObject({
+          status: 'RETRY_WAIT',
+          attempt_count: 0,
+          lease_recovery_count: 0,
+        })
+
+        await sql.query(
+          `INSERT INTO durable_work_items
+             (id, kind, resource_type, resource_id, status, available_at,
+              lease_owner, lease_expires_at, attempt_count, max_attempts,
+              lease_recovery_count, updated_at)
+           VALUES ($1, $2, 'RECOVERY_TEST', $3, 'CLAIMED', NOW() - INTERVAL '1 second',
+                   'expired-owner', NOW() - INTERVAL '1 second', 3, 3, 0, NOW())`,
+          [recoveryWorkItemId, recoveryKind, recoveryResourceId],
+        )
+        const recoveredClaim = await database.v2.claimWorkItem({
+          kind: recoveryKind,
+          owner: 'capacity-recovery-owner-1',
+          leaseSeconds: 60,
+        })
+        expect(recoveredClaim).toMatchObject({
+          id: recoveryWorkItemId,
+          attemptCount: 3,
+        })
+        await database.v2.deferWorkItem({
+          id: recoveryWorkItemId,
+          owner: 'capacity-recovery-owner-1',
+          retryAt: new Date(Date.now() - 1_000),
+          errorCode: 'CAPACITY_BACKPRESSURE',
+          errorSafe: 'Test recovery capacity backpressure',
+        })
+        const afterRecoveryDeferral = await sql.query<{
+          status: string
+          attempt_count: number
+          lease_recovery_count: number
+        }>(
+          'SELECT status, attempt_count, lease_recovery_count FROM durable_work_items WHERE id = $1',
+          [recoveryWorkItemId],
+        )
+        expect(afterRecoveryDeferral.rows[0]).toMatchObject({
+          status: 'RETRY_WAIT',
+          attempt_count: 3,
+          lease_recovery_count: 0,
+        })
+        const repeatedRecoveryClaim = await database.v2.claimWorkItem({
+          kind: recoveryKind,
+          owner: 'capacity-recovery-owner-2',
+          leaseSeconds: 60,
+        })
+        expect(repeatedRecoveryClaim).toMatchObject({
+          id: recoveryWorkItemId,
+          attemptCount: 3,
+        })
+        await database.v2.completeWorkItem(
+          recoveryWorkItemId,
+          'capacity-recovery-owner-2',
+        )
+
+        await sql.query(
+          `INSERT INTO durable_work_items
+             (id, kind, resource_type, resource_id, status, available_at,
+              attempt_count, max_attempts, lease_recovery_count, updated_at)
+           VALUES ($1, $2, 'FAILURE_TEST', $3, 'AVAILABLE', NOW() - INTERVAL '1 second',
+                   0, 3, 0, NOW())`,
+          [failedWorkItemId, failedKind, failedResourceId],
+        )
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const owner = `failure-owner-${attempt}`
+          const claim = await database.v2.claimWorkItem({
+            kind: failedKind,
+            owner,
+            leaseSeconds: 60,
+          })
+          expect(claim).toMatchObject({ id: failedWorkItemId, attemptCount: attempt })
+          await database.v2.retryWorkItem({
+            id: failedWorkItemId,
+            owner,
+            retryAt: new Date(Date.now() - 1_000),
+            errorCode: 'EXTERNAL_FAILURE',
+            errorSafe: 'Test external failure',
+          })
+        }
+        const failedState = await sql.query<{
+          status: string
+          attempt_count: number
+        }>('SELECT status, attempt_count FROM durable_work_items WHERE id = $1', [
+          failedWorkItemId,
+        ])
+        expect(failedState.rows[0]).toMatchObject({
+          status: 'EXHAUSTED',
+          attempt_count: 3,
+        })
+      } finally {
+        if (sqlConnected) {
+          await sql.query(
+            'DELETE FROM operational_exceptions WHERE resource_id = ANY($1::text[])',
+            [[workResourceId, failedResourceId]],
+          )
+          await sql.query('DELETE FROM durable_work_items WHERE id IN ($1, $2)', [
+            workItemId,
+            failedWorkItemId,
+          ])
+          await sql.query('DELETE FROM durable_work_items WHERE id = $1', [
+            recoveryWorkItemId,
+          ])
+          await sql.end()
+        }
+        await database.disconnect()
+      }
+    })
+
+    it('does not let a stale worker overwrite a replacement work-item lease', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const workItemId = `work_${randomUUID().replaceAll('-', '')}`
+      let sqlConnected = false
+
+      try {
+        await sql.connect()
+        sqlConnected = true
+        await sql.query(
+          `INSERT INTO durable_work_items
+             (id, kind, resource_type, resource_id, status, available_at,
+              lease_owner, lease_expires_at, attempt_count, max_attempts,
+              lease_recovery_count, updated_at)
+           VALUES ($1, 'STALE_LEASE_TEST', 'TEST', $2, 'CLAIMED', NOW(),
+                   'new-owner', NOW() + INTERVAL '1 minute', 1, 3, 0, NOW())`,
+          [workItemId, `resource_${randomUUID().replaceAll('-', '')}`],
+        )
+
+        await expect(
+          database.v2.deferWorkItem({
+            id: workItemId,
+            owner: 'old-owner',
+            retryAt: new Date(Date.now() + 10_000),
+            errorCode: 'CAPACITY_BACKPRESSURE',
+            errorSafe: 'Test stale lease deferral',
+          }),
+        ).rejects.toThrow('lease is no longer owned')
+        const state = await sql.query<{
+          status: string
+          lease_owner: string | null
+          attempt_count: number
+        }>(
+          `SELECT status, lease_owner, attempt_count
+             FROM durable_work_items WHERE id = $1`,
+          [workItemId],
+        )
+        expect(state.rows[0]).toMatchObject({
+          status: 'CLAIMED',
+          lease_owner: 'new-owner',
+          attempt_count: 1,
+        })
+      } finally {
+        if (sqlConnected) {
+          await sql.query('DELETE FROM durable_work_items WHERE id = $1', [workItemId])
+          await sql.end()
+        }
+        await database.disconnect()
+      }
+    })
+
     it('emits durable webhook events for non-payment resources and incoming facts', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const sql = new Client({ connectionString: databaseUrl as string })
@@ -940,7 +1401,9 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           [attemptId, paymentId, signature],
         )
 
-        expect(await database.reconcileUnmatchedManagedIncoming?.(50)).toBeGreaterThanOrEqual(1)
+        expect(
+          await database.reconcileUnmatchedManagedIncoming?.(50),
+        ).toBeGreaterThanOrEqual(1)
         const receive = await database.findReceiveRequestForOwner(merchantId, receiveId)
         expect(receive?.status).toBe('PAID')
         expect(receive?.matchedIncomingPaymentId).toBe(incomingId)
@@ -1235,6 +1698,135 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
       }
     })
 
+    it('defers webhook capacity pressure without exhausting real delivery retries', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const subscriptionId = `sub_${randomUUID().replaceAll('-', '')}`
+      const eventId = `evt_${randomUUID().replaceAll('-', '')}`
+      let deliveryId: string | undefined
+      let sqlConnected = false
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'webhook-capacity-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await database.v2Operations.createWebhookSubscription({
+          id: subscriptionId,
+          accountId,
+          endpoint: 'https://merchant.example.test/capacity',
+          eventTypes: ['test.capacity'],
+          signingKeyRef: 'secret/webhook/capacity',
+          signingKeyVersion: 1,
+        })
+        await database.v2Operations.createWebhookEvent({
+          id: `webhook_event_${randomUUID().replaceAll('-', '')}`,
+          eventId,
+          accountId,
+          resourceType: 'TEST_RESOURCE',
+          resourceId: `resource_${randomUUID().replaceAll('-', '')}`,
+          resourceVersion: 1,
+          eventType: 'test.capacity',
+          eventVersion: '1',
+          rawBody: JSON.stringify({ event_id: eventId }),
+        })
+        await sql.connect()
+        sqlConnected = true
+        const delivery = await sql.query<{ id: string }>(
+          'SELECT id FROM webhook_deliveries WHERE event_id = $1 AND subscription_id = $2',
+          [eventId, subscriptionId],
+        )
+        deliveryId = delivery.rows[0]?.id
+        expect(deliveryId).toBeDefined()
+
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          const owner = `webhook-capacity-owner-${attempt}`
+          await sql.query(
+            `UPDATE webhook_deliveries
+                SET status = 'CLAIMED', attempt_count = attempt_count + 1,
+                    lease_owner = $2, lease_expires_at = NOW() + INTERVAL '1 minute'
+              WHERE id = $1`,
+            [deliveryId, owner],
+          )
+          await database.v2Operations.deferWebhookDelivery({
+            id: deliveryId!,
+            owner,
+            retryAt: new Date(Date.now() - 1_000),
+            errorSafe: 'Test webhook capacity backpressure',
+          })
+        }
+
+        const deferred = await sql.query<{
+          status: string
+          attempt_count: number
+          lease_owner: string | null
+          lease_expires_at: Date | null
+        }>(
+          'SELECT status, attempt_count, lease_owner, lease_expires_at FROM webhook_deliveries WHERE id = $1',
+          [deliveryId],
+        )
+        expect(deferred.rows[0]).toMatchObject({
+          status: 'RETRY_WAIT',
+          attempt_count: 0,
+          lease_owner: null,
+          lease_expires_at: null,
+        })
+
+        await sql.query(
+          `UPDATE webhook_deliveries
+              SET status = 'CLAIMED', attempt_count = 3,
+                  lease_owner = 'real-failure-owner',
+                  lease_expires_at = NOW() + INTERVAL '1 minute'
+            WHERE id = $1`,
+          [deliveryId],
+        )
+        await database.v2Operations.retryWebhookDelivery({
+          id: deliveryId!,
+          owner: 'real-failure-owner',
+          retryAt: new Date(Date.now() - 1_000),
+          errorSafe: 'Test actual delivery failure',
+          maxAttempts: 3,
+        })
+        const exhausted = await sql.query<{
+          status: string
+          attempt_count: number
+        }>('SELECT status, attempt_count FROM webhook_deliveries WHERE id = $1', [
+          deliveryId,
+        ])
+        expect(exhausted.rows[0]).toMatchObject({
+          status: 'EXHAUSTED',
+          attempt_count: 3,
+        })
+      } finally {
+        if (sqlConnected) {
+          if (deliveryId !== undefined) {
+            await sql.query(
+              'DELETE FROM operational_exceptions WHERE resource_id = $1',
+              [deliveryId],
+            )
+            // Operation timeline rows are append-only by design.
+            await sql.query('DELETE FROM webhook_deliveries WHERE id = $1', [
+              deliveryId,
+            ])
+          }
+          await sql.query('DELETE FROM webhook_events WHERE event_id = $1', [eventId])
+          await sql.query('DELETE FROM webhook_subscriptions WHERE id = $1', [
+            subscriptionId,
+          ])
+          await sql.end()
+        }
+        await database.disconnect()
+      }
+    })
+
     it('accounts sponsorship deltas once per logical payment and serializes quota', async () => {
       const database = createDatabaseClient(databaseUrl as string)
       const accountId = `acct_${randomUUID().replaceAll('-', '')}`
@@ -1422,6 +2014,168 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
           ).some((issue) => issue.signature === signature),
         ).toBe(false)
       } finally {
+        await database.disconnect()
+      }
+    })
+
+    it('defers RPC backpressure without spending incoming retry or recovery budgets', async () => {
+      const database = createDatabaseClient(databaseUrl as string)
+      const sql = new Client({ connectionString: databaseUrl as string })
+      const accountId = `acct_${randomUUID().replaceAll('-', '')}`
+      const issueId = `issue_${randomUUID().replaceAll('-', '')}`
+      const signature = `capacity-issue-${randomUUID()}`
+      let sqlConnected = false
+
+      try {
+        await database.createAgentAccount({
+          id: accountId,
+          name: 'incoming-capacity-agent',
+          solanaPublicKey: `${accountId}_public`,
+          encryptedSolanaSecret: 'ciphertext',
+          encryptionNonce: 'bm9uY2U=',
+          encryptionAuthTag: 'dGFn',
+          credentialId: `cred_${randomUUID().replaceAll('-', '')}`,
+          keyHash: `${accountId}_hash`,
+          keyPrefix: 'apa_integration',
+        })
+        await sql.connect()
+        sqlConnected = true
+        await database.recordIncomingReconciliationIssue({
+          id: issueId,
+          accountId,
+          signature,
+          reason: 'TRANSACTION_UNAVAILABLE',
+        })
+
+        let now = new Date(Date.now() + 1_000)
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          const claims = await database.claimIncomingReconciliationIssues(100, now)
+          const claim = claims.find((item) => item.id === issueId)
+          expect(claim).toMatchObject({ retryCount: 1, recoveryClaimed: false })
+          await database.deferIncomingReconciliationIssue({
+            issueId,
+            retryAt: new Date(now.getTime() - 1_000),
+            retryCount: claim!.retryCount,
+            retryCountBeforeClaim: claim!.retryCountBeforeClaim,
+            recoveryClaimed: claim!.recoveryClaimed,
+          })
+          now = new Date(now.getTime() + 10_000)
+        }
+
+        await sql.query(
+          `UPDATE incoming_reconciliation_issues
+              SET retry_count = 8, recovery_count = 0,
+                  next_retry_at = NOW() - INTERVAL '1 second'
+            WHERE id = $1`,
+          [issueId],
+        )
+        const recoveryClaims = await database.claimIncomingReconciliationIssues(
+          100,
+          new Date(Date.now() + 1_000),
+        )
+        const recoveryClaim = recoveryClaims.find((item) => item.id === issueId)
+        expect(recoveryClaim).toMatchObject({ retryCount: 9, recoveryClaimed: true })
+        await database.deferIncomingReconciliationIssue({
+          issueId,
+          retryAt: new Date(Date.now() - 1_000),
+          retryCount: recoveryClaim!.retryCount,
+          retryCountBeforeClaim: recoveryClaim!.retryCountBeforeClaim,
+          recoveryClaimed: recoveryClaim!.recoveryClaimed,
+        })
+
+        const state = await sql.query<{
+          status: string
+          retry_count: number
+          recovery_count: number
+        }>(
+          'SELECT status, retry_count, recovery_count FROM incoming_reconciliation_issues WHERE id = $1',
+          [issueId],
+        )
+        expect(state.rows[0]).toMatchObject({
+          status: 'PENDING',
+          retry_count: 8,
+          recovery_count: 0,
+        })
+
+        const concurrentClaim = (
+          await database.claimIncomingReconciliationIssues(
+            100,
+            new Date(Date.now() + 1_000),
+          )
+        ).find((item) => item.id === issueId)
+        expect(concurrentClaim).toBeDefined()
+        const deferInput = {
+          issueId,
+          retryAt: new Date(Date.now() - 1_000),
+          retryCount: concurrentClaim!.retryCount,
+          retryCountBeforeClaim: concurrentClaim!.retryCountBeforeClaim,
+          recoveryClaimed: concurrentClaim!.recoveryClaimed,
+        }
+        const duplicateDeferrals = await Promise.allSettled([
+          database.deferIncomingReconciliationIssue(deferInput),
+          database.deferIncomingReconciliationIssue(deferInput),
+        ])
+        expect(
+          duplicateDeferrals.filter((result) => result.status === 'fulfilled'),
+        ).toHaveLength(1)
+        expect(
+          duplicateDeferrals.filter((result) => result.status === 'rejected'),
+        ).toHaveLength(1)
+
+        const finalState = await sql.query<{
+          status: string
+          retry_count: number
+          recovery_count: number
+        }>(
+          'SELECT status, retry_count, recovery_count FROM incoming_reconciliation_issues WHERE id = $1',
+          [issueId],
+        )
+        expect(finalState.rows[0]).toMatchObject({
+          status: 'PENDING',
+          retry_count: 8,
+          recovery_count: 0,
+        })
+
+        await sql.query(
+          `UPDATE incoming_reconciliation_issues
+              SET retry_count = 9, recovery_count = 0,
+                  next_retry_at = NOW() - INTERVAL '1 second'
+            WHERE id = $1`,
+          [issueId],
+        )
+        const saturatedClaim = (
+          await database.claimIncomingReconciliationIssues(
+            100,
+            new Date(Date.now() + 1_000),
+          )
+        ).find((item) => item.id === issueId)
+        expect(saturatedClaim).toMatchObject({
+          retryCount: 9,
+          retryCountBeforeClaim: 9,
+          recoveryClaimed: true,
+        })
+        await database.deferIncomingReconciliationIssue({
+          issueId,
+          retryAt: new Date(Date.now() - 1_000),
+          retryCount: saturatedClaim!.retryCount,
+          retryCountBeforeClaim: saturatedClaim!.retryCountBeforeClaim,
+          recoveryClaimed: saturatedClaim!.recoveryClaimed,
+        })
+        const saturatedState = await sql.query<{
+          status: string
+          retry_count: number
+          recovery_count: number
+        }>(
+          'SELECT status, retry_count, recovery_count FROM incoming_reconciliation_issues WHERE id = $1',
+          [issueId],
+        )
+        expect(saturatedState.rows[0]).toMatchObject({
+          status: 'PENDING',
+          retry_count: 9,
+          recovery_count: 0,
+        })
+      } finally {
+        if (sqlConnected) await sql.end()
         await database.disconnect()
       }
     })

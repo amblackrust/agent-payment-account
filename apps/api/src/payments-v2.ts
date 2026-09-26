@@ -398,6 +398,9 @@ export class V2PaymentService {
         ...(input.externalReference === undefined
           ? {}
           : { externalReference: input.externalReference }),
+        ...(input.originalPaymentId === undefined
+          ? {}
+          : { originalPaymentId: input.originalPaymentId }),
         ...(metadataJson === undefined ? {} : { metadataJson }),
         route: policyDecision.decision === 'DENY' ? null : route,
         routeSelectionReason:
@@ -515,33 +518,35 @@ export class V2PaymentService {
     requestId: string,
     correlationId?: string,
   ): Promise<{ readonly view: V2PaymentView; readonly created: boolean }> {
-    const original = await this.getPayment(account.account.id, originalPaymentId)
-    if (original.payment.status !== 'CONFIRMED') {
+    const original =
+      await this.options.repository.findPaymentForRefund(originalPaymentId)
+    if (original === null) throw new NotFoundError('Payment was not found')
+    if (original.status !== 'CONFIRMED') {
       throw new InvalidStateError('Only confirmed payments can be refunded')
     }
-    if (original.payment.recipientManagedAccountId !== account.account.id) {
+    if (original.recipientManagedAccountId !== account.account.id) {
       throw new AuthorizationError(
         'The authenticated account is not the refund authority',
       )
     }
-    if (original.payment.denominationId !== input.denominationId) {
+    if (original.denominationId !== input.denominationId) {
       throw new ValidationError('Refund denomination must match the original payment')
     }
     const denomination = await this.loadDenomination(input.denominationId)
     const amount = parseAmount(input.amount, denomination)
     if (
       input.routePreference !== undefined &&
-      input.routePreference !== original.payment.routeId
+      input.routePreference !== original.routeId
     ) {
       throw new ValidationError('Refund route must match the original payment')
     }
     const refundedAtomic =
       await this.options.repository.getRefundedAtomic(originalPaymentId)
-    if (amount.atomicUnits + refundedAtomic > original.payment.amountAtomic) {
+    if (amount.atomicUnits + refundedAtomic > original.amountAtomic) {
       throw new ValidationError('Refund amount exceeds the original payment amount')
     }
     const payerPublicKey = await this.options.repository.findAccountPublicKey(
-      original.payment.payerAccountId,
+      original.payerAccountId,
     )
     if (payerPublicKey === null) {
       throw new DependencyUnavailableError('Original payer account is unavailable')
@@ -556,17 +561,15 @@ export class V2PaymentService {
         target: {
           recipientId: null,
           displayName: 'Original payer',
-          managedAccountId: original.payment.payerAccountId,
+          managedAccountId: original.payerAccountId,
           destination: {
-            id: `payer_${original.payment.payerAccountId}`,
+            id: `payer_${original.payerAccountId}`,
             rail: 'SOLANA_SPL',
             type: 'SOLANA_SPL',
             walletAddress: payerPublicKey,
           },
         },
-        ...(original.payment.routeId === null
-          ? {}
-          : { routePreference: original.payment.routeId }),
+        ...(original.routeId === null ? {} : { routePreference: original.routeId }),
       },
       idempotencyKey,
       requestId,

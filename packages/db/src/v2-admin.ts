@@ -13,6 +13,12 @@ import type { Prisma, PrismaClient } from './generated/client/client.js'
 import { createTimelineEvent } from './timeline.js'
 import { enqueueWebhookEvent } from './webhook-events.js'
 
+// Runtime configuration caps all rate-limit and capacity windows at one day.
+// Retaining two maximum windows covers the longest live bucket plus clock skew.
+const RATE_LIMIT_MAX_WINDOW_SECONDS = 86_400
+const RATE_LIMIT_RETENTION_SECONDS = RATE_LIMIT_MAX_WINDOW_SECONDS * 2
+const RATE_LIMIT_CLEANUP_BATCH_SIZE = 32
+
 export interface V2AccountRecord {
   readonly id: string
   readonly name: string
@@ -1904,8 +1910,14 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
     },
 
     async consumeRateLimit(input) {
-      if (!Number.isInteger(input.windowSeconds) || input.windowSeconds <= 0) {
-        throw new InvalidStateError('Rate limit window must be positive')
+      if (
+        !Number.isInteger(input.windowSeconds) ||
+        input.windowSeconds <= 0 ||
+        input.windowSeconds > RATE_LIMIT_MAX_WINDOW_SECONDS
+      ) {
+        throw new InvalidStateError(
+          `Rate limit window must be from 1 to ${RATE_LIMIT_MAX_WINDOW_SECONDS} seconds`,
+        )
       }
       if (!Number.isInteger(input.limit) || input.limit <= 0) {
         throw new InvalidStateError('Rate limit must be positive')
@@ -1918,6 +1930,9 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
       )
       const retryAt = new Date(windowStart.getTime() + input.windowSeconds * 1000)
       const bucketId = `${input.subjectType}:${input.subjectId}:${input.bucket}:${windowStart.toISOString()}`
+      const retentionCutoff = new Date(
+        now.getTime() - RATE_LIMIT_RETENTION_SECONDS * 1_000,
+      )
       const result = await prisma.$transaction(async (transaction) => {
         await transaction.rateLimitBucket.upsert({
           where: {
@@ -1938,10 +1953,26 @@ export function createV2AdminRepository(prisma: PrismaClient): V2AdminRepository
           },
           update: {},
         })
-        return transaction.rateLimitBucket.update({
+        const updated = await transaction.rateLimitBucket.update({
           where: { id: bucketId },
           data: { requestCount: { increment: 1 } },
         })
+        // Global bounded cleanup also covers one-off client IPs and subjects
+        // that never make another request after creating their last bucket.
+        await transaction.$executeRaw`
+          WITH stale AS (
+            SELECT id
+            FROM "rate_limit_buckets"
+            WHERE window_started_at < ${retentionCutoff}
+            ORDER BY window_started_at ASC, id ASC
+            LIMIT ${RATE_LIMIT_CLEANUP_BATCH_SIZE}
+            FOR UPDATE SKIP LOCKED
+          )
+          DELETE FROM "rate_limit_buckets" bucket
+          USING stale
+          WHERE bucket.id = stale.id
+        `
+        return updated
       })
       return {
         allowed: result.requestCount <= input.limit,

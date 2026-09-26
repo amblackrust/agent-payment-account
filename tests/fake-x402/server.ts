@@ -38,7 +38,8 @@ try {
     app.log.error({ err: error }, 'local fake x402 service failed to start')
     await app.close()
   } else {
-    process.stderr.write('local fake x402 service failed to start\n')
+    const message = error instanceof Error ? error.message : 'unknown startup failure'
+    process.stderr.write(`local fake x402 service failed to start: ${message}\n`)
   }
   process.exitCode = 1
 }

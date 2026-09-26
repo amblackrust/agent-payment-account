@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import type { IncomingPaymentRepository, ReceiveRepository } from '@agent-payment/db'
 import type { IncomingTransfer, SolanaIncomingReader } from '@agent-payment/solana-rail'
 import type { CapacityResult } from './capacity.js'
+import { DEFAULT_RUNTIME_LIMITS } from './config.js'
 
 interface IndexedAccount {
   readonly accountId: string
@@ -66,7 +67,9 @@ export class IncomingReconciliationService {
   private async reconcileAccountsWithConcurrency(
     accounts: readonly IndexedAccount[],
   ): Promise<void> {
-    const requestedConcurrency = this.options.accountConcurrency ?? accounts.length
+    const requestedConcurrency =
+      this.options.accountConcurrency ??
+      DEFAULT_RUNTIME_LIMITS.incomingAccountConcurrency
     const concurrency = Math.max(
       1,
       Math.min(requestedConcurrency, Math.max(accounts.length, 1)),
@@ -225,14 +228,20 @@ export class IncomingReconciliationService {
   }
 
   private async hasRpcCapacity(accountId: string): Promise<boolean> {
-    if (this.options.capacity === undefined) return true
+    return (await this.acquireRpcCapacity(accountId)).allowed
+  }
+
+  private async acquireRpcCapacity(accountId: string): Promise<CapacityResult> {
+    if (this.options.capacity === undefined) {
+      return { allowed: true, count: 0, retryAt: new Date() }
+    }
     const result = await this.options.capacity.acquire('rpc', new Date())
-    if (result.allowed) return true
+    if (result.allowed) return result
     this.logger.error(
       { accountId, errorCode: 'CAPACITY_BACKPRESSURE' },
       'Incoming RPC capacity is temporarily exhausted',
     )
-    return false
+    return result
   }
 
   private async reconcilePendingIssues(): Promise<void> {
@@ -258,7 +267,17 @@ export class IncomingReconciliationService {
           )
           continue
         }
-        if (!(await this.hasRpcCapacity(issue.accountId))) continue
+        const capacity = await this.acquireRpcCapacity(issue.accountId)
+        if (!capacity.allowed) {
+          await this.repository.deferIncomingReconciliationIssue({
+            issueId: issue.id,
+            retryAt: capacity.retryAt,
+            retryCount: issue.retryCount,
+            retryCountBeforeClaim: issue.retryCountBeforeClaim,
+            recoveryClaimed: issue.recoveryClaimed,
+          })
+          continue
+        }
         const inspection = await inspectSignature(
           issue.accountPublicKey,
           issue.signature,

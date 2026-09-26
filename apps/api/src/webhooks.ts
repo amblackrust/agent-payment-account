@@ -248,7 +248,7 @@ export class WebhookDeliveryWorker {
     if (this.options.capacity === undefined) return true
     const result = await this.options.capacity.acquire('webhook', this.now())
     if (result.allowed) return true
-    await this.options.repository.retryWebhookDelivery({
+    await this.options.repository.deferWebhookDelivery({
       id: claim.id,
       owner: this.options.owner,
       retryAt: retryAtAfter(
@@ -256,7 +256,6 @@ export class WebhookDeliveryWorker {
         computeRetryAt({ now: this.now(), attemptCount: claim.attemptCount }),
       ),
       errorSafe: 'Webhook delivery capacity is temporarily exhausted',
-      maxAttempts: this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
     })
     return false
   }

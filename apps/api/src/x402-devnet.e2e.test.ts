@@ -26,11 +26,17 @@ const comparisonDatabaseUrl =
 const apiPort = Number(process.env.DEVNET_X402_API_PORT ?? 3_842)
 const fakePort = Number(process.env.DEVNET_X402_FAKE_PORT ?? 4_542)
 const adminApiKey = `devnet-x402-admin-${randomBytes(16).toString('hex')}`
+// Public test-only fixture keys keep reruns compatible with the dedicated E2E database.
 const runtimeWalletKey =
-  process.env.DEVNET_X402_WALLET_MASTER_KEY?.trim() || randomBytes(32).toString('hex')
+  process.env.DEVNET_X402_WALLET_MASTER_KEY?.trim() ||
+  createHash('sha256')
+    .update('agent-payment-account:devnet-x402:test-wallet-master-key:v1', 'utf8')
+    .digest('hex')
 const recoveryEnvelopeKey =
   process.env.DEVNET_X402_RECOVERY_ENVELOPE_KEY?.trim() ||
-  randomBytes(32).toString('hex')
+  createHash('sha256')
+    .update('agent-payment-account:devnet-x402:test-recovery-key:v1', 'utf8')
+    .digest('hex')
 const runId = randomBytes(8).toString('hex')
 const accountName = `devnet-x402-${runId}`
 const accountIdempotencyKey = `devnet-x402-account-${runId}`

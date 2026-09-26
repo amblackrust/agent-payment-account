@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { moneyFromAtomicUnits } from '@agent-payment/core'
 import type { IncomingTransfer, SolanaIncomingReader } from '@agent-payment/solana-rail'
+import { DEFAULT_RUNTIME_LIMITS } from './config.js'
 import { IncomingReconciliationService } from './incoming.js'
 
 const transfer: IncomingTransfer = {
@@ -129,6 +130,41 @@ describe('incoming reconciliation worker', () => {
     releaseScan()
     await Promise.all([first, second])
     expect(scans).toBe(1)
+  })
+
+  it('bounds account scans when no explicit concurrency is configured', async () => {
+    const harness = createHarness()
+    const accountCount = DEFAULT_RUNTIME_LIMITS.incomingAccountConcurrency + 3
+    harness.repository.listActiveAccountSettlements = async () =>
+      Array.from({ length: accountCount }, (_, index) => ({
+        accountId: `acct_${index}`,
+        solanaPublicKey: `owner_${index}`,
+      }))
+    let activeScans = 0
+    let maximumConcurrentScans = 0
+    const reader: SolanaIncomingReader = {
+      scan: async () => [],
+      scanWithCursor: async () => {
+        activeScans += 1
+        maximumConcurrentScans = Math.max(maximumConcurrentScans, activeScans)
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+        activeScans -= 1
+        return { transfers: [], nextCursor: null }
+      },
+    }
+    const service = new IncomingReconciliationService(
+      harness.repository as never,
+      reader,
+      { error: () => undefined },
+    )
+
+    await service.runOnce()
+
+    expect(maximumConcurrentScans).toBeLessThanOrEqual(
+      DEFAULT_RUNTIME_LIMITS.incomingAccountConcurrency,
+    )
+    expect(maximumConcurrentScans).toBeGreaterThan(1)
+    expect(activeScans).toBe(0)
   })
 
   it('does not let another worker scan an owned account partition', async () => {
@@ -375,6 +411,8 @@ describe('incoming reconciliation worker', () => {
           ...issue,
           accountPublicKey: 'owner',
           retryCount: 1,
+          retryCountBeforeClaim: 0,
+          recoveryClaimed: false,
         })),
       resolveIncomingReconciliationIssue: async (issueId: string) => {
         for (const [signature, issue] of issues) {
@@ -441,6 +479,8 @@ describe('incoming reconciliation worker', () => {
           signature: 'signature-ambiguous',
           reason: 'TRANSACTION_UNAVAILABLE',
           retryCount: 8,
+          retryCountBeforeClaim: 7,
+          recoveryClaimed: false,
         },
       ],
       resolveIncomingReconciliationIssue: async () => undefined,
@@ -471,6 +511,63 @@ describe('incoming reconciliation worker', () => {
       reason: 'INCOMING_ISSUE_RETRY_EXHAUSTED',
     })
     expect(reasonUpdates).toBe(0)
+  })
+
+  it('defers an issue on RPC capacity denial without inspecting or consuming retry budget', async () => {
+    const retryAt = new Date('2026-09-18T00:00:01.000Z')
+    let inspectCalls = 0
+    let deferred: unknown
+    const repository = {
+      listActiveAccountSettlements: async () => [],
+      claimIncomingReconciliationIssues: async () => [
+        {
+          id: 'issue-capacity',
+          accountId: 'acct_1',
+          accountPublicKey: 'owner',
+          signature: 'signature-capacity',
+          reason: 'TRANSACTION_UNAVAILABLE',
+          retryCount: 2,
+          retryCountBeforeClaim: 1,
+          recoveryClaimed: false,
+        },
+      ],
+      deferIncomingReconciliationIssue: async (input: unknown) => {
+        deferred = input
+      },
+      resolveIncomingReconciliationIssue: async () => undefined,
+      updateIncomingReconciliationIssueReason: async () => undefined,
+      exhaustIncomingReconciliationIssue: async () => undefined,
+    }
+    const service = new IncomingReconciliationService(
+      repository as never,
+      {
+        scan: async () => [],
+        inspectSignature: async () => {
+          inspectCalls += 1
+          return {
+            kind: 'UNRESOLVED' as const,
+            reason: 'TRANSACTION_UNAVAILABLE' as const,
+          }
+        },
+      },
+      { error: () => undefined },
+      {
+        capacity: {
+          acquire: async () => ({ allowed: false, count: 10, retryAt }),
+        },
+      },
+    )
+
+    await service.runOnce()
+
+    expect(inspectCalls).toBe(0)
+    expect(deferred).toEqual({
+      issueId: 'issue-capacity',
+      retryAt,
+      retryCount: 2,
+      retryCountBeforeClaim: 1,
+      recoveryClaimed: false,
+    })
   })
 
   it('leaves the account cursor untouched when shared RPC capacity is exhausted', async () => {

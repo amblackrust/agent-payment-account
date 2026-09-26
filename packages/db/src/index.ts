@@ -7,6 +7,8 @@ import {
   DEFAULT_AGENT_CREDENTIAL_SCOPES,
   ExternalRailError,
   InsufficientFundsError,
+  InvalidStateError,
+  NotFoundError,
   RecipientResolutionError,
   ValidationError,
 } from '@agent-payment/core'
@@ -156,6 +158,21 @@ export interface CreateAgentAccountInput {
   readonly keyPrefix: string
   readonly scopes?: readonly string[]
   readonly expiresAt?: Date
+  /**
+   * Optional initial receive request created in the same transaction as the
+   * account and its first credential. V1 provisioning supplies this value so
+   * a failed receive-request insert rolls back the whole provision.
+   */
+  readonly initialReceiveRequest?: {
+    readonly id: string
+    readonly currency: string
+    readonly reference: string
+    readonly amountAtomic?: bigint
+    readonly denominationId?: string
+    readonly amountScale?: number
+    readonly createdAt?: Date
+    readonly expiresAt?: Date
+  }
 }
 
 export interface AccountCustodyRecord {
@@ -556,6 +573,13 @@ export interface IncomingPaymentRepository {
     limit: number,
     now?: Date,
   ) => Promise<readonly IncomingReconciliationIssueRecord[]>
+  readonly deferIncomingReconciliationIssue: (input: {
+    readonly issueId: string
+    readonly retryAt: Date
+    readonly retryCount: number
+    readonly retryCountBeforeClaim: number
+    readonly recoveryClaimed: boolean
+  }) => Promise<void>
   readonly resolveIncomingReconciliationIssue: (
     issueId: string,
     now?: Date,
@@ -578,6 +602,8 @@ export interface IncomingReconciliationIssueRecord {
   readonly signature: string
   readonly reason: string
   readonly retryCount: number
+  readonly retryCountBeforeClaim: number
+  readonly recoveryClaimed: boolean
 }
 
 export interface PaymentAttemptRecord {
@@ -990,6 +1016,37 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             scopes: JSON.stringify(DEFAULT_AGENT_CREDENTIAL_SCOPES),
           },
         })
+        if (input.initialReceiveRequest !== undefined) {
+          const receiveRequest = await transaction.receiveRequest.create({
+            data: {
+              id: input.initialReceiveRequest.id,
+              accountId: account.id,
+              ...(input.initialReceiveRequest.amountAtomic === undefined
+                ? {}
+                : { amountAtomic: input.initialReceiveRequest.amountAtomic }),
+              ...(input.initialReceiveRequest.denominationId === undefined
+                ? {}
+                : { denominationId: input.initialReceiveRequest.denominationId }),
+              ...(input.initialReceiveRequest.amountScale === undefined
+                ? {}
+                : { amountScale: input.initialReceiveRequest.amountScale }),
+              currency: input.initialReceiveRequest.currency,
+              reference: input.initialReceiveRequest.reference,
+              ...(input.initialReceiveRequest.createdAt === undefined
+                ? {}
+                : { createdAt: input.initialReceiveRequest.createdAt }),
+              ...(input.initialReceiveRequest.expiresAt === undefined
+                ? {}
+                : { expiresAt: input.initialReceiveRequest.expiresAt }),
+            },
+          })
+          await enqueueReceiveRequestWebhookEvent(
+            transaction,
+            receiveRequest,
+            'created',
+            1,
+          )
+        }
         await createTimelineEvent(transaction, {
           id: `timeline_${randomBytes(16).toString('hex')}`,
           accountId: account.id,
@@ -2503,10 +2560,55 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
               signature: issue.signature,
               reason: issue.reason,
               retryCount,
+              retryCountBeforeClaim: issue.retry_count,
+              recoveryClaimed: issue.retry_count >= MAX_INCOMING_ISSUE_RETRIES,
             })
           }
         }
         return claims
+      })
+    },
+    async deferIncomingReconciliationIssue(input) {
+      await prisma.$transaction(async (transaction) => {
+        const retryCountIncremented = input.retryCount > input.retryCountBeforeClaim
+        if (
+          !Number.isInteger(input.retryCount) ||
+          !Number.isInteger(input.retryCountBeforeClaim) ||
+          input.retryCountBeforeClaim < 0 ||
+          input.retryCountBeforeClaim > MAX_INCOMING_ISSUE_RETRIES + 1 ||
+          input.retryCount !==
+            Math.min(input.retryCountBeforeClaim + 1, MAX_INCOMING_ISSUE_RETRIES + 1) ||
+          input.recoveryClaimed !==
+            input.retryCountBeforeClaim >= MAX_INCOMING_ISSUE_RETRIES
+        ) {
+          throw new InvalidStateError('Incoming reconciliation claim is invalid')
+        }
+
+        const updated = await transaction.incomingReconciliationIssue.updateMany({
+          where: {
+            id: input.issueId,
+            status: 'PENDING',
+            retryCount: input.retryCount,
+            ...(input.recoveryClaimed ? { recoveryCount: { gte: 1 } } : {}),
+          },
+          data: {
+            nextRetryAt: input.retryAt,
+            ...(retryCountIncremented
+              ? { retryCount: input.retryCountBeforeClaim }
+              : {}),
+            ...(input.recoveryClaimed ? { recoveryCount: { decrement: 1 } } : {}),
+          },
+        })
+        if (updated.count === 1) return
+
+        const issue = await transaction.incomingReconciliationIssue.findUnique({
+          where: { id: input.issueId },
+          select: { id: true },
+        })
+        if (issue === null) {
+          throw new NotFoundError('Incoming reconciliation issue was not found')
+        }
+        throw new ConflictError('Incoming reconciliation issue changed concurrently')
       })
     },
     async resolveIncomingReconciliationIssue(issueId, now = new Date()) {

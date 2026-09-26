@@ -5,6 +5,7 @@ import type {
   V2DatabaseRepository,
   V2IdempotencyRecord,
   V2PaymentCreateInput,
+  V2PaymentSnapshot,
   V2PaymentView,
 } from '@agent-payment/db'
 
@@ -34,6 +35,7 @@ function createHarness(
 ) {
   let captured: V2PaymentCreateInput | undefined
   let latestView: V2PaymentView | undefined
+  let refundOriginal: V2PaymentSnapshot | null = null
   let existingIdempotency: V2IdempotencyRecord | null = null
   let denominationStatus: 'ACTIVE' | 'RETIRED' = 'ACTIVE'
   const getSettledAtomic = vi.fn(async () => 1_000n)
@@ -110,6 +112,9 @@ function createHarness(
       transactionCountEscalatable: false,
     }),
     findV2Idempotency,
+    findPaymentForRefund: async () => refundOriginal,
+    getRefundedAtomic: async () => 0n,
+    findAccountPublicKey: async () => 'payer_public_key',
     createV2Payment: async (input: V2PaymentCreateInput) => {
       captured = input
       const now = new Date('2026-09-17T00:00:00.000Z')
@@ -145,7 +150,7 @@ function createHarness(
           outcomeState:
             input.policyDecision.decision === 'DENY' ? 'PROVED_NO_EFFECT' : 'NONE',
           rowVersion: 1,
-          originalPaymentId: null,
+          originalPaymentId: input.originalPaymentId ?? null,
           confirmedAt: null,
           failedAt: null,
           failureCode: null,
@@ -216,12 +221,56 @@ function createHarness(
     service,
     getSettledAtomic,
     getCaptured: () => captured,
+    setRefundOriginal: (payment: V2PaymentSnapshot | null) => {
+      refundOriginal = payment
+    },
     setExistingIdempotency: (record: V2IdempotencyRecord | null) => {
       existingIdempotency = record
     },
     setDenominationStatus: (status: 'ACTIVE' | 'RETIRED') => {
       denominationStatus = status
     },
+  }
+}
+
+function originalPayment(recipientManagedAccountId: string): V2PaymentSnapshot {
+  return {
+    id: 'payment_original',
+    payerAccountId: 'acct_payer',
+    correlationId: null,
+    recipientId: 'recipient_1',
+    recipientManagedAccountId,
+    kind: 'PAY',
+    description: null,
+    externalReference: null,
+    metadataJson: '{}',
+    amountAtomic: 125n,
+    amountScale: 2,
+    denominationId: 'denom_usd',
+    currency: 'USD',
+    status: 'CONFIRMED',
+    routeId: 'route_solana',
+    routeSelectionReason: 'priority',
+    routeCapabilitySnapshotJson: null,
+    settlementAssetId: 'asset_usdc',
+    economicMappingId: 'mapping_usd_usdc',
+    destinationSnapshotJson: JSON.stringify({
+      managed_account_id: recipientManagedAccountId,
+      wallet_address: 'recipient_wallet',
+    }),
+    policyDecisionId: 'policy-decision-original',
+    approvalId: null,
+    executionState: 'TERMINAL',
+    settlementState: 'CONFIRMED',
+    outcomeState: 'CONFIRMED',
+    rowVersion: 2,
+    originalPaymentId: null,
+    confirmedAt: new Date('2026-09-17T00:00:00.000Z'),
+    failedAt: null,
+    failureCode: null,
+    failureMessageSafe: null,
+    createdAt: new Date('2026-09-16T00:00:00.000Z'),
+    updatedAt: new Date('2026-09-17T00:00:00.000Z'),
   }
 }
 
@@ -402,5 +451,89 @@ describe('V2 payment service', () => {
     await expect(harness.service.serialize(result.view)).resolves.toMatchObject({
       metadata: { nested: { a: 1, b: 2 }, z: 'last' },
     })
+  })
+
+  it('authorizes a managed-recipient refund through the trusted lookup path', async () => {
+    const harness = createHarness(true)
+    harness.setRefundOriginal(originalPayment(account.account.id))
+
+    const first = await harness.service.createRefund(
+      account,
+      'payment_original',
+      {
+        amount: '1.25',
+        denominationId: 'denom_usd',
+        // The refund service must ignore a caller-supplied destination.
+        target: {
+          recipientId: 'spoofed-recipient',
+          displayName: 'Attacker destination',
+          managedAccountId: 'acct_attacker',
+          destination: {
+            id: 'attacker_destination',
+            rail: 'SOLANA_SPL',
+            type: 'SOLANA_SPL',
+            walletAddress: 'attacker_wallet',
+          },
+        },
+      },
+      'refund-idempotency-key',
+      'request-refund',
+    )
+
+    const captured = harness.getCaptured()
+    if (captured === undefined) throw new Error('Refund input was not captured')
+    harness.setExistingIdempotency({
+      requestHash: captured.requestHash,
+      fingerprint: captured.fingerprint,
+      resourceId: first.view.payment.id,
+    })
+    const replay = await harness.service.createRefund(
+      account,
+      'payment_original',
+      { amount: '1.25', denominationId: 'denom_usd' },
+      'refund-idempotency-key',
+      'request-refund-replay',
+    )
+
+    expect(first.created).toBe(true)
+    expect(captured.originalPaymentId).toBe('payment_original')
+    expect(captured.recipientId).toBeNull()
+    expect(JSON.parse(captured.destinationSnapshotJson)).toMatchObject({
+      recipient_id: null,
+      managed_account_id: 'acct_payer',
+      wallet_address: 'payer_public_key',
+    })
+    expect(replay.created).toBe(false)
+    expect(replay.view.payment.id).toBe(first.view.payment.id)
+    expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
+  })
+
+  it('rejects payer and unrelated accounts as refund authorities', async () => {
+    const harness = createHarness(true)
+    harness.setRefundOriginal(originalPayment('acct_recipient'))
+    const makeAccount = (id: string): AuthenticatedAccount => ({
+      ...account,
+      account: { ...account.account, id },
+      credential: { ...account.credential, accountId: id },
+    })
+
+    await expect(
+      harness.service.createRefund(
+        makeAccount('acct_payer'),
+        'payment_original',
+        { amount: '1.25', denominationId: 'denom_usd' },
+        'payer-key',
+        'request-payer',
+      ),
+    ).rejects.toThrow('refund authority')
+    await expect(
+      harness.service.createRefund(
+        makeAccount('acct_unrelated'),
+        'payment_original',
+        { amount: '1.25', denominationId: 'denom_usd' },
+        'unrelated-key',
+        'request-unrelated',
+      ),
+    ).rejects.toThrow('refund authority')
   })
 })

@@ -56,8 +56,10 @@ export class AccountService {
       const destination = await this.rail.getReceiveDestination(wallet.publicKey)
       const credential = generateApiCredential()
       const credentialId = createCredentialId()
+      const accountId = createAccountId()
+      const receiveId = createReceiveId()
       const account = await this.repository.createAgentAccount({
-        id: createAccountId(),
+        id: accountId,
         name: normalizedName,
         solanaPublicKey: wallet.publicKey,
         encryptedSolanaSecret: encryptedSecret.ciphertext,
@@ -66,12 +68,11 @@ export class AccountService {
         credentialId,
         keyHash: credential.keyHash,
         keyPrefix: credential.keyPrefix,
-      })
-      const receiveRequest = await this.repository.createReceiveRequest({
-        id: createReceiveId(),
-        accountId: account.id,
-        currency: 'USD',
-        reference: `account:${account.id}`,
+        initialReceiveRequest: {
+          id: receiveId,
+          currency: 'USD',
+          reference: `account:${accountId}`,
+        },
       })
 
       return {
@@ -80,7 +81,7 @@ export class AccountService {
         status: 'ACTIVE',
         apiKey: credential.rawKey,
         credentialId,
-        receiveId: receiveRequest.id,
+        receiveId,
         destination,
       }
     } finally {

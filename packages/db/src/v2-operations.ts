@@ -219,6 +219,16 @@ export interface V2OperationsRepository {
     readonly errorSafe: string
     readonly maxAttempts: number
   }): Promise<void>
+  /**
+   * Defers a claimed delivery without consuming an external delivery attempt.
+   * This is reserved for local backpressure before the HTTP request starts.
+   */
+  deferWebhookDelivery(input: {
+    readonly id: string
+    readonly owner: string
+    readonly retryAt: Date
+    readonly errorSafe: string
+  }): Promise<void>
   createBackupVerification(input: {
     readonly id: string
     readonly backupReference: string
@@ -879,7 +889,6 @@ export function createV2OperationsRepository(
 
     async retryWebhookDelivery(input) {
       await prisma.$transaction(async (transaction) => {
-        const now = new Date()
         const locked = await transaction.$queryRaw<readonly { id: string }[]>`
           SELECT id
           FROM "webhook_deliveries"
@@ -888,6 +897,7 @@ export function createV2OperationsRepository(
         `
         if (locked.length === 0)
           throw new NotFoundError('Webhook delivery was not found')
+        const now = new Date()
         const delivery = await transaction.webhookDelivery.findUnique({
           where: { id: input.id },
         })
@@ -915,6 +925,49 @@ export function createV2OperationsRepository(
             availableAt: input.retryAt,
             nextRetryAt: input.retryAt,
             errorSafe: input.errorSafe,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+          },
+        })
+      })
+    },
+
+    async deferWebhookDelivery(input) {
+      await prisma.$transaction(async (transaction) => {
+        const locked = await transaction.$queryRaw<readonly { id: string }[]>`
+          SELECT id
+          FROM "webhook_deliveries"
+          WHERE id = ${input.id}
+          FOR UPDATE
+        `
+        if (locked.length === 0)
+          throw new NotFoundError('Webhook delivery was not found')
+        const now = new Date()
+        const delivery = await transaction.webhookDelivery.findUnique({
+          where: { id: input.id },
+        })
+        if (
+          delivery === null ||
+          delivery.status !== 'CLAIMED' ||
+          delivery.leaseOwner !== input.owner ||
+          delivery.leaseExpiresAt === null ||
+          delivery.leaseExpiresAt <= now
+        ) {
+          throw new ConflictError('Webhook delivery lease is no longer owned')
+        }
+        if (delivery.attemptCount < 1) {
+          throw new InvalidStateError(
+            'Claimed webhook delivery has no attempt to defer',
+          )
+        }
+        await transaction.webhookDelivery.update({
+          where: { id: input.id },
+          data: {
+            status: 'RETRY_WAIT',
+            availableAt: input.retryAt,
+            nextRetryAt: input.retryAt,
+            errorSafe: input.errorSafe,
+            attemptCount: { decrement: 1 },
             leaseOwner: null,
             leaseExpiresAt: null,
           },

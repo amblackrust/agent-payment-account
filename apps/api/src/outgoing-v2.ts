@@ -950,7 +950,7 @@ export class V2OutgoingWorker {
     this.options.metrics?.incrementCounter('mux_dependency_backpressure_total', {
       dependency,
     })
-    await this.options.repository.retryWorkItem({
+    await this.options.repository.deferWorkItem({
       id: claim.id,
       owner: this.options.owner,
       retryAt: retryAtAfter(
