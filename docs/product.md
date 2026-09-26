@@ -24,6 +24,14 @@ A raw blockchain wallet exposes a large operational surface to an agent: RPC sel
 
 Mux moves those responsibilities behind an account-oriented contract. The agent uses amounts such as `"0.50"` in `USD`, recipient IDs, idempotency keys, and normalized lifecycle states; the runtime translates that intent into a real SPL transfer and records how it progresses.
 
+The V2 contract makes the denomination explicit: agent-facing V2 operations
+send an exact decimal amount together with `denomination_id`. The current
+configured route remains a single classic SPL settlement asset, while the
+domain model keeps logical denominations, settlement assets, and economic
+mappings distinct so adding another asset cannot silently reinterpret an old
+amount. The older `/v1` contract remains available as a fixed-two-decimal USD
+compatibility surface.
+
 ## Product Model
 
 ### Agent Account
@@ -38,7 +46,9 @@ The balance response separates:
 - `pending_outgoing`: funds held by active outgoing reservations;
 - `available`: settled funds not reserved by in-flight payments.
 
-All public amounts use fixed two-decimal `USD` strings. The configured settlement mint remains an operator concern.
+V1 balance responses use fixed two-decimal `USD` strings. V2 balance responses
+use exact decimal strings and identify the requested denomination. The
+configured settlement mint remains an operator concern.
 
 ### Recipient
 

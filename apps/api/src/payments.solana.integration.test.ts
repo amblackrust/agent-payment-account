@@ -47,12 +47,15 @@ const testConfig: AppConfig = {
     'postgresql://postgres:postgres@127.0.0.1:5432/agent_payment_account',
   port: 0,
   nodeEnv: 'test',
+  runtimeRole: 'all',
+  restoreGateRequired: false,
   adminApiKey: 'test-admin-key',
   solanaRpcUrl: 'http://surfpool.local',
   solanaCluster: 'localnet',
   solanaSettlementMint: 'test-mint',
   solanaFeePayerSecret: 'test-fee-payer-secret',
   walletMasterKey: masterKey,
+  recoveryEnvelopeKey: masterKey,
   allowMainnet: false,
 }
 
@@ -290,12 +293,12 @@ describe.skipIf(databaseUrl === undefined || databaseUrl.length === 0)(
         const baseUrl = `http://127.0.0.1:${listenerAddress.port}`
         const payerBootstrap = await createAccountThroughApi(
           baseUrl,
-          testConfig.adminApiKey,
+          testConfig.adminApiKey!,
           'surfpool-payer',
         )
         const recipientBootstrap = await createAccountThroughApi(
           baseUrl,
-          testConfig.adminApiKey,
+          testConfig.adminApiKey!,
           'surfpool-recipient',
         )
         const payerId = payerBootstrap.id

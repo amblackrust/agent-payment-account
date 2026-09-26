@@ -1,0 +1,539 @@
+import { describe, expect, it, vi } from 'vitest'
+import { V2PaymentService, type V2RouteCapabilityProvider } from './payments-v2.js'
+import type {
+  AuthenticatedAccount,
+  V2DatabaseRepository,
+  V2IdempotencyRecord,
+  V2PaymentCreateInput,
+  V2PaymentSnapshot,
+  V2PaymentView,
+} from '@agent-payment/db'
+
+const account: AuthenticatedAccount = {
+  account: {
+    id: 'acct_1',
+    name: 'Test account',
+    status: 'ACTIVE',
+    solanaPublicKey: 'payer_public_key',
+  },
+  credential: {
+    id: 'cred_1',
+    accountId: 'acct_1',
+    keyHash: 'hash',
+    keyPrefix: 'apa_test',
+    status: 'ACTIVE',
+    scopes: ['payments:create', 'payments:read'],
+    expiresAt: null,
+    revokedAt: null,
+    lastUsedAt: null,
+  },
+}
+
+function createHarness(
+  destinationApproved: boolean,
+  routeCapabilityProvider?: V2RouteCapabilityProvider,
+) {
+  let captured: V2PaymentCreateInput | undefined
+  let latestView: V2PaymentView | undefined
+  let refundOriginal: V2PaymentSnapshot | null = null
+  let existingIdempotency: V2IdempotencyRecord | null = null
+  let denominationStatus: 'ACTIVE' | 'RETIRED' = 'ACTIVE'
+  const getSettledAtomic = vi.fn(async () => 1_000n)
+  const findV2Idempotency = vi.fn(async () => existingIdempotency)
+  const repository = {
+    findDenomination: async () => ({
+      id: 'denom_usd',
+      symbol: 'USD',
+      maxScale: 2,
+      status: denominationStatus,
+      version: 1,
+    }),
+    listActiveSettlementRoutes: async () => [
+      {
+        id: 'route_solana',
+        rail: 'SOLANA_SPL',
+        railVersion: '1',
+        network: 'localnet',
+        settlementAssetId: 'asset_usdc',
+        economicMappingId: 'mapping_usd_usdc',
+        status: 'ACTIVE' as const,
+        priority: 1,
+        configVersion: 'test',
+      },
+    ],
+    findSettlementAsset: async () => ({
+      id: 'asset_usdc',
+      rail: 'SOLANA_SPL',
+      network: 'localnet',
+      assetReference: 'mint_usdc',
+      decimals: 6,
+      status: 'ACTIVE',
+      version: 1,
+    }),
+    findEconomicMapping: async () => ({
+      id: 'mapping_usd_usdc',
+      denominationId: 'denom_usd',
+      settlementAssetId: 'asset_usdc',
+      numerator: 1n,
+      denominator: 1n,
+      status: 'ACTIVE',
+      version: 1,
+    }),
+    findApprovedDestination: async () =>
+      destinationApproved
+        ? {
+            id: 'approved_1',
+            accountId: 'acct_1',
+            fingerprint: 'fingerprint',
+            rail: 'SOLANA_SPL',
+            network: 'localnet',
+            assetReference: 'mint_usdc',
+            destination: 'recipient_wallet',
+          }
+        : null,
+    getSpendContext: async () => ({
+      confirmedSpendAtomic: 0n,
+      heldReservationAtomic: 0n,
+      unresolvedSpendAtomic: 0n,
+      transactionCount: 0,
+    }),
+    findActiveSpendPolicy: async () => ({
+      id: 'policy_1',
+      accountId: 'acct_1',
+      version: 1,
+      status: 'ACTIVE',
+      denominationId: 'denom_usd',
+      maxPerPaymentAtomic: null,
+      rollingBudgetAtomic: null,
+      rollingWindowSeconds: null,
+      transactionCountCap: null,
+      approvalThresholdAtomic: null,
+      rollingBudgetEscalatable: false,
+      transactionCountEscalatable: false,
+    }),
+    findV2Idempotency,
+    findPaymentForRefund: async () => refundOriginal,
+    getRefundedAtomic: async () => 0n,
+    findAccountPublicKey: async () => 'payer_public_key',
+    createV2Payment: async (input: V2PaymentCreateInput) => {
+      captured = input
+      const now = new Date('2026-09-17T00:00:00.000Z')
+      latestView = {
+        payment: {
+          id: input.paymentId,
+          payerAccountId: input.accountId,
+          recipientId: input.recipientId,
+          recipientManagedAccountId: input.recipientManagedAccountId ?? null,
+          kind: input.operation,
+          description: input.description ?? null,
+          externalReference: input.externalReference ?? null,
+          metadataJson: input.metadataJson ?? '{}',
+          amountAtomic: input.amountAtomic,
+          amountScale: input.amountScale,
+          denominationId: input.denominationId,
+          currency: input.currency,
+          status:
+            input.policyDecision.decision === 'DENY'
+              ? 'REJECTED_BY_POLICY'
+              : input.policyDecision.decision === 'REQUIRE_APPROVAL'
+                ? 'AWAITING_APPROVAL'
+                : 'ROUTING',
+          routeId: input.route?.id ?? null,
+          routeSelectionReason: input.routeSelectionReason,
+          settlementAssetId: input.settlementAssetId,
+          destinationSnapshotJson: input.destinationSnapshotJson,
+          policyDecisionId: input.policyDecision.id,
+          approvalId: input.approval?.id ?? null,
+          executionState:
+            input.policyDecision.decision === 'ALLOW' ? 'QUEUED' : 'NOT_STARTED',
+          settlementState: 'NOT_SUBMITTED',
+          outcomeState:
+            input.policyDecision.decision === 'DENY' ? 'PROVED_NO_EFFECT' : 'NONE',
+          rowVersion: 1,
+          originalPaymentId: input.originalPaymentId ?? null,
+          confirmedAt: null,
+          failedAt: null,
+          failureCode: null,
+          failureMessageSafe: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+        policyDecision: input.policyDecision.decision,
+        reasonCodes: input.policyDecision.reasonCodes,
+        approvalState: input.approval === undefined ? 'NOT_REQUIRED' : 'PENDING',
+        reservationStatus: input.policyDecision.decision === 'ALLOW' ? 'HELD' : 'NONE',
+        attempts:
+          input.policyDecision.decision === 'ALLOW'
+            ? [
+                {
+                  id: input.attemptId,
+                  paymentId: input.paymentId,
+                  attemptNumber: 1,
+                  routeId: input.route?.id ?? null,
+                  status: 'CREATED',
+                  outcome: 'NOT_STARTED',
+                  preparedEffectHash: null,
+                  signedPayloadHash: null,
+                  expectedExternalId: null,
+                  validityExpiresAt: null,
+                  validitySlot: null,
+                  rowVersion: 1,
+                },
+              ]
+            : [],
+      }
+      return {
+        payment: latestView.payment,
+        created: true,
+      }
+    },
+    findPaymentView: async () => latestView ?? null,
+  } as unknown as V2DatabaseRepository
+  const service = new V2PaymentService({
+    repository,
+    recipientRepository: {
+      findRecipientForOwner: async () => ({
+        id: 'recipient_1',
+        ownerAccountId: 'acct_1',
+        displayName: 'Recipient',
+        type: 'EXTERNAL',
+        managedAccountId: null,
+        ownerStatus: 'ACTIVE',
+        destinations: [
+          {
+            id: 'destination_1',
+            rail: 'SOLANA_SPL',
+            type: 'SOLANA_SPL',
+            walletAddress: 'recipient_wallet',
+          },
+        ],
+        createdAt: new Date('2026-09-16T00:00:00.000Z'),
+        updatedAt: new Date('2026-09-16T00:00:00.000Z'),
+        archivedAt: null,
+        rowVersion: 1,
+      }),
+    },
+    settledBalanceProvider: { getSettledAtomic },
+    ...(routeCapabilityProvider === undefined ? {} : { routeCapabilityProvider }),
+    now: () => new Date('2026-09-17T00:00:00.000Z'),
+  })
+  return {
+    service,
+    getSettledAtomic,
+    getCaptured: () => captured,
+    setRefundOriginal: (payment: V2PaymentSnapshot | null) => {
+      refundOriginal = payment
+    },
+    setExistingIdempotency: (record: V2IdempotencyRecord | null) => {
+      existingIdempotency = record
+    },
+    setDenominationStatus: (status: 'ACTIVE' | 'RETIRED') => {
+      denominationStatus = status
+    },
+  }
+}
+
+function originalPayment(recipientManagedAccountId: string): V2PaymentSnapshot {
+  return {
+    id: 'payment_original',
+    payerAccountId: 'acct_payer',
+    correlationId: null,
+    recipientId: 'recipient_1',
+    recipientManagedAccountId,
+    kind: 'PAY',
+    description: null,
+    externalReference: null,
+    metadataJson: '{}',
+    amountAtomic: 125n,
+    amountScale: 2,
+    denominationId: 'denom_usd',
+    currency: 'USD',
+    status: 'CONFIRMED',
+    routeId: 'route_solana',
+    routeSelectionReason: 'priority',
+    routeCapabilitySnapshotJson: null,
+    settlementAssetId: 'asset_usdc',
+    economicMappingId: 'mapping_usd_usdc',
+    destinationSnapshotJson: JSON.stringify({
+      managed_account_id: recipientManagedAccountId,
+      wallet_address: 'recipient_wallet',
+    }),
+    policyDecisionId: 'policy-decision-original',
+    approvalId: null,
+    executionState: 'TERMINAL',
+    settlementState: 'CONFIRMED',
+    outcomeState: 'CONFIRMED',
+    rowVersion: 2,
+    originalPaymentId: null,
+    confirmedAt: new Date('2026-09-17T00:00:00.000Z'),
+    failedAt: null,
+    failureCode: null,
+    failureMessageSafe: null,
+    createdAt: new Date('2026-09-16T00:00:00.000Z'),
+    updatedAt: new Date('2026-09-17T00:00:00.000Z'),
+  }
+}
+
+describe('V2 payment service', () => {
+  it('fails closed before policy and reservation work when route capability is unavailable', async () => {
+    const getCapabilities = vi.fn(async (routes: readonly { id: string }[]) =>
+      routes.map((route) => ({
+        routeId: route.id,
+        eligible: false,
+        reason: 'RPC_UNAVAILABLE',
+        observedAt: new Date('2026-09-17T00:00:00.000Z'),
+        identityVersion: 'test-capability',
+      })),
+    )
+    const harness = createHarness(true, { getCapabilities })
+
+    await expect(
+      harness.service.createPayment(
+        account,
+        {
+          kind: 'PAY',
+          recipientId: 'recipient_1',
+          amount: '1.25',
+          denominationId: 'denom_usd',
+        },
+        'capability-key',
+        'req-capability',
+      ),
+    ).rejects.toThrow('No active settlement route is eligible')
+
+    expect(getCapabilities).toHaveBeenCalledOnce()
+    expect(harness.getSettledAtomic).not.toHaveBeenCalled()
+    expect(harness.getCaptured()).toBeUndefined()
+  })
+
+  it('creates an allowed payment with an atomic reservation plan', async () => {
+    const harness = createHarness(true)
+    const result = await harness.service.createPayment(
+      account,
+      {
+        kind: 'PAY',
+        recipientId: 'recipient_1',
+        amount: '001.25',
+        denominationId: 'denom_usd',
+      },
+      'idem_1',
+      'req_1',
+    )
+
+    expect(result.view.payment.status).toBe('ROUTING')
+    expect(result.view.reservationStatus).toBe('HELD')
+    expect(result.view.attempts).toHaveLength(1)
+    expect(harness.getCaptured()?.route?.id).toBe('route_solana')
+    expect(harness.getCaptured()?.amountAtomic).toBe(125n)
+    expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
+  })
+
+  it('persists the selected route capability identity and observation time', async () => {
+    const observedAt = new Date('2026-09-17T00:00:01.000Z')
+    const harness = createHarness(true, {
+      getCapabilities: async (routes) =>
+        routes.map((route) => ({
+          routeId: route.id,
+          eligible: true,
+          observedAt,
+          identityVersion: 'solana:localnet:mint:v1',
+        })),
+    })
+
+    await harness.service.createPayment(
+      account,
+      {
+        kind: 'PAY',
+        recipientId: 'recipient_1',
+        amount: '1.25',
+        denominationId: 'denom_usd',
+      },
+      'idem_capability_snapshot',
+      'req_capability_snapshot',
+    )
+
+    expect(harness.getCaptured()?.routeCapabilitySnapshotJson).toBe(
+      JSON.stringify({
+        route_id: 'route_solana',
+        eligible: true,
+        reason: null,
+        observed_at: observedAt.toISOString(),
+        identity_version: 'solana:localnet:mint:v1',
+      }),
+    )
+  })
+
+  it('persists policy denial without selecting a durable route or calling balance', async () => {
+    const harness = createHarness(false)
+    const result = await harness.service.createPayment(
+      account,
+      {
+        kind: 'PAY',
+        recipientId: 'recipient_1',
+        amount: '1.25',
+        denominationId: 'denom_usd',
+      },
+      'idem_2',
+      'req_2',
+    )
+
+    expect(result.view.policyDecision).toBe('DENY')
+    expect(result.view.payment.status).toBe('REJECTED_BY_POLICY')
+    expect(result.view.reservationStatus).toBe('NONE')
+    expect(result.view.attempts).toHaveLength(0)
+    expect(harness.getCaptured()?.route).toBeNull()
+    expect(harness.getCaptured()?.settlementAssetId).toBeNull()
+    expect(harness.getSettledAtomic).not.toHaveBeenCalled()
+  })
+
+  it('replays an idempotent payment before downstream route and balance reads', async () => {
+    const harness = createHarness(true)
+    const input = {
+      kind: 'PAY' as const,
+      recipientId: 'recipient_1',
+      amount: '1.25',
+      denominationId: 'denom_usd',
+    }
+    const first = await harness.service.createPayment(
+      account,
+      input,
+      'idem_replay',
+      'req_1',
+    )
+    const captured = harness.getCaptured()
+    if (captured === undefined) throw new Error('Payment input was not captured')
+    harness.setExistingIdempotency({
+      requestHash: captured.requestHash,
+      fingerprint: captured.fingerprint,
+      resourceId: first.view.payment.id,
+    })
+
+    const second = await harness.service.createPayment(
+      account,
+      input,
+      'idem_replay',
+      'req_2',
+    )
+
+    harness.setDenominationStatus('RETIRED')
+    const replayAfterRetirement = await harness.service.createPayment(
+      account,
+      input,
+      'idem_replay',
+      'req_3',
+    )
+
+    expect(second.created).toBe(false)
+    expect(second.view.payment.id).toBe(first.view.payment.id)
+    expect(replayAfterRetirement.created).toBe(false)
+    expect(replayAfterRetirement.view.payment.id).toBe(first.view.payment.id)
+    expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
+  })
+
+  it('canonicalizes and round-trips bounded payment metadata', async () => {
+    const harness = createHarness(true)
+    const result = await harness.service.createPayment(
+      account,
+      {
+        kind: 'PAY',
+        recipientId: 'recipient_1',
+        amount: '1.25',
+        denominationId: 'denom_usd',
+        metadata: { z: 'last', nested: { b: 2, a: 1 } },
+      },
+      'idem_metadata',
+      'req_metadata',
+    )
+
+    expect(harness.getCaptured()?.metadataJson).toBe(
+      '{"nested":{"a":1,"b":2},"z":"last"}',
+    )
+    await expect(harness.service.serialize(result.view)).resolves.toMatchObject({
+      metadata: { nested: { a: 1, b: 2 }, z: 'last' },
+    })
+  })
+
+  it('authorizes a managed-recipient refund through the trusted lookup path', async () => {
+    const harness = createHarness(true)
+    harness.setRefundOriginal(originalPayment(account.account.id))
+
+    const first = await harness.service.createRefund(
+      account,
+      'payment_original',
+      {
+        amount: '1.25',
+        denominationId: 'denom_usd',
+        // The refund service must ignore a caller-supplied destination.
+        target: {
+          recipientId: 'spoofed-recipient',
+          displayName: 'Attacker destination',
+          managedAccountId: 'acct_attacker',
+          destination: {
+            id: 'attacker_destination',
+            rail: 'SOLANA_SPL',
+            type: 'SOLANA_SPL',
+            walletAddress: 'attacker_wallet',
+          },
+        },
+      },
+      'refund-idempotency-key',
+      'request-refund',
+    )
+
+    const captured = harness.getCaptured()
+    if (captured === undefined) throw new Error('Refund input was not captured')
+    harness.setExistingIdempotency({
+      requestHash: captured.requestHash,
+      fingerprint: captured.fingerprint,
+      resourceId: first.view.payment.id,
+    })
+    const replay = await harness.service.createRefund(
+      account,
+      'payment_original',
+      { amount: '1.25', denominationId: 'denom_usd' },
+      'refund-idempotency-key',
+      'request-refund-replay',
+    )
+
+    expect(first.created).toBe(true)
+    expect(captured.originalPaymentId).toBe('payment_original')
+    expect(captured.recipientId).toBeNull()
+    expect(JSON.parse(captured.destinationSnapshotJson)).toMatchObject({
+      recipient_id: null,
+      managed_account_id: 'acct_payer',
+      wallet_address: 'payer_public_key',
+    })
+    expect(replay.created).toBe(false)
+    expect(replay.view.payment.id).toBe(first.view.payment.id)
+    expect(harness.getSettledAtomic).toHaveBeenCalledOnce()
+  })
+
+  it('rejects payer and unrelated accounts as refund authorities', async () => {
+    const harness = createHarness(true)
+    harness.setRefundOriginal(originalPayment('acct_recipient'))
+    const makeAccount = (id: string): AuthenticatedAccount => ({
+      ...account,
+      account: { ...account.account, id },
+      credential: { ...account.credential, accountId: id },
+    })
+
+    await expect(
+      harness.service.createRefund(
+        makeAccount('acct_payer'),
+        'payment_original',
+        { amount: '1.25', denominationId: 'denom_usd' },
+        'payer-key',
+        'request-payer',
+      ),
+    ).rejects.toThrow('refund authority')
+    await expect(
+      harness.service.createRefund(
+        makeAccount('acct_unrelated'),
+        'payment_original',
+        { amount: '1.25', denominationId: 'denom_usd' },
+        'unrelated-key',
+        'request-unrelated',
+      ),
+    ).rejects.toThrow('refund authority')
+  })
+})

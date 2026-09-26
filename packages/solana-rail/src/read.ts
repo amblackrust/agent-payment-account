@@ -15,6 +15,9 @@ import {
 export type SolanaRpc = ReturnType<typeof createSolanaRpc>
 
 export const DEFAULT_RPC_TIMEOUT_MS = 5_000
+const RPC_RATE_LIMIT_MAX_RETRIES = 5
+const RPC_RATE_LIMIT_BASE_DELAY_MS = 1_000
+const RPC_RATE_LIMIT_MAX_DELAY_MS = 15_000
 
 export type SolanaCluster = 'localnet' | 'devnet' | 'testnet' | 'mainnet-beta'
 
@@ -33,6 +36,13 @@ export interface SettlementBalance {
   readonly ataStatus: 'PRESENT' | 'MISSING'
 }
 
+export interface SettlementAtomicBalance {
+  readonly tokenAtomicUnits: bigint
+  readonly tokenDecimals: number
+  readonly ata: string
+  readonly ataStatus: 'PRESENT' | 'MISSING'
+}
+
 export interface ReceiveDestination {
   readonly owner: string
   readonly tokenAccount: string
@@ -41,6 +51,8 @@ export interface ReceiveDestination {
 
 export interface SolanaRail {
   getSettlementBalance(owner: string): Promise<SettlementBalance>
+  /** Reads the exact token balance without forcing a USD two-decimal projection. */
+  getSettlementAtomicBalance?(owner: string): Promise<SettlementAtomicBalance>
   getReceiveDestination(owner: string): Promise<ReceiveDestination>
   checkReadiness?(): Promise<void>
 }
@@ -100,8 +112,12 @@ function tokenToUsdMoney(tokenAtomicUnits: bigint, tokenDecimals: number): Money
   }
 
   if (tokenDecimals >= USD_DECIMAL_PLACES) {
-    // Sub-cent token atoms remain in the rail result; spendable USD is truncated.
     const divisor = 10n ** BigInt(tokenDecimals - USD_DECIMAL_PLACES)
+    if (tokenAtomicUnits % divisor !== 0n) {
+      throw new ExternalRailError(
+        'Settlement balance cannot be represented exactly in the configured denomination',
+      )
+    }
     return moneyFromAtomicUnits(tokenAtomicUnits / divisor)
   }
 
@@ -180,34 +196,42 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
   async function withRpcTimeout<T>(
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
-    const controller = new AbortController()
-    let timedOut = false
-    let timeout: NodeJS.Timeout | undefined
-    const timeoutPromise = new Promise<never>((_resolve, reject) => {
-      timeout = setTimeout(() => {
-        timedOut = true
-        controller.abort()
-        reject(
-          new ExternalRailError('Solana RPC request timed out', undefined, 'RETRYABLE'),
-        )
-      }, timeoutMs)
-    })
-    try {
-      return await Promise.race([operation(controller.signal), timeoutPromise])
-    } catch (error) {
-      if (timedOut || controller.signal.aborted) {
-        throw new ExternalRailError(
-          'Solana RPC request timed out',
-          undefined,
-          'RETRYABLE',
-        )
-      }
-      throw toExternalRailError(error)
-    } finally {
-      if (timeout !== undefined) {
-        clearTimeout(timeout)
+    for (let attempt = 0; attempt <= RPC_RATE_LIMIT_MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController()
+      let timedOut = false
+      let timeout: NodeJS.Timeout | undefined
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          timedOut = true
+          controller.abort()
+          reject(
+            new ExternalRailError(
+              'Solana RPC request timed out',
+              undefined,
+              'RETRYABLE',
+            ),
+          )
+        }, timeoutMs)
+      })
+      try {
+        return await Promise.race([operation(controller.signal), timeoutPromise])
+      } catch (error) {
+        if (timedOut || controller.signal.aborted) {
+          throw new ExternalRailError(
+            'Solana RPC request timed out',
+            undefined,
+            'RETRYABLE',
+          )
+        }
+        if (!isRpcRateLimitedError(error) || attempt === RPC_RATE_LIMIT_MAX_RETRIES) {
+          throw toExternalRailError(error)
+        }
+        await waitForRpcRateLimit(attempt)
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout)
       }
     }
+    throw new ExternalRailError('Solana RPC request failed', undefined, 'RETRYABLE')
   }
 
   async function validateSettlementMetadata(): Promise<SettlementMetadata> {
@@ -266,6 +290,43 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
     }
   }
 
+  async function getSettlementAtomicBalance(
+    owner: string,
+  ): Promise<SettlementAtomicBalance> {
+    const metadata = await getSettlementMetadata()
+    const destination = await deriveDestinationWithoutValidation(owner)
+    try {
+      const tokenAccount = await withRpcTimeout((abortSignal) =>
+        fetchMaybeToken(options.rpc, destination.tokenAccount as Address, {
+          abortSignal,
+        }),
+      )
+      if (!tokenAccount.exists) {
+        return {
+          tokenAtomicUnits: 0n,
+          tokenDecimals: metadata.decimals,
+          ata: destination.tokenAccount,
+          ataStatus: 'MISSING',
+        }
+      }
+      if (
+        tokenAccount.programAddress !== TOKEN_PROGRAM_ADDRESS ||
+        tokenAccount.data.mint !== settlementMint ||
+        tokenAccount.data.owner !== destination.owner
+      ) {
+        throw new ExternalRailError('Settlement token account has unexpected ownership')
+      }
+      return {
+        tokenAtomicUnits: tokenAccount.data.amount,
+        tokenDecimals: metadata.decimals,
+        ata: destination.tokenAccount,
+        ataStatus: 'PRESENT',
+      }
+    } catch (error) {
+      throw toExternalRailError(error)
+    }
+  }
+
   return {
     async checkReadiness(): Promise<void> {
       await validateSettlementMetadata()
@@ -276,49 +337,42 @@ export function createSolanaRailWithRpc(options: SolanaRailWithRpcOptions): Sola
       return deriveDestinationWithoutValidation(owner)
     },
 
-    async getSettlementBalance(owner): Promise<SettlementBalance> {
-      const metadata = await getSettlementMetadata()
-      const destination = await deriveDestinationWithoutValidation(owner)
-      try {
-        const tokenAccount = await withRpcTimeout((abortSignal) =>
-          fetchMaybeToken(options.rpc, destination.tokenAccount as Address, {
-            abortSignal,
-          }),
-        )
-        if (!tokenAccount.exists) {
-          return {
-            currency: 'USD',
-            settled: moneyFromAtomicUnits(0n),
-            tokenAtomicUnits: 0n,
-            tokenDecimals: metadata.decimals,
-            ata: destination.tokenAccount,
-            ataStatus: 'MISSING',
-          }
-        }
-        if (
-          tokenAccount.programAddress !== TOKEN_PROGRAM_ADDRESS ||
-          tokenAccount.data.mint !== settlementMint ||
-          tokenAccount.data.owner !== destination.owner
-        ) {
-          throw new ExternalRailError(
-            'Settlement token account has unexpected ownership',
-          )
-        }
+    async getSettlementAtomicBalance(owner): Promise<SettlementAtomicBalance> {
+      return getSettlementAtomicBalance(owner)
+    },
 
-        const tokenAtomicUnits = tokenAccount.data.amount
-        return {
-          currency: 'USD',
-          settled: tokenToUsdMoney(tokenAtomicUnits, metadata.decimals),
-          tokenAtomicUnits,
-          tokenDecimals: metadata.decimals,
-          ata: destination.tokenAccount,
-          ataStatus: 'PRESENT',
-        }
-      } catch (error) {
-        throw toExternalRailError(error)
+    async getSettlementBalance(owner): Promise<SettlementBalance> {
+      const balance = await getSettlementAtomicBalance(owner)
+      return {
+        currency: 'USD',
+        settled: tokenToUsdMoney(balance.tokenAtomicUnits, balance.tokenDecimals),
+        ...balance,
       }
     },
   }
+}
+
+function isRpcRateLimitedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const context = (error as { readonly context?: unknown }).context
+  if (
+    typeof context === 'object' &&
+    context !== null &&
+    !Array.isArray(context) &&
+    (context as { readonly statusCode?: unknown }).statusCode === 429
+  ) {
+    return true
+  }
+  const detail = `${error.name} ${error.message}`.toLowerCase()
+  return detail.includes('429') || detail.includes('too many requests')
+}
+
+async function waitForRpcRateLimit(attempt: number): Promise<void> {
+  const delayMs = Math.min(
+    RPC_RATE_LIMIT_MAX_DELAY_MS,
+    RPC_RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt,
+  )
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
 }
 
 export { tokenToUsdMoney }

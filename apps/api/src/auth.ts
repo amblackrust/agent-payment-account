@@ -1,6 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { FastifyRequest } from 'fastify'
-import { AuthenticationError } from '@agent-payment/core'
+import {
+  AgentCredentialStatus,
+  AuthenticationError,
+  AuthorizationError,
+  type AgentCredentialScope,
+} from '@agent-payment/core'
 import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 
 export const ADMIN_API_KEY_HEADER = 'x-admin-api-key'
@@ -25,8 +30,11 @@ export function hashApiKey(rawKey: string): string {
   return createHash('sha256').update(rawKey, 'utf8').digest('hex')
 }
 
-export function isApiKeyMatch(provided: string | undefined, expected: string): boolean {
-  if (provided === undefined) {
+export function isApiKeyMatch(
+  provided: string | undefined,
+  expected: string | undefined,
+): boolean {
+  if (provided === undefined || expected === undefined) {
     return false
   }
   const providedBytes = Buffer.from(provided, 'utf8')
@@ -59,6 +67,19 @@ export async function authenticateAgent(
   if (account === null || account.credential.revokedAt !== null) {
     throw new AuthenticationError()
   }
+  if (
+    account.credential.status !== undefined &&
+    account.credential.status !== AgentCredentialStatus.ACTIVE
+  ) {
+    throw new AuthenticationError()
+  }
+  if (
+    account.credential.expiresAt !== undefined &&
+    account.credential.expiresAt !== null &&
+    account.credential.expiresAt <= new Date()
+  ) {
+    throw new AuthenticationError()
+  }
   if (account.account.status !== 'ACTIVE') {
     throw new AuthenticationError('Account is disabled')
   }
@@ -68,12 +89,43 @@ export async function authenticateAgent(
   return account
 }
 
-export function assertAdminApiKey(request: FastifyRequest, expected: string): void {
+export async function authenticateAgentWithScope(
+  request: FastifyRequest,
+  repository: AccountRepository,
+  requiredScope: AgentCredentialScope,
+): Promise<AuthenticatedAccount> {
+  const account = await authenticateAgent(request, repository)
+  if (account.credential.scopes === undefined) {
+    throw new AuthorizationError('Credential scopes are unavailable')
+  }
+  if (!account.credential.scopes.includes(requiredScope)) {
+    throw new AuthorizationError('Credential does not have the required scope')
+  }
+  return account
+}
+
+export function assertAdminApiKey(
+  request: FastifyRequest,
+  expected: string | undefined,
+): void {
   const provided = request.headers[ADMIN_API_KEY_HEADER]
   const value = Array.isArray(provided) ? provided[0] : provided
   if (!isApiKeyMatch(value, expected)) {
     throw new AuthenticationError()
   }
+}
+
+/**
+ * Returns the durable audit identity for the authenticated platform operator.
+ * The raw credential is intentionally never persisted or exposed.
+ */
+export function getAdminOperatorId(
+  request: FastifyRequest,
+  expected: string | undefined,
+): string {
+  assertAdminApiKey(request, expected)
+  if (expected === undefined) throw new AuthenticationError()
+  return `platform-operator:${hashApiKey(expected).slice(0, 24)}`
 }
 
 declare module 'fastify' {

@@ -1,0 +1,122 @@
+groups:
+  - name: mux-v2-domain
+    rules:
+      - alert: MuxV2DomainDegraded
+        expr: mux_domain_health_status == 0
+        for: 5m
+        labels:
+          service: mux
+          severity: warning
+        annotations:
+          summary: Mux V2 domain health is degraded
+          description: The domain health endpoint reports an active workflow or dependency degradation.
+
+      - alert: MuxV2DomainHealthCheckFailed
+        expr: mux_domain_dependency_check_failed == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 domain health check failed
+          description: The API could not evaluate durable domain health while serving metrics.
+
+      - alert: MuxV2ReviewRequiredBacklog
+        expr: mux_domain_alert_active{alert="REVIEW_REQUIRED_BACKLOG"} == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 has payments requiring review
+          description: At least one payment is blocked in REVIEW_REQUIRED.
+
+      - alert: MuxV2ReviewRequiredAge
+        expr: mux_domain_alert_active{alert="REVIEW_REQUIRED_AGE"} == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 review backlog is too old
+          description: The oldest payment requiring review exceeds the configured age threshold.
+
+      - alert: MuxV2IncomingIssuesExhausted
+        expr: mux_domain_alert_active{alert="INCOMING_ISSUES_EXHAUSTED"} == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 incoming reconciliation issues exhausted retries
+          description: Incoming reconciliation requires operator review.
+
+      - alert: MuxV2CustodyFailures
+        expr: mux_domain_alert_active{alert="CUSTODY_FAILURES"} == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 custody operations are failing
+          description: Signing or custody failures are preventing safe settlement execution.
+
+      - alert: MuxV2NoProgress
+        expr: mux_domain_alert_active{alert="NO_PROGRESS"} == 1
+        for: 10m
+        labels:
+          service: mux
+          severity: warning
+        annotations:
+          summary: Mux V2 workflow has made no progress
+          description: A durable workflow item has exceeded the configured no-progress window.
+
+      - alert: MuxV2DatabaseSaturation
+        expr: mux_domain_alert_active{alert="DATABASE_SATURATION"} == 1
+        for: 10m
+        labels:
+          service: mux
+          severity: warning
+        annotations:
+          summary: Mux V2 database capacity is saturated
+          description: Durable capacity usage is at or above the configured saturation threshold.
+
+      - alert: MuxV2DependencyDegraded
+        expr: mux_domain_alert_active{alert="DEPENDENCY_DEGRADED"} == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 settlement dependency is degraded
+          description: A configured rail, RPC, custody, or restore dependency is not ready.
+
+      - alert: MuxV2WebhookBacklog
+        expr: mux_domain_alert_active{alert="WEBHOOK_BACKLOG"} == 1
+        for: 10m
+        labels:
+          service: mux
+          severity: warning
+        annotations:
+          summary: Mux V2 webhook deliveries are backlogged
+          description: Durable webhook delivery work is waiting beyond the configured threshold.
+
+      - alert: MuxV2RestoreVerificationFailed
+        expr: mux_domain_alert_active{alert="RESTORE_VERIFICATION_FAILED"} == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 restore verification failed
+          description: Money workers must remain gated until restore verification and reconciliation are complete.
+
+      - alert: MuxV2RuntimeIdentityMismatch
+        expr: mux_domain_alert_active{alert="RUNTIME_IDENTITY_MISMATCH"} == 1
+        for: 5m
+        labels:
+          service: mux
+          severity: critical
+        annotations:
+          summary: Mux V2 runtime identity mismatch
+          description: The running financial runtime does not match the durable database identity.

@@ -1,0 +1,498 @@
+import { execFile } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+
+import { createDatabaseClient } from '@agent-payment/db'
+import {
+  createSolanaIncomingReader,
+  createSolanaRail,
+} from '@agent-payment/solana-rail'
+import { createSolanaRpc, type ClusterUrl } from '@solana/kit'
+
+import { buildApp } from './app.js'
+import {
+  ConfigurationError,
+  getRuntimeLimits,
+  loadConfig,
+  redactConfig,
+  type AppConfig,
+  type RuntimeLimits,
+} from './config.js'
+import { DurableCapacityController } from './capacity.js'
+import { IncomingReconciliationService } from './incoming.js'
+import { WebhookDeliveryWorker, type WebhookSigningKeyProvider } from './webhooks.js'
+import {
+  fingerprintWalletMasterKey,
+  validateLegacyWalletCustody,
+  WalletSecretCipher,
+} from './custody.js'
+import { createDomainHealthSnapshot, MetricsRegistry } from './observability.js'
+import { MaintenanceSchedule } from './maintenance-schedule.js'
+import type { V2OutgoingWorker } from './outgoing-v2.js'
+import { createV2OutgoingWorker } from './v2-outgoing-runtime.js'
+import { waitForShutdown } from './lifecycle.js'
+import { buildRuntimeIdentity } from './runtime-identity.js'
+import { createRuntimeOwner } from './runtime-owner.js'
+import { buildBackupChildEnvironment } from './worker-environment.js'
+
+const execFileAsync = promisify(execFile)
+
+interface RuntimeWorker {
+  runOnce(): Promise<void>
+  stop(): void
+  drain(): Promise<void>
+}
+
+class EnvironmentWebhookSigningKeyProvider implements WebhookSigningKeyProvider {
+  private readonly keys: ReadonlyMap<string, Uint8Array>
+
+  public constructor(serialized: string | undefined) {
+    if (serialized === undefined) {
+      throw new ConfigurationError(
+        'WEBHOOK_SIGNING_KEYS_JSON is required for the webhook runtime role',
+      )
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(serialized) as unknown
+    } catch {
+      throw new ConfigurationError('WEBHOOK_SIGNING_KEYS_JSON must be valid JSON')
+    }
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      Object.values(parsed).some((value) => typeof value !== 'string')
+    ) {
+      throw new ConfigurationError(
+        'WEBHOOK_SIGNING_KEYS_JSON must map key references to base64 strings',
+      )
+    }
+    const entries = Object.entries(parsed).map(([reference, value]) => {
+      const bytes = Buffer.from(value, 'base64')
+      if (
+        reference.length === 0 ||
+        bytes.length < 16 ||
+        bytes.toString('base64') !== value
+      ) {
+        throw new ConfigurationError(
+          'WEBHOOK_SIGNING_KEYS_JSON contains an invalid signing key',
+        )
+      }
+      return [reference, new Uint8Array(bytes)] as const
+    })
+    this.keys = new Map(entries)
+  }
+
+  public async getKey(reference: string, version: number): Promise<Uint8Array> {
+    const key = this.keys.get(`${reference}:${version}`)
+    if (key === undefined) throw new Error('Webhook signing key is unavailable')
+    return new Uint8Array(key)
+  }
+}
+
+class MaintenanceWorker implements RuntimeWorker {
+  private stopped = false
+  private currentRun: Promise<void> | undefined
+  private readonly schedule: MaintenanceSchedule
+  private readonly recipient: string
+
+  public constructor(
+    private readonly outputDirectory: string,
+    private readonly databaseUrl: string,
+    recipient: string | undefined,
+    private readonly identity: string | undefined,
+    private readonly verifyDatabaseUrl: string | undefined,
+    private readonly runtimeAuthorityId: string | undefined,
+    private readonly custodyIdentity: string | undefined,
+    backupIntervalSeconds: number,
+  ) {
+    this.schedule = new MaintenanceSchedule(backupIntervalSeconds * 1_000)
+    if (recipient === undefined) {
+      throw new ConfigurationError(
+        'BACKUP_AGE_RECIPIENT is required for the maintenance runtime role',
+      )
+    }
+    this.recipient = recipient
+    if ((identity === undefined) !== (verifyDatabaseUrl === undefined)) {
+      throw new ConfigurationError(
+        'Backup verification identity and database URL must be configured together',
+      )
+    }
+  }
+
+  public runOnce(): Promise<void> {
+    if (this.stopped) return Promise.resolve()
+    if (this.currentRun !== undefined) return this.currentRun
+    if (!this.schedule.claim()) return Promise.resolve()
+    const run = this.createAndVerifyBackup()
+    let tracked: Promise<void>
+    tracked = run.finally(() => {
+      if (this.currentRun === tracked) this.currentRun = undefined
+    })
+    this.currentRun = tracked
+    return tracked
+  }
+
+  public stop(): void {
+    this.stopped = true
+  }
+
+  public async drain(): Promise<void> {
+    await this.currentRun
+  }
+
+  private async createAndVerifyBackup(): Promise<void> {
+    mkdirSync(this.outputDirectory, { recursive: true, mode: 0o700 })
+    const timestamp = new Date().toISOString().replaceAll(/[:.]/gu, '-')
+    const output = path.join(this.outputDirectory, `mux-${timestamp}.dump.age`)
+    const script = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../scripts/backup-verify.mjs',
+    )
+    const environment = buildBackupChildEnvironment({
+      databaseUrl: this.databaseUrl,
+      recipient: this.recipient,
+      ...(this.identity === undefined ? {} : { identity: this.identity }),
+      ...(this.verifyDatabaseUrl === undefined
+        ? {}
+        : { verifyDatabaseUrl: this.verifyDatabaseUrl }),
+      ...(this.runtimeAuthorityId === undefined
+        ? {}
+        : { runtimeAuthorityId: this.runtimeAuthorityId }),
+      ...(this.custodyIdentity === undefined
+        ? {}
+        : { custodyIdentity: this.custodyIdentity }),
+    })
+    await execFileAsync(process.execPath, [script, 'backup', output], {
+      env: environment,
+    })
+    if (this.identity !== undefined && this.verifyDatabaseUrl !== undefined) {
+      await execFileAsync(process.execPath, [script, 'verify', output], {
+        env: environment,
+      })
+    }
+  }
+}
+
+async function startWorker(): Promise<void> {
+  const config = loadConfig()
+  if (config.runtimeRole === 'api' || config.runtimeRole === 'all') {
+    throw new ConfigurationError(
+      `RUNTIME_ROLE=${config.runtimeRole} must use src/server.ts, not src/worker.ts`,
+    )
+  }
+
+  const database = createDatabaseClient(config.databaseUrl)
+  const limits = getRuntimeLimits(config)
+  const metrics = new MetricsRegistry()
+  const capacity = new DurableCapacityController(database.v2Admin, limits)
+  const rail = createSolanaRail({
+    rpcUrl: config.solanaRpcUrl,
+    expectedCluster: config.solanaCluster,
+    allowMainnet: config.allowMainnet,
+    settlementMint: config.solanaSettlementMint,
+  })
+  const walletMasterKey =
+    config.runtimeRole === 'outgoing'
+      ? requireWalletMasterKey(config.walletMasterKey)
+      : undefined
+  const walletCipher =
+    walletMasterKey === undefined ? undefined : new WalletSecretCipher(walletMasterKey)
+  const runtimeIdentity = await buildRuntimeIdentity({
+    database,
+    config,
+    ...(walletMasterKey === undefined
+      ? {}
+      : { custodyKeyFingerprint: fingerprintWalletMasterKey(walletMasterKey) }),
+  })
+  if (walletMasterKey !== undefined) {
+    await database.initializeRuntimeIdentity(runtimeIdentity, (custody) =>
+      validateLegacyWalletCustody(walletCipher!, custody),
+    )
+  } else {
+    await database.checkRuntimeIdentity(runtimeIdentity)
+  }
+  if (config.runtimeAuthorityId !== undefined) {
+    await database.initializeRuntimeAuthority(config.runtimeAuthorityId)
+  }
+
+  const v2OutgoingRuntime =
+    config.runtimeRole === 'outgoing' || config.runtimeRole === 'reconcile'
+      ? createV2OutgoingWorker({
+          config,
+          database,
+          ...(walletCipher === undefined ? {} : { walletCipher }),
+          metrics,
+        })
+      : undefined
+
+  const incomingReader =
+    config.runtimeRole === 'incoming'
+      ? createSolanaIncomingReader({
+          rpc: createSolanaRpc(config.solanaRpcUrl as ClusterUrl),
+          readRail: rail,
+          rpcUrl: config.solanaRpcUrl,
+          expectedCluster: config.solanaCluster,
+          allowMainnet: config.allowMainnet,
+          settlementMint: config.solanaSettlementMint,
+        })
+      : undefined
+
+  let lastWorkerError: string | undefined
+  const app = buildApp({
+    config,
+    readinessDependency: {
+      checkReadiness: async () => {
+        await database.checkReadiness()
+        await rail.checkReadiness?.()
+        await v2OutgoingRuntime?.checkReadiness()
+      },
+    },
+    domainHealthDependency: {
+      checkDomainHealth: async () => {
+        const health = await database.v2Operations.getDomainHealth?.({
+          databaseCapacityPerWindow: limits.databaseCapacityPerWindow,
+          capacityWindowSeconds: limits.capacityWindowSeconds,
+          ...(runtimeIdentity === undefined
+            ? {}
+            : { expectedRuntimeIdentity: JSON.stringify(runtimeIdentity) }),
+        })
+        let dependencyDegraded = false
+        try {
+          await rail.checkReadiness?.()
+          await v2OutgoingRuntime?.checkReadiness()
+        } catch {
+          dependencyDegraded = true
+        }
+        if (health === undefined) {
+          return {
+            status:
+              lastWorkerError === undefined && !dependencyDegraded ? 'ok' : 'degraded',
+            checks: {
+              worker: lastWorkerError === undefined ? 'ok' : 'degraded',
+              dependency: dependencyDegraded ? 'degraded' : 'ok',
+            },
+          }
+        }
+        return createDomainHealthSnapshot({
+          health,
+          dependencyDegraded,
+          thresholds: limits.domainAlertThresholds,
+          ...(lastWorkerError === undefined ? {} : { workerError: lastWorkerError }),
+        })
+      },
+    },
+    metrics,
+  })
+  v2OutgoingRuntime?.worker.setLogger({
+    info: (data, message) => app.log.info(data, message),
+    error: (data, message) => app.log.error(data, message),
+  })
+  const worker: RuntimeWorker = createWorker({
+    role: config.runtimeRole,
+    databaseUrl: config.databaseUrl,
+    database,
+    ...(incomingReader === undefined ? {} : { incomingReader }),
+    ...(v2OutgoingRuntime === undefined
+      ? {}
+      : { v2OutgoingWorker: v2OutgoingRuntime.worker }),
+    ...(config.runtimeRole === 'webhook'
+      ? {
+          webhookSigningKeys: new EnvironmentWebhookSigningKeyProvider(
+            config.webhookSigningKeysJson,
+          ),
+        }
+      : {}),
+    ...(config.runtimeRole === 'maintenance'
+      ? {
+          ...(config.backupOutputDirectory === undefined
+            ? {}
+            : { backupOutputDirectory: config.backupOutputDirectory }),
+          ...(config.backupAgeRecipient === undefined
+            ? {}
+            : { backupAgeRecipient: config.backupAgeRecipient }),
+          ...(config.backupAgeIdentity === undefined
+            ? {}
+            : { backupAgeIdentity: config.backupAgeIdentity }),
+          ...(config.backupVerifyDatabaseUrl === undefined
+            ? {}
+            : { backupVerifyDatabaseUrl: config.backupVerifyDatabaseUrl }),
+          ...(config.backupIntervalSeconds === undefined
+            ? {}
+            : { backupIntervalSeconds: config.backupIntervalSeconds }),
+          ...(config.runtimeAuthorityId === undefined
+            ? {}
+            : { runtimeAuthorityId: config.runtimeAuthorityId }),
+          ...(config.custodyBackendIdentity === undefined
+            ? {}
+            : { custodyIdentity: config.custodyBackendIdentity }),
+        }
+      : {}),
+    limits,
+    capacity,
+    logger: {
+      info: (data, message) => app.log.info(data, message),
+      error: (data, message) => app.log.error(data, message),
+    },
+  })
+  const runWorker = (): void => {
+    void worker.runOnce().catch((error: unknown) => {
+      lastWorkerError = error instanceof Error ? error.name : 'UNKNOWN'
+      app.log.error({ errorCode: lastWorkerError }, 'Worker run failed')
+    })
+  }
+  let timer: NodeJS.Timeout | undefined
+  app.addHook('onClose', async () => {
+    if (timer !== undefined) clearInterval(timer)
+    worker.stop()
+    try {
+      await waitForShutdown(worker.drain(), limits.shutdownTimeoutMs, () =>
+        app.log.warn(
+          { shutdownTimeoutMs: limits.shutdownTimeoutMs },
+          'Worker shutdown deadline reached; durable leases will be reclaimed',
+        ),
+      )
+    } finally {
+      await database.disconnect()
+    }
+  })
+
+  let shutdownPromise: Promise<void> | undefined
+  const shutdown = (signal: string): Promise<void> => {
+    if (shutdownPromise !== undefined) return shutdownPromise
+    shutdownPromise = app
+      .close()
+      .then(() => app.log.info({ signal }, 'Worker shutdown complete'))
+      .catch((error: unknown) => {
+        app.log.error(
+          { signal, errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
+          'Worker shutdown failed',
+        )
+        process.exitCode = 1
+      })
+    return shutdownPromise
+  }
+  process.once('SIGTERM', () => void shutdown('SIGTERM'))
+  process.once('SIGINT', () => void shutdown('SIGINT'))
+
+  try {
+    await database.checkReadiness()
+    await rail.checkReadiness?.()
+    await v2OutgoingRuntime?.checkReadiness()
+    await app.listen({ host: '0.0.0.0', port: config.port })
+    runWorker()
+    const intervalMs = getWorkerIntervalMs(config, limits.workerIntervalMs)
+    timer = setInterval(runWorker, intervalMs)
+    app.log.info(
+      { config: redactConfig(config), role: config.runtimeRole },
+      'Worker started',
+    )
+  } catch (error) {
+    app.log.error(
+      { errorCode: error instanceof Error ? error.name : 'UNKNOWN' },
+      'Worker failed to start',
+    )
+    await app.close()
+    throw error
+  }
+}
+
+function getWorkerIntervalMs(config: AppConfig, defaultIntervalMs: number): number {
+  if (config.runtimeRole !== 'maintenance') return defaultIntervalMs
+  if (config.backupIntervalSeconds === undefined) {
+    throw new ConfigurationError(
+      'BACKUP_INTERVAL_SECONDS is required for the maintenance runtime role',
+    )
+  }
+  return config.backupIntervalSeconds * 1_000
+}
+
+function createWorker(input: {
+  readonly role: 'outgoing' | 'reconcile' | 'incoming' | 'webhook' | 'maintenance'
+  readonly databaseUrl: string
+  readonly database: ReturnType<typeof createDatabaseClient>
+  readonly incomingReader?: ReturnType<typeof createSolanaIncomingReader>
+  readonly v2OutgoingWorker?: V2OutgoingWorker
+  readonly webhookSigningKeys?: WebhookSigningKeyProvider
+  readonly backupOutputDirectory?: string
+  readonly backupAgeRecipient?: string
+  readonly backupAgeIdentity?: string
+  readonly backupVerifyDatabaseUrl?: string
+  readonly backupIntervalSeconds?: number
+  readonly runtimeAuthorityId?: string
+  readonly custodyIdentity?: string
+  readonly limits: RuntimeLimits
+  readonly capacity: DurableCapacityController
+  readonly logger: {
+    info(data: Readonly<Record<string, unknown>>, message: string): void
+    error(data: Readonly<Record<string, unknown>>, message: string): void
+  }
+}): RuntimeWorker {
+  if (input.role === 'incoming') {
+    if (input.incomingReader === undefined) {
+      throw new ConfigurationError('Incoming worker reader is unavailable')
+    }
+    return new IncomingReconciliationService(
+      input.database,
+      input.incomingReader,
+      input.logger,
+      {
+        accountConcurrency: input.limits.incomingAccountConcurrency,
+        owner: createRuntimeOwner('incoming'),
+        capacity: input.capacity,
+      },
+    )
+  }
+  if (input.role === 'outgoing' || input.role === 'reconcile') {
+    if (input.v2OutgoingWorker === undefined) {
+      throw new ConfigurationError('V2 outgoing worker is unavailable')
+    }
+    return input.v2OutgoingWorker
+  }
+  if (input.role === 'webhook') {
+    if (input.webhookSigningKeys === undefined) {
+      throw new ConfigurationError('Webhook signing key provider is unavailable')
+    }
+    return new WebhookDeliveryWorker({
+      repository: input.database.v2Operations,
+      signingKeys: input.webhookSigningKeys,
+      owner: createRuntimeOwner('webhook'),
+      batchSize: input.limits.webhookBatchSize,
+      leaseSeconds: input.limits.webhookLeaseSeconds,
+      maxAttempts: input.limits.webhookMaxAttempts,
+      timeoutMs: input.limits.webhookTimeoutMs,
+      capacity: input.capacity,
+      logger: input.logger,
+    })
+  }
+  if (input.backupOutputDirectory === undefined) {
+    throw new ConfigurationError('Backup output directory is unavailable')
+  }
+  if (input.backupIntervalSeconds === undefined) {
+    throw new ConfigurationError('Backup interval is unavailable')
+  }
+  return new MaintenanceWorker(
+    input.backupOutputDirectory,
+    input.databaseUrl,
+    input.backupAgeRecipient,
+    input.backupAgeIdentity,
+    input.backupVerifyDatabaseUrl,
+    input.runtimeAuthorityId,
+    input.custodyIdentity,
+    input.backupIntervalSeconds,
+  )
+}
+
+await startWorker()
+
+function requireWalletMasterKey(value: string | undefined): string {
+  if (value === undefined) {
+    throw new ConfigurationError(
+      'WALLET_MASTER_KEY is required for the outgoing runtime',
+    )
+  }
+  return value
+}

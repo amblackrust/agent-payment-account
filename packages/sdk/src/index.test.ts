@@ -7,6 +7,7 @@ import {
   ExternalServiceError,
   InsufficientFundsError,
   PaymentPendingError,
+  PolicyDeniedError,
   RecipientError,
   RefundNotSupportedError,
   UnsupportedRailError,
@@ -93,8 +94,8 @@ async function fastifyFetch(
         ? input.toString()
         : input.url
   const response = await app.inject({
-    method: (init?.method ?? 'GET') as 'GET' | 'POST',
-    url: new URL(inputUrl).pathname,
+    method: (init?.method ?? 'GET') as 'GET' | 'POST' | 'PATCH',
+    url: `${new URL(inputUrl).pathname}${new URL(inputUrl).search}`,
     headers: Object.fromEntries(headers.entries()),
     ...(init?.body === undefined ? {} : { payload: JSON.parse(String(init.body)) }),
   })
@@ -152,7 +153,268 @@ async function createLocalApi() {
   return { app, requests }
 }
 
+const v2Account = {
+  id: 'acct_test',
+  name: 'Test account',
+  status: 'ACTIVE',
+  solana_public_key: 'owner-address',
+  workspace_id: null,
+  runtime_version: 'v2',
+  provisioning_failure_code: null,
+  disabled_at: null,
+  disabled_reason: null,
+  row_version: 1,
+  created_at: '2026-09-06T00:00:00.000Z',
+  updated_at: '2026-09-06T00:00:00.000Z',
+}
+
+const v2Recipient = {
+  id: 'rcpt_test',
+  display_name: 'Test recipient',
+  type: 'SOLANA_SPL',
+  managed_account_id: null,
+  destinations: [
+    {
+      id: 'dest_test',
+      rail: 'SOLANA_SPL',
+      type: 'SOLANA_SPL',
+      wallet_address: 'recipient-address',
+      network: null,
+      asset_reference: null,
+      status: 'ACTIVE',
+      version: 1,
+    },
+  ],
+  created_at: '2026-09-06T00:00:00.000Z',
+  updated_at: '2026-09-06T00:00:00.000Z',
+}
+
+const v2Receive = {
+  id: 'recv_v2_test',
+  account_id: 'acct_test',
+  amount: '1.250',
+  denomination_id: 'usd',
+  currency: 'USD',
+  reference: 'receive-v2-reference',
+  status: 'OPEN',
+  created_at: '2026-09-06T00:00:00.000Z',
+  expires_at: null,
+  paid_at: null,
+  destination: {
+    type: 'external_transfer_target',
+    reference: 'token-account',
+  },
+  settlement: {
+    owner: 'owner-address',
+    token_account: 'token-account',
+    mint: 'mint-address',
+  },
+}
+
+const v2Balance = {
+  account_id: 'acct_test',
+  denomination_id: 'usd',
+  settled: '10.00',
+  reserved: '1.20',
+  spendable: '8.80',
+  observed_at: '2026-09-06T00:00:00.000Z',
+  degraded: false,
+}
+
+const v2Payment = {
+  id: 'pay_v2_test',
+  kind: 'PAY',
+  recipient_id: 'rcpt_test',
+  description: null,
+  external_reference: null,
+  metadata: {},
+  amount: '1.250',
+  denomination_id: 'usd',
+  denomination_symbol: 'USD',
+  status: 'ROUTING',
+  policy_decision: 'ALLOW',
+  policy_reason_codes: [],
+  approval_state: 'NOT_REQUIRED',
+  attempt_count: 1,
+  reservation_status: 'HELD',
+  route_id: 'route_solana',
+  route_selection_reason: 'configured_default',
+  settlement_asset_id: 'asset_usdc',
+  execution_state: 'QUEUED',
+  settlement_state: 'NOT_SUBMITTED',
+  outcome_state: 'NONE',
+  created_at: '2026-09-06T00:00:00.000Z',
+  updated_at: '2026-09-06T00:00:00.000Z',
+  confirmed_at: null,
+  failure_code: null,
+  failure_message: null,
+  original_payment_id: null,
+}
+
+async function createLocalV2Api(balance = v2Balance) {
+  const app = Fastify()
+  app.get('/v2/accounts/:accountId', async () => v2Account)
+  app.get('/v2/balance', async () => balance)
+  app.post('/v2/payments', async (request) => ({
+    ...v2Payment,
+    metadata:
+      (request.body as { metadata?: Readonly<Record<string, unknown>> }).metadata ?? {},
+  }))
+  app.post('/v2/recipients', async () => v2Recipient)
+  app.get('/v2/recipients', async () => ({
+    recipients: [v2Recipient],
+    next_cursor: null,
+  }))
+  app.get('/v2/recipients/:recipientId', async () => v2Recipient)
+  app.patch('/v2/recipients/:recipientId', async () => v2Recipient)
+  app.post('/v2/recipients/:recipientId/archive', async () => ({ status: 'ARCHIVED' }))
+  app.post('/v2/receive-requests', async () => v2Receive)
+  app.get('/v2/receive-requests/:receiveId', async () => v2Receive)
+  app.get('/v2/receive-requests', async () => ({
+    receive_requests: [v2Receive],
+    next_cursor: null,
+  }))
+  app.post('/v2/receive-requests/:receiveId/cancel', async () => ({
+    ...v2Receive,
+    status: 'CANCELLED',
+  }))
+  return app
+}
+
 describe('AgentPaymentAccount SDK', () => {
+  it('keeps V2 account, recipient, and receive contracts in parity with HTTP', async () => {
+    const app = await createLocalV2Api()
+    const account = new AgentPaymentAccount({
+      baseUrl: 'http://localhost:3000/',
+      apiKey: 'agent-secret',
+      fetch: fastifyFetch.bind(undefined, app),
+    })
+
+    try {
+      await expect(account.getAccount('acct_test')).resolves.toMatchObject({
+        id: 'acct_test',
+        name: 'Test account',
+        rowVersion: 1,
+      })
+      await expect(account.getBalanceV2('usd')).resolves.toMatchObject({
+        accountId: 'acct_test',
+        settled: '10.00',
+        spendable: '8.80',
+      })
+      await expect(
+        account.createPaymentV2(
+          {
+            recipientId: 'rcpt_test',
+            amount: '1.250',
+            denominationId: 'usd',
+            metadata: { source: 'sdk', attempt: 1 },
+          },
+          { idempotencyKey: 'payment-v2-key' },
+        ),
+      ).resolves.toMatchObject({
+        id: 'pay_v2_test',
+        metadata: { source: 'sdk', attempt: 1 },
+      })
+      await expect(
+        account.createRecipientV2({
+          displayName: 'Test recipient',
+          type: 'SOLANA_SPL',
+          destination: { type: 'SOLANA_SPL', walletAddress: 'recipient-address' },
+        }),
+      ).resolves.toMatchObject({
+        id: 'rcpt_test',
+        destinations: [{ walletAddress: 'recipient-address' }],
+      })
+      await expect(account.listRecipientsV2Page({ limit: 1 })).resolves.toMatchObject({
+        recipients: [{ id: 'rcpt_test' }],
+        nextCursor: null,
+      })
+      await expect(account.getRecipientV2('rcpt_test')).resolves.toMatchObject({
+        displayName: 'Test recipient',
+      })
+      await expect(
+        account.updateRecipientV2('rcpt_test', {
+          rowVersion: 1,
+          displayName: 'Renamed',
+        }),
+      ).resolves.toMatchObject({ id: 'rcpt_test' })
+      await expect(account.archiveRecipientV2('rcpt_test', 2)).resolves.toBeUndefined()
+      await expect(
+        account.createReceiveV2(
+          { denominationId: 'usd', amount: '1.250' },
+          { idempotencyKey: 'receive-v2-key' },
+        ),
+      ).resolves.toMatchObject({ denominationId: 'usd', amount: '1.250' })
+      await expect(account.getReceiveV2('recv_v2_test')).resolves.toMatchObject({
+        id: 'recv_v2_test',
+      })
+      await expect(account.listReceiveV2Page({ limit: 1 })).resolves.toMatchObject({
+        receiveRequests: [{ id: 'recv_v2_test' }],
+        nextCursor: null,
+      })
+      await expect(account.cancelReceiveV2('recv_v2_test')).resolves.toMatchObject({
+        status: 'CANCELLED',
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('rejects V2 balance responses outside the canonical exact-money contract', async () => {
+    const app = await createLocalV2Api({ ...v2Balance, settled: '1e-2' })
+    const account = new AgentPaymentAccount({
+      baseUrl: 'http://localhost:3000/',
+      apiKey: 'agent-secret',
+      fetch: fastifyFetch.bind(undefined, app),
+    })
+
+    try {
+      await expect(account.getBalanceV2('usd')).rejects.toThrow(
+        'API returned an invalid V2 balance response',
+      )
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('preserves policy-denial recovery fields from the V2 error envelope', async () => {
+    const account = new AgentPaymentAccount({
+      baseUrl: 'https://payments.example.test',
+      apiKey: 'agent-secret',
+      fetch: async () =>
+        jsonResponse(
+          {
+            code: 'POLICY_DENIED',
+            message: 'Payment was denied by policy',
+            request_id: 'req_policy_denied',
+            payment_id: 'pay_policy_denied',
+            payment_status: 'REJECTED_BY_POLICY',
+            reason_codes: ['PER_PAYMENT_LIMIT'],
+          },
+          403,
+        ),
+    })
+
+    const error = await account
+      .createPaymentV2(
+        {
+          recipientId: 'rcpt_test',
+          amount: '1.20',
+          denominationId: 'usd',
+        },
+        'policy-denied-key',
+      )
+      .catch((value: unknown) => value)
+
+    expect(error).toBeInstanceOf(PolicyDeniedError)
+    expect(error).toMatchObject({
+      paymentId: 'pay_policy_denied',
+      paymentStatus: 'REJECTED_BY_POLICY',
+      reasonCodes: ['PER_PAYMENT_LIMIT'],
+      requestId: 'req_policy_denied',
+    })
+  })
+
   it('uses the local Fastify HTTP contract for the basic financial flow', async () => {
     const { app, requests } = await createLocalApi()
     const account = new AgentPaymentAccount({
@@ -287,6 +549,30 @@ describe('AgentPaymentAccount SDK', () => {
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',
         apiKey: 'key',
+        fetch: async () =>
+          jsonResponse(
+            {
+              code: 'IDEMPOTENCY_KEY_REUSED',
+              message: 'Idempotency key was already used for another request',
+            },
+            409,
+          ),
+      }).createPaymentV2(
+        {
+          recipientId: 'rcpt_test',
+          amount: '1.20',
+          denominationId: 'usd',
+        },
+        { idempotencyKey: 'reused-key' },
+      ),
+    ).rejects.toMatchObject({
+      code: 'IDEMPOTENCY_KEY_REUSED',
+      statusCode: 409,
+    })
+    await expect(
+      new AgentPaymentAccount({
+        baseUrl: 'https://payments.example.test',
+        apiKey: 'key',
         fetch: response('INTERNAL_ERROR', 500),
       }).getBalance(),
     ).rejects.toBeInstanceOf(ExternalServiceError)
@@ -395,16 +681,21 @@ describe('AgentPaymentAccount SDK', () => {
   })
 
   it('treats invalid money POST responses and unknown 5xx responses as pending', async () => {
+    let invalidJsonCalls = 0
     await expect(
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',
         apiKey: 'agent-secret',
-        fetch: async () => new Response('{not-json', { status: 201 }),
+        fetch: async () => {
+          invalidJsonCalls += 1
+          return new Response('{not-json', { status: 201 })
+        },
       }).send({ recipientId: 'rcpt_test', amount: '1.20' }, 'invalid-json-key'),
     ).rejects.toMatchObject({
       code: 'PAYMENT_PENDING',
       idempotencyKey: 'invalid-json-key',
     })
+    expect(invalidJsonCalls).toBe(1)
     await expect(
       new AgentPaymentAccount({
         baseUrl: 'https://payments.example.test',

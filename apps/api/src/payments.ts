@@ -50,6 +50,36 @@ export interface PaymentResult {
   readonly created: boolean
 }
 
+export interface PaymentServiceLike {
+  createPayment(
+    account: AuthenticatedAccount,
+    kind: PaymentKind,
+    input: PaymentRequest,
+    idempotencyKey: string,
+    requestId?: string,
+    correlationId?: string,
+  ): Promise<PaymentResult>
+  createRefund(
+    account: AuthenticatedAccount,
+    input: {
+      readonly originalPaymentId: string
+      readonly amount: string
+      readonly currency: string
+    },
+    idempotencyKey: string,
+    requestId?: string,
+    correlationId?: string,
+  ): Promise<PaymentResult>
+  getPayment(accountId: string, paymentId: string): Promise<PaymentRecord>
+  listPaymentsPage(
+    accountId: string,
+    input: { readonly limit?: number; readonly cursor?: string },
+  ): Promise<{
+    readonly payments: readonly PaymentRecord[]
+    readonly next_cursor: string | null
+  }>
+}
+
 export interface PaymentEventSink {
   info(data: Readonly<Record<string, unknown>>, message: string): void
 }
@@ -63,7 +93,7 @@ export type PayerSecretKeyProvider = (accountId: string) => Promise<Uint8Array>
 
 type PaymentStore = PaymentRepository & RecipientRepository & ReservationRepository
 
-export class PaymentService {
+export class PaymentService implements PaymentServiceLike {
   private eventSink: PaymentEventSink | undefined
 
   public constructor(

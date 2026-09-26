@@ -1,0 +1,621 @@
+import { createHash } from 'node:crypto'
+import { describe, expect, it } from 'vitest'
+import type { V2PaymentAttemptSnapshot } from '@agent-payment/db'
+import type { V2PaymentView } from '@agent-payment/db'
+import type { V2SigningRequestRecord } from '@agent-payment/db'
+import { WalletSecretCipher } from './custody.js'
+import { V2OutgoingWorker } from './outgoing-v2.js'
+
+function view(): V2PaymentView {
+  return {
+    payment: {
+      id: 'pay_1',
+      payerAccountId: 'acct_1',
+      recipientId: 'rcpt_1',
+      recipientManagedAccountId: null,
+      kind: 'PAY',
+      description: null,
+      externalReference: null,
+      amountAtomic: 100n,
+      amountScale: 2,
+      denominationId: 'denom_usd',
+      currency: 'USD',
+      status: 'ROUTING',
+      routeId: 'route_1',
+      routeSelectionReason: 'priority',
+      settlementAssetId: 'asset_1',
+      destinationSnapshotJson: JSON.stringify({
+        rail: 'SOLANA_SPL',
+        network: 'localnet',
+        asset_reference: 'asset_1',
+        wallet_address: 'destination_1',
+      }),
+      policyDecisionId: 'decision_1',
+      approvalId: null,
+      executionState: 'QUEUED',
+      settlementState: 'NOT_SUBMITTED',
+      outcomeState: 'NONE',
+      rowVersion: 1,
+      originalPaymentId: null,
+      confirmedAt: null,
+      failedAt: null,
+      failureCode: null,
+      failureMessageSafe: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+    },
+    policyDecision: 'ALLOW',
+    reasonCodes: [],
+    approvalState: 'NOT_REQUIRED',
+    reservationStatus: 'HELD',
+    attempts: [
+      {
+        id: 'attempt_1',
+        paymentId: 'pay_1',
+        attemptNumber: 1,
+        routeId: 'route_1',
+        status: 'CREATED',
+        outcome: 'NOT_STARTED',
+        preparedEffectHash: null,
+        signedPayloadHash: null,
+        expectedExternalId: null,
+        validityExpiresAt: null,
+        validitySlot: null,
+        rowVersion: 1,
+      },
+    ],
+  }
+}
+
+describe('V2 outgoing worker', () => {
+  it('terminalizes a provably pre-effect payment when account disable wins', async () => {
+    let claims = 0
+    let aborted = false
+    let completed = false
+    const repository = {
+      claimWorkItem: async () => {
+        if (claims++ > 0) return null
+        return {
+          id: 'work_1',
+          kind: 'OUTGOING_PAYMENT',
+          resourceType: 'PAYMENT',
+          resourceId: 'pay_1',
+          attemptCount: 1,
+          payloadJson: '{}',
+          accountId: 'acct_1',
+        }
+      },
+      findPaymentView: async () => view(),
+      abortPreEffectPayment: async () => {
+        aborted = true
+        return view()
+      },
+      completeWorkItem: async () => {
+        completed = true
+      },
+    }
+    let prepared = false
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'DISABLED' },
+      executor: {
+        prepare: async () => {
+          prepared = true
+          throw new Error('must not prepare')
+        },
+        sign: async () => {
+          throw new Error('must not sign')
+        },
+        submit: async () => ({ status: 'UNKNOWN' as const }),
+      },
+      owner: 'worker-1',
+    })
+
+    await worker.runOnce()
+
+    expect(prepared).toBe(false)
+    expect(aborted).toBe(true)
+    expect(completed).toBe(true)
+  })
+
+  it('claims replacement work and confirms it through the constrained signing boundary', async () => {
+    let claimIndex = 0
+    let signCount = 0
+    let completed = false
+    let finalized = false
+    let finalizedInput: Record<string, unknown> | undefined
+    const costEstimates: unknown[] = []
+    const reconciledCosts: unknown[] = []
+    const signedPayload = new Uint8Array([1, 2, 3])
+    const baseView = view()
+    let latestAttempt = baseView.attempts[0]
+    const signingRequest: V2SigningRequestRecord = {
+      id: 'signing_attempt_1',
+      paymentId: 'pay_1',
+      attemptId: 'attempt_1',
+      effectHash: 'a'.repeat(64),
+      routeId: 'route_1',
+      network: 'localnet',
+      assetReference: 'asset_1',
+      destination: 'destination_1',
+      amountAtomic: 100n,
+      feePayerIdentity: 'fee-payer-1',
+      keyVersion: 1,
+      status: 'PENDING',
+      serviceIdentity: 'worker-1',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      completedAt: null,
+    }
+    const repository = {
+      claimWorkItem: async () => {
+        const claim =
+          claimIndex++ === 0
+            ? {
+                id: 'work_replacement',
+                kind: 'OUTGOING_PAYMENT_ATTEMPT',
+                resourceType: 'PAYMENT_ATTEMPT',
+                resourceId: 'attempt_1',
+                attemptCount: 1,
+                payloadJson: JSON.stringify({
+                  payment_id: 'pay_1',
+                  attempt_id: 'attempt_1',
+                }),
+                accountId: 'acct_1',
+              }
+            : null
+        return claim
+      },
+      findPaymentView: async () => ({ ...baseView, attempts: [latestAttempt] }),
+      updateAttemptOutcome: async (input: {
+        preparedEffectHash?: string
+        preparedEffectJson?: string | null
+        signedPayloadHash?: string
+        expectedExternalId?: string
+        signedPayloadEncrypted?: string
+      }) => {
+        latestAttempt = {
+          ...latestAttempt,
+          ...(input.preparedEffectHash === undefined
+            ? {}
+            : { preparedEffectHash: input.preparedEffectHash }),
+          ...(input.preparedEffectJson === undefined
+            ? {}
+            : { preparedEffectJson: input.preparedEffectJson }),
+          ...(input.signedPayloadHash === undefined
+            ? {}
+            : { signedPayloadHash: input.signedPayloadHash }),
+          ...(input.expectedExternalId === undefined
+            ? {}
+            : { expectedExternalId: input.expectedExternalId }),
+          ...(input.signedPayloadEncrypted === undefined
+            ? {}
+            : { signedPayloadEncrypted: input.signedPayloadEncrypted }),
+        } as V2PaymentAttemptSnapshot
+        return latestAttempt
+      },
+      updatePaymentExecution: async () => baseView.payment,
+      finalizeV2Payment: async (input: Record<string, unknown>) => {
+        finalized = true
+        finalizedInput = input
+        return baseView
+      },
+      completeWorkItem: async () => {
+        completed = true
+      },
+    }
+    const cipher = new WalletSecretCipher(
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    )
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'ACTIVE' },
+      custody: {
+        findActiveCustodyKeyVersion: async () => ({
+          id: 'key_1',
+          accountId: 'acct_1',
+          keyVersion: 1,
+          backendIdentity: 'test',
+          keyReference: 'key-ref-1',
+          rootKeyFingerprint: 'b'.repeat(64),
+          status: 'ACTIVE',
+        }),
+        findSigningRequest: async () => null,
+        createSigningRequest: async () => signingRequest,
+        completeSigningRequest: async () => ({ ...signingRequest, status: 'SIGNED' }),
+      },
+      signedPayloadCipher: cipher,
+      executor: {
+        prepare: async () => ({
+          accountId: 'acct_1',
+          paymentId: 'pay_1',
+          attemptId: 'attempt_1',
+          effectHash: 'a'.repeat(64),
+          routeId: 'route_1',
+          network: 'localnet',
+          assetReference: 'asset_1',
+          destination: 'destination_1',
+          amountAtomic: 100n,
+          feePayerIdentity: 'fee-payer-1',
+          keyVersion: 1,
+          payloadHash: 'a'.repeat(64),
+          preparedPayload: '{}',
+          platformCostEstimate: { assetId: 'sol', amountAtomic: 5n },
+        }),
+        sign: async () => {
+          signCount += 1
+          return {
+            effectHash: 'a'.repeat(64),
+            keyVersion: 1,
+            signedPayload,
+            externalId: 'expected-external-1',
+          }
+        },
+        submit: async () => ({
+          status: 'CONFIRMED' as const,
+          externalId: 'external-1',
+          platformCostActual: { assetId: 'sol', amountAtomic: 4n },
+        }),
+      },
+      platformCosts: {
+        createPlatformCostEstimate: async (input) => {
+          costEstimates.push(input)
+          return {} as never
+        },
+        reconcilePlatformCost: async (input) => {
+          reconciledCosts.push(input)
+          return {} as never
+        },
+      },
+      owner: 'worker-1',
+    })
+
+    await worker.runOnce()
+
+    expect(signCount).toBe(1)
+    expect(finalized).toBe(true)
+    expect(finalizedInput?.expectedExternalId).toBe('expected-external-1')
+    expect(finalizedInput?.externalId).toBe('external-1')
+    expect(finalizedInput?.payloadHash).toBe(
+      createHash('sha256')
+        .update(new Uint8Array([1, 2, 3]))
+        .digest('hex'),
+    )
+    expect(finalizedInput?.metadataJson).toContain('prepared_payload_hash')
+    expect(costEstimates).toHaveLength(1)
+    expect(reconciledCosts).toHaveLength(1)
+    expect((reconciledCosts[0] as { actualAmount: bigint }).actualAmount).toBe(4n)
+    expect(signedPayload).toEqual(new Uint8Array([0, 0, 0]))
+    expect(completed).toBe(true)
+  })
+
+  it('does not sign after an account becomes disabled after preparation', async () => {
+    const preparedEffect = {
+      accountId: 'acct_1',
+      paymentId: 'pay_1',
+      attemptId: 'attempt_1',
+      effectHash: 'a'.repeat(64),
+      routeId: 'route_1',
+      network: 'localnet',
+      assetReference: 'asset_1',
+      destination: 'destination_1',
+      amountAtomic: '100',
+      feePayerIdentity: 'fee-payer-1',
+      keyVersion: 1,
+      payloadHash: 'a'.repeat(64),
+      preparedPayload: '{}',
+    }
+    const preparedView = {
+      ...view(),
+      attempts: [
+        {
+          ...view().attempts[0],
+          status: 'PREPARED',
+          preparedEffectHash: preparedEffect.effectHash,
+          preparedEffectJson: JSON.stringify(preparedEffect),
+        },
+      ],
+    }
+    let claims = 0
+    let statusCalls = 0
+    let aborted = false
+    let completed = false
+    let signed = false
+    const cipher = new WalletSecretCipher(
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    )
+    const signingRequest: V2SigningRequestRecord = {
+      id: 'signing_attempt_1',
+      paymentId: 'pay_1',
+      attemptId: 'attempt_1',
+      effectHash: preparedEffect.effectHash,
+      routeId: 'route_1',
+      network: 'localnet',
+      assetReference: 'asset_1',
+      destination: 'destination_1',
+      amountAtomic: 100n,
+      feePayerIdentity: 'fee-payer-1',
+      keyVersion: 1,
+      status: 'PENDING',
+      serviceIdentity: 'worker-1',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      completedAt: null,
+    }
+    const worker = new V2OutgoingWorker({
+      repository: {
+        claimWorkItem: async () =>
+          claims++ === 0
+            ? {
+                id: 'work_1',
+                kind: 'OUTGOING_PAYMENT_ATTEMPT',
+                resourceType: 'PAYMENT_ATTEMPT',
+                resourceId: 'attempt_1',
+                attemptCount: 1,
+                payloadJson: JSON.stringify({ payment_id: 'pay_1' }),
+                accountId: 'acct_1',
+              }
+            : null,
+        findPaymentView: async () => preparedView,
+        abortPreEffectPayment: async () => {
+          aborted = true
+          return preparedView
+        },
+        completeWorkItem: async () => {
+          completed = true
+        },
+      } as never,
+      accountStatusProvider: {
+        getStatus: async () => {
+          statusCalls += 1
+          return statusCalls === 1 ? 'ACTIVE' : 'DISABLED'
+        },
+      },
+      custody: {
+        findActiveCustodyKeyVersion: async () => ({
+          id: 'key_1',
+          accountId: 'acct_1',
+          keyVersion: 1,
+          backendIdentity: 'test',
+          keyReference: 'key-ref-1',
+          rootKeyFingerprint: 'b'.repeat(64),
+          status: 'ACTIVE',
+        }),
+        findSigningRequest: async () => signingRequest,
+        createSigningRequest: async () => signingRequest,
+        completeSigningRequest: async () => ({ ...signingRequest, status: 'SIGNED' }),
+      },
+      signedPayloadCipher: cipher,
+      executor: {
+        prepare: async () => {
+          throw new Error('durable prepared effect should be restored')
+        },
+        sign: async () => {
+          signed = true
+          throw new Error('must not sign a disabled account')
+        },
+        submit: async () => ({ status: 'UNKNOWN' as const }),
+      },
+      owner: 'worker-1',
+    })
+
+    await worker.runOnce()
+
+    expect(aborted).toBe(true)
+    expect(completed).toBe(true)
+    expect(signed).toBe(false)
+  })
+
+  it('keeps reconciliation work on the dedicated reconciliation role', async () => {
+    const claimedKinds: string[] = []
+    let retryInput: { nextKind?: string } | undefined
+    let claimCount = 0
+    const repository = {
+      claimWorkItem: async ({ kind }: { kind: string }) => {
+        claimedKinds.push(kind)
+        if (claimCount++ > 0) return null
+        return {
+          id: 'reconcile_work_1',
+          kind,
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: 'attempt_1',
+          attemptCount: 1,
+          payloadJson: JSON.stringify({ payment_id: 'pay_1', attempt_id: 'attempt_1' }),
+          accountId: 'acct_1',
+        }
+      },
+      findPaymentView: async () => view(),
+      retryWorkItem: async (input: { nextKind?: string }) => {
+        retryInput = input
+      },
+    }
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'ACTIVE' },
+      executor: {
+        prepare: async () => {
+          throw new Error('reconcile role must not prepare')
+        },
+        sign: async () => {
+          throw new Error('reconcile role must not sign')
+        },
+        submit: async () => ({ status: 'UNKNOWN' as const }),
+      },
+      mode: 'reconcile',
+      owner: 'reconcile-1',
+    })
+
+    await worker.runOnce()
+
+    expect(claimedKinds).toEqual([
+      'RECONCILE_PAYMENT_ATTEMPT',
+      'RECONCILE_PAYMENT_ATTEMPT',
+    ])
+    expect(retryInput?.nextKind).toBe('OUTGOING_PAYMENT_ATTEMPT')
+  })
+
+  it('keeps the reservation held while atomically creating a safe fallback attempt', async () => {
+    let claimCount = 0
+    let finalizedInput: Record<string, unknown> | undefined
+    const repository = {
+      claimWorkItem: async () => {
+        if (claimCount++ > 0) return null
+        return {
+          id: 'reconcile_work_1',
+          kind: 'RECONCILE_PAYMENT_ATTEMPT',
+          resourceType: 'PAYMENT_ATTEMPT',
+          resourceId: 'attempt_1',
+          attemptCount: 1,
+          payloadJson: JSON.stringify({ payment_id: 'pay_1', attempt_id: 'attempt_1' }),
+          accountId: 'acct_1',
+        }
+      },
+      findPaymentView: async () => ({
+        ...view(),
+        attempts: [
+          { ...view().attempts[0], outcome: 'UNKNOWN', status: 'RECONCILING' },
+        ],
+      }),
+      listActiveSettlementRoutes: async () => [
+        {
+          id: 'route_1',
+          rail: 'SOLANA_SPL',
+          railVersion: '1',
+          network: 'localnet',
+          settlementAssetId: 'asset_1',
+          economicMappingId: 'mapping_1',
+          status: 'ACTIVE' as const,
+          priority: 1,
+          configVersion: 'test',
+        },
+        {
+          id: 'route_2',
+          rail: 'SOLANA_SPL',
+          railVersion: '1',
+          network: 'fallbacknet',
+          settlementAssetId: 'asset_2',
+          economicMappingId: 'mapping_2',
+          status: 'ACTIVE' as const,
+          priority: 2,
+          configVersion: 'test',
+        },
+      ],
+      findSettlementAsset: async () => ({
+        id: 'asset_2',
+        rail: 'SOLANA_SPL',
+        network: 'fallbacknet',
+        assetReference: 'asset_2',
+        decimals: 6,
+        status: 'ACTIVE',
+        version: 1,
+      }),
+      findEconomicMapping: async () => ({
+        id: 'mapping_2',
+        denominationId: 'denom_usd',
+        settlementAssetId: 'asset_2',
+        numerator: 1n,
+        denominator: 1n,
+        status: 'ACTIVE',
+        version: 1,
+      }),
+      finalizeV2Payment: async (input: Record<string, unknown>) => {
+        finalizedInput = input
+        return view()
+      },
+      completeWorkItem: async () => undefined,
+    }
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'ACTIVE' },
+      executor: {
+        prepare: async () => {
+          throw new Error('reconciliation must not prepare')
+        },
+        sign: async () => {
+          throw new Error('reconciliation must not sign')
+        },
+        submit: async () => ({ status: 'UNKNOWN' as const }),
+        reconcile: async () => ({ status: 'PROVED_NO_EFFECT' as const }),
+      },
+      mode: 'reconcile',
+      owner: 'reconcile-1',
+    })
+
+    await worker.runOnce()
+
+    expect(finalizedInput?.reservation).toBe('NONE')
+    expect(finalizedInput?.paymentStatus).toBe('ROUTING')
+    expect(finalizedInput?.replacement).toMatchObject({
+      workItemId: expect.any(String),
+      route: { id: 'route_2' },
+    })
+  })
+
+  it('defers capacity denial without preparing or consuming execution budget', async () => {
+    let claimCount = 0
+    let prepared = 0
+    let signed = 0
+    let submitted = 0
+    let retried = 0
+    const deferred: unknown[] = []
+    const repository = {
+      claimWorkItem: async () => {
+        if (claimCount++ > 0) return null
+        return {
+          id: 'work_capacity_1',
+          kind: 'OUTGOING_PAYMENT',
+          resourceType: 'PAYMENT',
+          resourceId: 'pay_1',
+          attemptCount: 1,
+          payloadJson: '{}',
+          accountId: 'acct_1',
+        }
+      },
+      findPaymentView: async () => view(),
+      deferWorkItem: async (input: unknown) => {
+        deferred.push(input)
+      },
+      retryWorkItem: async () => {
+        retried += 1
+      },
+    }
+    const worker = new V2OutgoingWorker({
+      repository: repository as never,
+      accountStatusProvider: { getStatus: async () => 'ACTIVE' },
+      executor: {
+        prepare: async () => {
+          prepared += 1
+          throw new Error('capacity should defer before prepare')
+        },
+        sign: async () => {
+          signed += 1
+          throw new Error('capacity should defer before sign')
+        },
+        submit: async () => {
+          submitted += 1
+          return { status: 'CONFIRMED' as const }
+        },
+      },
+      capacity: {
+        acquire: async (dependency: string) => ({
+          allowed: dependency !== 'rail',
+          count: dependency === 'rail' ? 10 : 1,
+          retryAt: new Date('2026-09-18T00:01:00.000Z'),
+        }),
+      },
+      owner: 'worker-capacity',
+      custody: {} as never,
+      signedPayloadCipher: {} as never,
+    })
+
+    await worker.runOnce()
+
+    expect(prepared).toBe(0)
+    expect(signed).toBe(0)
+    expect(submitted).toBe(0)
+    expect(retried).toBe(0)
+    expect(deferred).toHaveLength(1)
+    expect(deferred[0]).toMatchObject({
+      id: 'work_capacity_1',
+      errorCode: 'CAPACITY_BACKPRESSURE',
+    })
+  })
+})

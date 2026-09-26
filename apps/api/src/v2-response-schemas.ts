@@ -1,0 +1,75 @@
+import {
+  v2AccountCreationResponseJsonSchema,
+  v2AccountResponseJsonSchema,
+  v2ApprovalListResponseJsonSchema,
+  v2ApprovalResponseJsonSchema,
+  v2ApprovedDestinationListResponseJsonSchema,
+  v2ApprovedDestinationResponseJsonSchema,
+  v2BalanceResponseJsonSchema,
+  v2CredentialIssuanceRequestJsonSchema,
+  v2CredentialIssuanceResponseJsonSchema,
+  v2CredentialListResponseJsonSchema,
+  v2ErrorEnvelopeJsonSchema,
+  v2ExceptionListResponseJsonSchema,
+  v2ExceptionResponseJsonSchema,
+  v2FundingDestinationResponseJsonSchema,
+  v2HistoryResponseJsonSchema,
+  v2LifecycleResponseJsonSchema,
+  v2PaymentCreateRequestJsonSchema,
+  v2PaymentListQueryJsonSchema,
+  v2PaymentListResponseJsonSchema,
+  v2PaymentResponseJsonSchema,
+  v2PolicyListResponseJsonSchema,
+  v2PolicyResponseJsonSchema,
+  v2ReceiveCreateRequestJsonSchema,
+  v2ReceiveListResponseJsonSchema,
+  v2ReceiveResponseJsonSchema,
+  v2RecipientListResponseJsonSchema,
+  v2RecipientResponseJsonSchema,
+  v2RotatedCredentialResponseJsonSchema,
+  v2StatusResponseJsonSchema,
+  v2TimelineResponseJsonSchema,
+  v2WebhookSubscriptionListResponseJsonSchema,
+  v2WebhookSubscriptionResponseJsonSchema,
+} from '@agent-payment/contracts'
+
+/**
+ * Fastify keeps this module as a local import boundary, while the actual
+ * V2 JSON Schema documents are generated from the shared contract package.
+ */
+export const v2AccountResponseSchema = v2AccountResponseJsonSchema
+export const v2AccountCreationResponseSchema = v2AccountCreationResponseJsonSchema
+export const v2LifecycleResponseSchema = v2LifecycleResponseJsonSchema
+export const v2CredentialListResponseSchema = v2CredentialListResponseJsonSchema
+export const v2CredentialIssuanceRequestSchema = v2CredentialIssuanceRequestJsonSchema
+export const v2CredentialIssuanceResponseSchema = v2CredentialIssuanceResponseJsonSchema
+export const v2ErrorResponseSchema = v2ErrorEnvelopeJsonSchema
+export const v2RotatedCredentialResponseSchema = v2RotatedCredentialResponseJsonSchema
+export const v2PolicyListResponseSchema = v2PolicyListResponseJsonSchema
+export const v2PolicyResponseSchema = v2PolicyResponseJsonSchema
+export const v2ApprovalListResponseSchema = v2ApprovalListResponseJsonSchema
+export const v2ApprovalResponseSchema = v2ApprovalResponseJsonSchema
+export const v2ApprovedDestinationListResponseSchema =
+  v2ApprovedDestinationListResponseJsonSchema
+export const v2ApprovedDestinationResponseSchema =
+  v2ApprovedDestinationResponseJsonSchema
+export const v2StatusResponseSchema = v2StatusResponseJsonSchema
+export const v2TimelineResponseSchema = v2TimelineResponseJsonSchema
+export const v2WebhookSubscriptionListResponseSchema =
+  v2WebhookSubscriptionListResponseJsonSchema
+export const v2WebhookSubscriptionResponseSchema =
+  v2WebhookSubscriptionResponseJsonSchema
+export const v2ExceptionListResponseSchema = v2ExceptionListResponseJsonSchema
+export const v2ExceptionResponseSchema = v2ExceptionResponseJsonSchema
+export const v2BalanceResponseSchema = v2BalanceResponseJsonSchema
+export const v2FundingDestinationResponseSchema = v2FundingDestinationResponseJsonSchema
+export const v2HistoryResponseSchema = v2HistoryResponseJsonSchema
+export const v2RecipientListResponseSchema = v2RecipientListResponseJsonSchema
+export const v2RecipientResponseSchema = v2RecipientResponseJsonSchema
+export const v2ReceiveListResponseSchema = v2ReceiveListResponseJsonSchema
+export const v2ReceiveResponseSchema = v2ReceiveResponseJsonSchema
+export const v2ReceiveCreateRequestSchema = v2ReceiveCreateRequestJsonSchema
+export const v2PaymentCreateRequestSchema = v2PaymentCreateRequestJsonSchema
+export const v2PaymentListQuerySchema = v2PaymentListQueryJsonSchema
+export const v2PaymentListResponseSchema = v2PaymentListResponseJsonSchema
+export const v2PaymentResponseSchema = v2PaymentResponseJsonSchema

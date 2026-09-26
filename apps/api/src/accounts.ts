@@ -1,13 +1,19 @@
+import { createHash } from 'node:crypto'
 import {
+  ConflictError,
+  DependencyUnavailableError,
   ValidationError,
+  DEFAULT_AGENT_CREDENTIAL_SCOPES,
   createAccountId,
   createCredentialId,
   createReceiveId,
 } from '@agent-payment/core'
 import type { AccountRepository, ReceiveRepository } from '@agent-payment/db'
+import type { V2AdminRepository } from '@agent-payment/db'
 import type { ReceiveDestination, SolanaRail } from '@agent-payment/solana-rail'
 import { generateApiCredential } from './auth.js'
-import type { WalletSecretCipher } from './custody.js'
+import { DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS } from './config.js'
+import type { RecoveryEnvelopeCipher, WalletSecretCipher } from './custody.js'
 import { generateManagedWallet } from '@agent-payment/solana-rail'
 
 export interface CreatedAccountResponse {
@@ -20,11 +26,22 @@ export interface CreatedAccountResponse {
   readonly destination: ReceiveDestination
 }
 
+export interface V2FundingProvisioner {
+  provision(input: {
+    readonly accountId: string
+    readonly owner: string
+  }): Promise<void>
+}
+
 export class AccountService {
   public constructor(
     private readonly repository: AccountRepository & ReceiveRepository,
     private readonly cipher: WalletSecretCipher,
     private readonly rail: SolanaRail,
+    private readonly v2Admin?: V2AdminRepository,
+    private readonly recoveryCipher?: RecoveryEnvelopeCipher,
+    private readonly v2FundingProvisioner?: V2FundingProvisioner,
+    private readonly credentialRecoveryTtlSeconds = DEFAULT_CREDENTIAL_RECOVERY_TTL_SECONDS,
   ) {}
 
   public async createAccount(name: string): Promise<CreatedAccountResponse> {
@@ -39,8 +56,10 @@ export class AccountService {
       const destination = await this.rail.getReceiveDestination(wallet.publicKey)
       const credential = generateApiCredential()
       const credentialId = createCredentialId()
+      const accountId = createAccountId()
+      const receiveId = createReceiveId()
       const account = await this.repository.createAgentAccount({
-        id: createAccountId(),
+        id: accountId,
         name: normalizedName,
         solanaPublicKey: wallet.publicKey,
         encryptedSolanaSecret: encryptedSecret.ciphertext,
@@ -49,12 +68,11 @@ export class AccountService {
         credentialId,
         keyHash: credential.keyHash,
         keyPrefix: credential.keyPrefix,
-      })
-      const receiveRequest = await this.repository.createReceiveRequest({
-        id: createReceiveId(),
-        accountId: account.id,
-        currency: 'USD',
-        reference: `account:${account.id}`,
+        initialReceiveRequest: {
+          id: receiveId,
+          currency: 'USD',
+          reference: `account:${accountId}`,
+        },
       })
 
       return {
@@ -63,7 +81,7 @@ export class AccountService {
         status: 'ACTIVE',
         apiKey: credential.rawKey,
         credentialId,
-        receiveId: receiveRequest.id,
+        receiveId,
         destination,
       }
     } finally {
@@ -81,8 +99,206 @@ export class AccountService {
       accountId,
       keyHash: credential.keyHash,
       keyPrefix: credential.keyPrefix,
+      scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
     })
     return { ...stored, apiKey: credential.rawKey }
+  }
+
+  public async createAccountV2(
+    name: string,
+    idempotencyKey: string,
+    now = new Date(),
+  ): Promise<CreatedAccountResponse> {
+    if (this.v2Admin === undefined || this.recoveryCipher === undefined) {
+      throw new Error('V2 account provisioning is unavailable')
+    }
+    const normalizedName = name.trim()
+    if (normalizedName.length === 0 || normalizedName.length > 120) {
+      throw new ValidationError('Account name must contain 1 to 120 characters')
+    }
+    const requestHash = hashProvisioningRequest(normalizedName)
+    const replay = await this.v2Admin.findProvisioningReplay({
+      idempotencyKey,
+      requestHash,
+    })
+    if (replay !== null) {
+      return this.recoverV2ProvisionedAccount(
+        replay.accountId,
+        replay.credentialId,
+        idempotencyKey,
+        now,
+      )
+    }
+
+    const wallet = await generateManagedWallet()
+    try {
+      const encryptedSecret = this.cipher.encrypt(wallet.secretKey)
+      const destination = await this.rail.getReceiveDestination(wallet.publicKey)
+      const credential = generateApiCredential()
+      const credentialId = createCredentialId()
+      const recovery = this.recoveryCipher.encrypt(
+        new TextEncoder().encode(credential.rawKey),
+      )
+      const accountId = createAccountId()
+      const receiveId = createReceiveId()
+      const stored = await this.v2Admin.provisionAccount({
+        idempotencyKey,
+        requestHash,
+        accountId,
+        name: normalizedName,
+        solanaPublicKey: wallet.publicKey,
+        encryptedSolanaSecret: encryptedSecret.ciphertext,
+        encryptionNonce: encryptedSecret.nonce,
+        encryptionAuthTag: encryptedSecret.authTag,
+        credentialId,
+        keyHash: credential.keyHash,
+        keyPrefix: credential.keyPrefix,
+        scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
+        recoveryCiphertext: recovery.ciphertext,
+        recoveryNonce: recovery.nonce,
+        recoveryAuthTag: recovery.authTag,
+        recoveryExpiresAt: new Date(
+          now.getTime() + this.credentialRecoveryTtlSeconds * 1000,
+        ),
+        receiveRequestId: receiveId,
+        receiveReference: `account:${accountId}`,
+      })
+      await this.finishV2Provisioning(stored.account.id, stored.account.solanaPublicKey)
+      if (!stored.created) {
+        return this.recoverV2ProvisionedAccount(
+          stored.account.id,
+          stored.credential.id,
+          idempotencyKey,
+          now,
+        )
+      }
+      return {
+        id: accountId,
+        name: normalizedName,
+        status: 'ACTIVE',
+        apiKey: credential.rawKey,
+        credentialId,
+        receiveId,
+        destination,
+      }
+    } finally {
+      wallet.secretKey.fill(0)
+    }
+  }
+
+  private async recoverV2ProvisionedAccount(
+    accountId: string,
+    credentialId: string,
+    idempotencyKey: string,
+    now: Date,
+  ): Promise<CreatedAccountResponse> {
+    if (this.v2Admin === undefined || this.recoveryCipher === undefined) {
+      throw new DependencyUnavailableError('V2 account provisioning is unavailable')
+    }
+    const existingAccount = await this.v2Admin.findAccount(accountId)
+    if (existingAccount === null) {
+      throw new Error('Provisioned account is unavailable')
+    }
+    await this.finishV2Provisioning(existingAccount.id, existingAccount.solanaPublicKey)
+    const envelope = await this.v2Admin.consumeRecoveryEnvelope(
+      accountId,
+      idempotencyKey,
+      now,
+    )
+    if (envelope === null) {
+      throw new ValidationError('Credential recovery window has expired')
+    }
+    const apiKey = decodeOneTimeSecret(this.recoveryCipher.decrypt(envelope))
+    const account = await this.v2Admin.findAccount(accountId)
+    if (account === null) throw new Error('Provisioned account is unavailable')
+    const requests = await this.repository.listReceiveRequests(account.id)
+    const receiveRequest = requests.find(
+      (request) => request.reference === `account:${account.id}`,
+    )
+    if (receiveRequest === undefined) {
+      throw new Error('Provisioned receive request is unavailable')
+    }
+    return {
+      id: account.id,
+      name: account.name,
+      status: 'ACTIVE',
+      apiKey,
+      credentialId,
+      receiveId: receiveRequest.id,
+      destination: await this.rail.getReceiveDestination(account.solanaPublicKey),
+    }
+  }
+
+  private async finishV2Provisioning(accountId: string, owner: string): Promise<void> {
+    if (this.v2Admin === undefined) {
+      throw new DependencyUnavailableError('V2 account provisioning is unavailable')
+    }
+    let account = await this.v2Admin.findAccount(accountId)
+    if (account === null) throw new Error('Provisioned account is unavailable')
+    if (account.status === 'ACTIVE') return
+    if (account.status === 'PROVISIONING_FAILED') {
+      await this.v2Admin.transitionAccount({
+        accountId,
+        currentStatus: account.status,
+        nextStatus: 'PROVISIONING',
+        rowVersion: account.rowVersion,
+        reason: 'PROVISIONING_RETRY',
+      })
+      account = await this.v2Admin.findAccount(accountId)
+      if (account === null) throw new Error('Provisioned account is unavailable')
+    }
+    if (account.status !== 'PROVISIONING') {
+      throw new ValidationError('Account is not in a resumable provisioning state')
+    }
+    try {
+      if (this.v2FundingProvisioner === undefined) {
+        throw new DependencyUnavailableError(
+          'Funding destination provisioning is unavailable',
+        )
+      }
+      await this.v2FundingProvisioner.provision({ accountId, owner })
+      const current = await this.v2Admin.findAccount(accountId)
+      if (current === null) throw new Error('Provisioned account is unavailable')
+      if (current.status === 'ACTIVE') return
+      if (current.status !== 'PROVISIONING') {
+        throw new ValidationError('Account is not in a resumable provisioning state')
+      }
+      await this.v2Admin.transitionAccount({
+        accountId,
+        currentStatus: 'PROVISIONING',
+        nextStatus: 'ACTIVE',
+        rowVersion: current.rowVersion,
+      })
+    } catch (error) {
+      const current = await this.v2Admin.findAccount(accountId)
+      if (current?.status === 'ACTIVE' && error instanceof ConflictError) {
+        return
+      }
+      if (current !== null && current.status === 'PROVISIONING') {
+        await this.v2Admin.transitionAccount({
+          accountId,
+          currentStatus: 'PROVISIONING',
+          nextStatus: 'PROVISIONING_FAILED',
+          rowVersion: current.rowVersion,
+          reason: error instanceof Error ? error.name : 'PROVISIONING_FAILED',
+        })
+      }
+      throw error
+    }
+  }
+}
+
+function hashProvisioningRequest(name: string): string {
+  return createHash('sha256').update(JSON.stringify({ name }), 'utf8').digest('hex')
+}
+
+function decodeOneTimeSecret(secret: Uint8Array): string {
+  try {
+    const value = new TextDecoder().decode(secret)
+    if (value.length === 0) throw new Error('empty secret')
+    return value
+  } finally {
+    secret.fill(0)
   }
 }
 

@@ -1,6 +1,8 @@
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import type { IncomingPaymentRepository, ReceiveRepository } from '@agent-payment/db'
 import type { IncomingTransfer, SolanaIncomingReader } from '@agent-payment/solana-rail'
+import type { CapacityResult } from './capacity.js'
+import { DEFAULT_RUNTIME_LIMITS } from './config.js'
 
 interface IndexedAccount {
   readonly accountId: string
@@ -9,16 +11,30 @@ interface IndexedAccount {
 
 type IncomingStore = IncomingPaymentRepository & ReceiveRepository
 const ISSUE_RETRY_BATCH_SIZE = 50
+const MAX_ISSUE_RETRIES = 8
+
+export interface IncomingReconciliationOptions {
+  readonly accountConcurrency?: number
+  readonly owner?: string
+  readonly leaseSeconds?: number
+  readonly capacity?: {
+    acquire(dependency: 'rpc', now?: Date): Promise<CapacityResult>
+  }
+}
 
 export class IncomingReconciliationService {
   private stopped = false
   private currentRun: Promise<void> | undefined
+  private readonly owner: string
 
   public constructor(
     private readonly repository: IncomingStore,
     private readonly reader: SolanaIncomingReader,
     private readonly logger: { error(data: object, message: string): void },
-  ) {}
+    private readonly options: IncomingReconciliationOptions = {},
+  ) {
+    this.owner = options.owner ?? `incoming-${process.pid}-${randomUUID()}`
+  }
 
   public runOnce(): Promise<void> {
     if (this.stopped) return Promise.resolve()
@@ -43,19 +59,66 @@ export class IncomingReconciliationService {
   private async reconcileAllAccounts(): Promise<void> {
     const accounts: readonly IndexedAccount[] =
       await this.repository.listActiveAccountSettlements()
-    for (const account of accounts) {
-      await this.reconcileAccount(account)
-    }
+    await this.reconcileAccountsWithConcurrency(accounts)
     await this.reconcilePendingIssues()
+    await this.repository.reconcileUnmatchedManagedIncoming?.(ISSUE_RETRY_BATCH_SIZE)
+  }
+
+  private async reconcileAccountsWithConcurrency(
+    accounts: readonly IndexedAccount[],
+  ): Promise<void> {
+    const requestedConcurrency =
+      this.options.accountConcurrency ??
+      DEFAULT_RUNTIME_LIMITS.incomingAccountConcurrency
+    const concurrency = Math.max(
+      1,
+      Math.min(requestedConcurrency, Math.max(accounts.length, 1)),
+    )
+    let nextIndex = 0
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (nextIndex < accounts.length) {
+          const account = accounts[nextIndex]
+          nextIndex += 1
+          if (account !== undefined) await this.reconcileAccount(account)
+        }
+      }),
+    )
   }
 
   private async reconcileAccount(account: IndexedAccount): Promise<void> {
-    const cursor = await this.repository.getIncomingCursor(
-      account.accountId,
-      'SOLANA_SPL',
-      account.solanaPublicKey,
+    const owner = this.owner
+    const leaseSeconds = this.options.leaseSeconds ?? 60
+    const partition = await this.repository.claimIncomingPartition?.({
+      accountId: account.accountId,
+      rail: 'SOLANA_SPL',
+      address: account.solanaPublicKey,
+      owner,
+      leaseSeconds,
+      now: new Date(),
+    })
+    if (this.repository.claimIncomingPartition !== undefined && partition === null) {
+      return
+    }
+    const lease: { expiresAt?: Date } = {}
+    if (partition?.leaseExpiresAt !== undefined && partition.leaseExpiresAt !== null) {
+      lease.expiresAt = partition.leaseExpiresAt
+    }
+    const cursor =
+      partition ??
+      (await this.repository.getIncomingCursor(
+        account.accountId,
+        'SOLANA_SPL',
+        account.solanaPublicKey,
+      ))
+    const heartbeat = this.startPartitionLeaseHeartbeat(
+      account,
+      owner,
+      leaseSeconds,
+      lease,
     )
     try {
+      if (!(await this.hasRpcCapacity(account.accountId))) return
       const scan =
         this.reader.scanWithCursor === undefined
           ? {
@@ -90,6 +153,14 @@ export class IncomingReconciliationService {
           rail: 'SOLANA_SPL',
           address: account.solanaPublicKey,
           cursorSignature: scan.nextCursor,
+          ...(this.repository.claimIncomingPartition === undefined
+            ? {}
+            : {
+                leaseOwner: owner,
+                ...(lease.expiresAt === undefined
+                  ? {}
+                  : { leaseExpiresAt: lease.expiresAt }),
+              }),
         })
       }
     } catch (error) {
@@ -100,7 +171,77 @@ export class IncomingReconciliationService {
         },
         'Incoming reconciliation failed',
       )
+    } finally {
+      heartbeat.stop()
+      await this.repository.releaseIncomingPartition?.({
+        accountId: account.accountId,
+        rail: 'SOLANA_SPL',
+        address: account.solanaPublicKey,
+        owner,
+        ...(lease.expiresAt === undefined ? {} : { leaseExpiresAt: lease.expiresAt }),
+      })
     }
+  }
+
+  private startPartitionLeaseHeartbeat(
+    account: IndexedAccount,
+    owner: string,
+    leaseSeconds: number,
+    lease: { expiresAt?: Date },
+  ): { stop(): void } {
+    const renew = this.repository.renewIncomingPartition
+    if (renew === undefined || this.repository.claimIncomingPartition === undefined) {
+      return { stop: () => undefined }
+    }
+    const timer = setInterval(
+      () => {
+        const now = new Date()
+        const expectedLeaseExpiresAt = lease.expiresAt
+        void renew({
+          accountId: account.accountId,
+          rail: 'SOLANA_SPL',
+          address: account.solanaPublicKey,
+          owner,
+          leaseSeconds,
+          now,
+          ...(expectedLeaseExpiresAt === undefined
+            ? {}
+            : { leaseExpiresAt: expectedLeaseExpiresAt }),
+        }).then(
+          () => {
+            lease.expiresAt = new Date(now.getTime() + leaseSeconds * 1_000)
+          },
+          (error: unknown) => {
+            this.logger.error(
+              {
+                accountId: account.accountId,
+                errorCode: error instanceof Error ? error.name : 'UNKNOWN',
+              },
+              'Incoming partition lease renewal failed',
+            )
+          },
+        )
+      },
+      Math.max(1_000, Math.floor((leaseSeconds * 1_000) / 3)),
+    )
+    return { stop: () => clearInterval(timer) }
+  }
+
+  private async hasRpcCapacity(accountId: string): Promise<boolean> {
+    return (await this.acquireRpcCapacity(accountId)).allowed
+  }
+
+  private async acquireRpcCapacity(accountId: string): Promise<CapacityResult> {
+    if (this.options.capacity === undefined) {
+      return { allowed: true, count: 0, retryAt: new Date() }
+    }
+    const result = await this.options.capacity.acquire('rpc', new Date())
+    if (result.allowed) return result
+    this.logger.error(
+      { accountId, errorCode: 'CAPACITY_BACKPRESSURE' },
+      'Incoming RPC capacity is temporarily exhausted',
+    )
+    return result
   }
 
   private async reconcilePendingIssues(): Promise<void> {
@@ -119,11 +260,36 @@ export class IncomingReconciliationService {
     const issues = await claimIssues(ISSUE_RETRY_BATCH_SIZE)
     for (const issue of issues) {
       try {
+        if (issue.retryCount > MAX_ISSUE_RETRIES) {
+          await this.repository.exhaustIncomingReconciliationIssue(
+            issue.id,
+            'INCOMING_ISSUE_RETRY_EXHAUSTED',
+          )
+          continue
+        }
+        const capacity = await this.acquireRpcCapacity(issue.accountId)
+        if (!capacity.allowed) {
+          await this.repository.deferIncomingReconciliationIssue({
+            issueId: issue.id,
+            retryAt: capacity.retryAt,
+            retryCount: issue.retryCount,
+            retryCountBeforeClaim: issue.retryCountBeforeClaim,
+            recoveryClaimed: issue.recoveryClaimed,
+          })
+          continue
+        }
         const inspection = await inspectSignature(
           issue.accountPublicKey,
           issue.signature,
         )
         if (inspection.kind === 'UNRESOLVED') {
+          if (issue.retryCount >= MAX_ISSUE_RETRIES) {
+            await this.repository.exhaustIncomingReconciliationIssue(
+              issue.id,
+              'INCOMING_ISSUE_RETRY_EXHAUSTED',
+            )
+            continue
+          }
           await updateReason(issue.id, inspection.reason)
           continue
         }
@@ -132,6 +298,24 @@ export class IncomingReconciliationService {
         }
         await resolveIssue(issue.id)
       } catch (error) {
+        if (issue.retryCount >= MAX_ISSUE_RETRIES) {
+          try {
+            await this.repository.exhaustIncomingReconciliationIssue(
+              issue.id,
+              'INCOMING_ISSUE_RETRY_EXHAUSTED',
+            )
+          } catch (exhaustionError) {
+            this.logger.error(
+              {
+                accountId: issue.accountId,
+                signature: issue.signature,
+                errorCode:
+                  exhaustionError instanceof Error ? exhaustionError.name : 'UNKNOWN',
+              },
+              'Incoming reconciliation issue exhaustion failed',
+            )
+          }
+        }
         this.logger.error(
           {
             accountId: issue.accountId,

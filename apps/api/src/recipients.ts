@@ -8,6 +8,7 @@ import type {
 } from '@agent-payment/db'
 
 const SOLANA_SPL_DESTINATION = 'SOLANA_SPL'
+const DEFAULT_MAX_PAGE_SIZE = 100
 
 export interface CreateRecipientRequest {
   readonly displayName: string
@@ -28,14 +29,23 @@ export interface UpdateRecipientRequest {
     readonly walletAddress: string
   }
   readonly managedAccountId?: string | null
+  readonly rowVersion?: number
 }
 
 export class RecipientService {
+  private readonly maxPageSize: number
+
   public constructor(
     private readonly repository: RecipientRepository & {
       readonly findAccountPublicKey: (accountId: string) => Promise<string | null>
     },
-  ) {}
+    options: { readonly maxPageSize?: number } = {},
+  ) {
+    this.maxPageSize = options.maxPageSize ?? DEFAULT_MAX_PAGE_SIZE
+    if (!Number.isInteger(this.maxPageSize) || this.maxPageSize < 1) {
+      throw new ValidationError('Maximum page size must be a positive integer')
+    }
+  }
 
   public async createRecipient(
     ownerAccountId: string,
@@ -160,6 +170,7 @@ export class RecipientService {
                 ? null
                 : validateText(input.managedAccountId, 'Managed account id', 64),
           }),
+      ...(input.rowVersion === undefined ? {} : { rowVersion: input.rowVersion }),
     }
     if (
       input.destination?.type !== undefined &&
@@ -214,8 +225,10 @@ export class RecipientService {
     input: { readonly limit?: number; readonly cursor?: string },
   ) {
     const limit = input.limit ?? 50
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-      throw new ValidationError('Recipient limit must be an integer from 1 to 100')
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.maxPageSize) {
+      throw new ValidationError(
+        `Recipient limit must be an integer from 1 to ${this.maxPageSize}`,
+      )
     }
     const cursor = decodeRecipientCursor(input.cursor)
     const records =
@@ -266,6 +279,10 @@ export function serializeRecipient(recipient: RecipientRecord) {
       rail: destination.rail,
       type: destination.type,
       wallet_address: destination.walletAddress,
+      network: destination.network ?? null,
+      asset_reference: destination.assetReference ?? null,
+      status: destination.status ?? 'ACTIVE',
+      version: destination.version ?? 1,
     })),
     created_at: recipient.createdAt.toISOString(),
     updated_at: recipient.updatedAt.toISOString(),

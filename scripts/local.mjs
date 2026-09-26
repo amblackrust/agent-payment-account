@@ -14,6 +14,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { parse as parseDotenv } from 'dotenv'
+import { buildChildProcessEnvironment } from './child-environment.mjs'
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const localDirectory = path.join(repositoryRoot, '.local')
@@ -23,6 +24,13 @@ const mintPath = path.join(localDirectory, 'mint.json')
 const validatorStatePath = path.join(localDirectory, 'solana-validator.json')
 const validatorLogPath = path.join(localDirectory, 'solana-validator.log')
 const environmentPath = path.join(repositoryRoot, '.env')
+const localSettlementConfigurationScript = path.join(
+  repositoryRoot,
+  'apps',
+  'api',
+  'scripts',
+  'ensure-local-settlement-configuration.ts',
+)
 const rpcUrl = 'http://127.0.0.1:8899'
 const tokenProgramAddress = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 const settlementDecimals = 6
@@ -44,6 +52,7 @@ const placeholderValues = new Set([
   'replace-with-local-token-mint',
   'replace-with-64-byte-fee-payer-secret',
   'replace-with-32-byte-hex-master-key',
+  'replace-with-32-byte-hex-recovery-key',
 ])
 
 class LocalSetupError extends Error {
@@ -57,10 +66,12 @@ function executableName(command) {
   return process.platform === 'win32' && command === 'pnpm' ? 'pnpm.cmd' : command
 }
 
+const safeChildEnvironment = buildChildProcessEnvironment()
+
 function run(command, args, options = {}) {
   const result = spawnSync(executableName(command), args, {
     cwd: repositoryRoot,
-    env: { ...process.env, NO_DNA: '1', ...options.environment },
+    env: { ...safeChildEnvironment, NO_DNA: '1', ...options.environment },
     encoding: 'utf8',
     stdio: options.capture ? 'pipe' : 'inherit',
     timeout: options.timeoutMs ?? 120_000,
@@ -81,7 +92,7 @@ function run(command, args, options = {}) {
 function commandSucceeds(command, args) {
   const result = spawnSync(executableName(command), args, {
     cwd: repositoryRoot,
-    env: { ...process.env, NO_DNA: '1' },
+    env: { ...safeChildEnvironment, NO_DNA: '1' },
     stdio: 'ignore',
     timeout: commandTimeoutMs,
   })
@@ -312,13 +323,25 @@ function writeLocalEnvironment(existing, generated) {
       'WALLET_MASTER_KEY in .env must be 64 hexadecimal characters.',
     )
   }
+  const recoveryEnvelopeKey = isMissingOrPlaceholder(
+    existing.values.RECOVERY_ENVELOPE_KEY,
+  )
+    ? randomBytes(32).toString('hex')
+    : existing.values.RECOVERY_ENVELOPE_KEY
+  if (!/^[0-9a-fA-F]{64}$/.test(recoveryEnvelopeKey)) {
+    throw new LocalSetupError(
+      'RECOVERY_ENVELOPE_KEY in .env must be 64 hexadecimal characters.',
+    )
+  }
 
   const values = {
     ...localEnvironmentDefaults,
     ADMIN_API_KEY: adminApiKey,
     SOLANA_SETTLEMENT_MINT: generated.mintAddress,
     SOLANA_FEE_PAYER_SECRET: generated.feePayerSecret,
+    SOLANA_FEE_PAYER_IDENTITY: generated.feePayerAddress,
     WALLET_MASTER_KEY: walletMasterKey,
+    RECOVERY_ENVELOPE_KEY: recoveryEnvelopeKey,
   }
   let content = existing.content
   if (content === '') {
@@ -331,6 +354,18 @@ function writeLocalEnvironment(existing, generated) {
   }
   writePrivateFile(environmentPath, content)
   return { ...existing.values, ...values }
+}
+
+function hasCompleteLocalEnvironment(existing, generated) {
+  const expectedValues = {
+    ...localEnvironmentDefaults,
+    SOLANA_SETTLEMENT_MINT: generated.mintAddress,
+    SOLANA_FEE_PAYER_SECRET: generated.feePayerSecret,
+    SOLANA_FEE_PAYER_IDENTITY: generated.feePayerAddress,
+  }
+  return Object.entries(expectedValues).every(
+    ([key, value]) => existing.values[key] === value,
+  )
 }
 
 async function rpc(method, params = [], timeoutMs = 2_000) {
@@ -427,7 +462,7 @@ async function ensureValidator() {
     {
       cwd: repositoryRoot,
       detached: true,
-      env: { ...process.env, NO_DNA: '1' },
+      env: { ...safeChildEnvironment, NO_DNA: '1' },
       stdio: ['ignore', logFile, logFile],
     },
   )
@@ -526,7 +561,8 @@ async function ensureSettlementMint(address, feePayerAddress) {
 
 async function apiReady() {
   try {
-    const response = await fetch('http://127.0.0.1:3000/ready', {
+    const apiUrl = process.env.LOCAL_API_URL ?? 'http://127.0.0.1:3000'
+    const response = await fetch(new URL('/ready', apiUrl), {
       signal: AbortSignal.timeout(2_000),
     })
     if (!response.ok) return false
@@ -616,7 +652,7 @@ async function stopValidator() {
   return true
 }
 
-async function setup() {
+async function setup({ infrastructureOnly = false } = {}) {
   console.log('Mux local setup\n')
   checkPrerequisites()
   console.log('✓ Prerequisites available')
@@ -627,12 +663,23 @@ async function setup() {
   const feePayerSecret = ensureFeePayer(existingEnvironment.values)
   const feePayerAddress = publicKey(feePayerPath)
   const mintAddress = ensureMintKeypair(existingEnvironment.values)
-  const environment = writeLocalEnvironment(existingEnvironment, {
+  const generatedEnvironment = {
     feePayerSecret,
+    feePayerAddress,
     mintAddress,
-  })
+  }
+  const preserveExistingEnvironment =
+    infrastructureOnly &&
+    hasCompleteLocalEnvironment(existingEnvironment, generatedEnvironment)
+  const environment = preserveExistingEnvironment
+    ? existingEnvironment.values
+    : writeLocalEnvironment(existingEnvironment, generatedEnvironment)
   console.log('✓ Platform fee payer ready')
-  console.log('✓ Local environment written')
+  console.log(
+    preserveExistingEnvironment
+      ? '✓ Existing local environment preserved'
+      : '✓ Local environment written',
+  )
 
   await Promise.all([ensurePostgres(), ensureValidator()])
   console.log('✓ PostgreSQL running')
@@ -643,12 +690,39 @@ async function setup() {
   await ensureSettlementMint(mintAddress, feePayerAddress)
   console.log('✓ Settlement mint ready')
 
-  run('pnpm', ['db:migrate:deploy'], { environment })
-  console.log('✓ Database migrations applied')
+  if (!infrastructureOnly) {
+    run('pnpm', ['db:migrate:deploy'], {
+      environment: { DATABASE_URL: environment.DATABASE_URL },
+    })
+    console.log('✓ Database migrations applied')
+
+    run('pnpm', ['db:generate'])
+    run(
+      'pnpm',
+      [
+        '--filter',
+        '@agent-payment/api',
+        'exec',
+        'tsx',
+        localSettlementConfigurationScript,
+      ],
+      {
+        environment: {
+          DATABASE_URL: environment.DATABASE_URL,
+          SOLANA_SETTLEMENT_MINT: mintAddress,
+          NODE_OPTIONS: '--conditions=development',
+        },
+      },
+    )
+  }
 
   console.log(`\nSettlement mint: ${mintAddress}`)
   console.log(`Fee payer address: ${feePayerAddress}`)
-  console.log('\nLocal environment ready.\n\nStart Mux:\n\n  pnpm dev')
+  if (infrastructureOnly) {
+    console.log('\nLocal infrastructure ready. Database contents were not changed.')
+  } else {
+    console.log('\nLocal environment ready.\n\nStart Mux:\n\n  pnpm dev')
+  }
 }
 
 async function down() {
@@ -666,10 +740,17 @@ async function down() {
 }
 
 const action = process.argv[2]
+const setupOption = process.argv[3]
 
 try {
-  if (action === 'setup') await setup()
-  else if (action === 'status') await showStatus()
+  if (action === 'setup') {
+    if (setupOption !== undefined && setupOption !== '--infrastructure-only') {
+      throw new LocalSetupError(
+        'Usage: node scripts/local.mjs setup [--infrastructure-only]',
+      )
+    }
+    await setup({ infrastructureOnly: setupOption === '--infrastructure-only' })
+  } else if (action === 'status') await showStatus()
   else if (action === 'down') await down()
   else throw new LocalSetupError('Usage: node scripts/local.mjs <setup|status|down>')
 } catch (error) {

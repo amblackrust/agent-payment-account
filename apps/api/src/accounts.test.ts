@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { ConflictError } from '@agent-payment/core'
+import { ConflictError, DEFAULT_AGENT_CREDENTIAL_SCOPES } from '@agent-payment/core'
 import type { AccountRepository, AuthenticatedAccount } from '@agent-payment/db'
 import type { SolanaRail } from '@agent-payment/solana-rail'
 import { moneyFromAtomicUnits } from '@agent-payment/core'
@@ -14,12 +14,16 @@ const config: AppConfig = {
   databaseUrl: 'postgresql://postgres:postgres@localhost:5432/test',
   port: 3000,
   nodeEnv: 'test',
+  runtimeRole: 'all',
+  restoreGateRequired: false,
   adminApiKey: 'admin-test-key',
   solanaRpcUrl: 'http://127.0.0.1:8899',
   solanaCluster: 'localnet',
   solanaSettlementMint: 'settlement-mint',
   solanaFeePayerSecret: 'fee-payer-test-secret',
   walletMasterKey: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  recoveryEnvelopeKey:
+    'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
   allowMainnet: false,
 }
 
@@ -35,6 +39,7 @@ const activeAccount: AuthenticatedAccount = {
     accountId: 'acct_test',
     keyHash: 'hash',
     keyPrefix: 'apa_test',
+    scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
     revokedAt: null,
     lastUsedAt: null,
   },

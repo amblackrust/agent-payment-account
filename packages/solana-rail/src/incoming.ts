@@ -204,11 +204,17 @@ export function createSolanaIncomingReader(
     if (Number.isNaN(confirmedAt.getTime())) {
       return { kind: 'UNRESOLVED', reason: 'BLOCK_TIME_UNAVAILABLE' }
     }
+    let amount: Money
+    try {
+      amount = tokenAmountToUsd(classified.amount, context.tokenDecimals)
+    } catch {
+      return { kind: 'UNRESOLVED', reason: 'UNCLASSIFIED_TRANSFER' }
+    }
     return {
       kind: 'INCOMING',
       transfer: {
         signature: transactionSignature,
-        amount: tokenAmountToUsd(classified.amount, context.tokenDecimals),
+        amount,
         tokenAtomicUnits: classified.amount,
         tokenDecimals: context.tokenDecimals,
         sourceAddress: classified.sourceAddress,
@@ -530,10 +536,15 @@ function getMemo(transaction: TransactionResponse): string | undefined {
 
 function tokenAmountToUsd(tokenAtomicUnits: bigint, decimals: number): Money {
   if (decimals >= 2) {
+    const divisor = 10n ** BigInt(decimals - 2)
+    if (tokenAtomicUnits % divisor !== 0n) {
+      throw new ExternalRailError(
+        'Incoming transfer cannot be represented exactly in the configured denomination',
+      )
+    }
     return {
       currency: 'USD',
-      atomicUnits: (tokenAtomicUnits /
-        10n ** BigInt(decimals - 2)) as Money['atomicUnits'],
+      atomicUnits: (tokenAtomicUnits / divisor) as Money['atomicUnits'],
     }
   }
   return {

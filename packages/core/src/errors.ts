@@ -9,6 +9,17 @@ export const DOMAIN_ERROR_CODES = {
   EXTERNAL_RAIL: 'EXTERNAL_RAIL_FAILURE',
   REFUND_NOT_SUPPORTED: 'REFUND_NOT_SUPPORTED',
   INTERNAL: 'INTERNAL_ERROR',
+  AUTHORIZATION: 'AUTHORIZATION_ERROR',
+  IDEMPOTENCY_CONFLICT: 'IDEMPOTENCY_CONFLICT',
+  IDEMPOTENCY_KEY_REUSED: 'IDEMPOTENCY_KEY_REUSED',
+  POLICY_DENIED: 'POLICY_DENIED',
+  APPROVAL_REQUIRED: 'APPROVAL_REQUIRED',
+  REVIEW_REQUIRED: 'REVIEW_REQUIRED',
+  DEPENDENCY_UNAVAILABLE: 'DEPENDENCY_UNAVAILABLE',
+  CUSTODY_UNAVAILABLE: 'CUSTODY_UNAVAILABLE',
+  INVALID_STATE: 'INVALID_STATE',
+  RATE_LIMITED: 'RATE_LIMITED',
+  NOT_FOUND: 'NOT_FOUND',
 } as const
 
 export type DomainErrorCode =
@@ -64,6 +75,83 @@ export class ValidationError extends DomainError {
 export class AuthenticationError extends DomainError {
   public constructor(message = 'Authentication failed') {
     super(DOMAIN_ERROR_CODES.AUTHENTICATION, message)
+  }
+}
+
+export class AuthorizationError extends DomainError {
+  public constructor(message = 'The actor is not authorized for this operation') {
+    super(DOMAIN_ERROR_CODES.AUTHORIZATION, message)
+  }
+}
+
+export class IdempotencyConflictError extends DomainError {
+  public constructor(message = 'Idempotency key was already used for another request') {
+    super(DOMAIN_ERROR_CODES.IDEMPOTENCY_CONFLICT, message)
+  }
+}
+
+export class IdempotencyKeyReusedError extends DomainError {
+  public constructor(message = 'Idempotency key was already used for another request') {
+    super(DOMAIN_ERROR_CODES.IDEMPOTENCY_KEY_REUSED, message)
+  }
+}
+
+export class PolicyDeniedError extends DomainError {
+  public constructor(
+    message = 'Payment was denied by policy',
+    details?: Readonly<Record<string, string>>,
+  ) {
+    super(DOMAIN_ERROR_CODES.POLICY_DENIED, message, details)
+  }
+}
+
+export class ApprovalRequiredError extends DomainError {
+  public constructor(
+    message = 'Payment requires approval',
+    details?: Readonly<Record<string, string>>,
+  ) {
+    super(DOMAIN_ERROR_CODES.APPROVAL_REQUIRED, message, details)
+  }
+}
+
+export class ReviewRequiredError extends DomainError {
+  public constructor(
+    message = 'Payment requires operational review',
+    details?: Readonly<Record<string, string>>,
+  ) {
+    super(DOMAIN_ERROR_CODES.REVIEW_REQUIRED, message, details)
+  }
+}
+
+export class DependencyUnavailableError extends DomainError {
+  public constructor(message = 'A required dependency is unavailable') {
+    super(DOMAIN_ERROR_CODES.DEPENDENCY_UNAVAILABLE, message)
+  }
+}
+
+export class CustodyUnavailableError extends DomainError {
+  public constructor(message = 'Signing custody is unavailable') {
+    super(DOMAIN_ERROR_CODES.CUSTODY_UNAVAILABLE, message)
+  }
+}
+
+export class InvalidStateError extends DomainError {
+  public constructor(
+    message = 'The resource is in an invalid state for this operation',
+  ) {
+    super(DOMAIN_ERROR_CODES.INVALID_STATE, message)
+  }
+}
+
+export class RateLimitedError extends DomainError {
+  public constructor(message = 'Request rate limit exceeded') {
+    super(DOMAIN_ERROR_CODES.RATE_LIMITED, message)
+  }
+}
+
+export class NotFoundError extends DomainError {
+  public constructor(message = 'Resource was not found') {
+    super(DOMAIN_ERROR_CODES.NOT_FOUND, message)
   }
 }
 

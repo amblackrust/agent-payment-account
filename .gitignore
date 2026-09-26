@@ -10,3 +10,14 @@ coverage/
 *.log
 docker-data/
 .local/
+test-ledger/
+
+# Local agent context and implementation planning; not project source.
+/.serena/
+/project-context.md
+/MUX_V2_Implementation_Task_Plan.md
+/MUX_V2_Implementation_Task_Plan.md:Zone.Identifier
+
+# Local tooling metadata and internal, outdated release-gate notes.
+/skills-lock.json
+/docs/v2-conformance.md

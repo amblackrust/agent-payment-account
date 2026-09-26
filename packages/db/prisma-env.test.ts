@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { DatabaseConfigurationError, requireDatabaseUrl } from './prisma-env.js'
+import {
+  assertDotenvIsNotProduction,
+  DatabaseConfigurationError,
+  requireDatabaseUrl,
+  shouldLoadLocalDotenv,
+} from './prisma-env.js'
 
 describe('Prisma database configuration', () => {
   it('requires an explicit DATABASE_URL', () => {
@@ -14,5 +19,18 @@ describe('Prisma database configuration', () => {
     expect(requireDatabaseUrl({ DATABASE_URL: ' postgres://db.example/app ' })).toBe(
       'postgres://db.example/app',
     )
+  })
+
+  it('does not load local dotenv configuration for production', () => {
+    expect(shouldLoadLocalDotenv({ NODE_ENV: 'production' })).toBe(false)
+    expect(shouldLoadLocalDotenv({ NODE_ENV: 'test' })).toBe(true)
+    expect(shouldLoadLocalDotenv({})).toBe(true)
+  })
+
+  it('rejects a dotenv file that declares production', () => {
+    expect(() => assertDotenvIsNotProduction({ NODE_ENV: 'production' })).toThrow(
+      'production must use its secret backend',
+    )
+    expect(() => assertDotenvIsNotProduction({ NODE_ENV: 'development' })).not.toThrow()
   })
 })

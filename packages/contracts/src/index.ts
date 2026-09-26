@@ -17,10 +17,17 @@ const currency = z.literal('USD')
 const paymentStatus = z.enum([
   'CREATED',
   'ROUTING',
+  'AWAITING_APPROVAL',
+  'REJECTED_BY_POLICY',
+  'REJECTED',
   'SUBMITTED',
   'RECONCILING',
   'CONFIRMED',
+  'PROVED_NO_EFFECT',
+  'REVIEW_REQUIRED',
+  'CLOSED_UNRESOLVED',
   'FAILED',
+  'EXPIRED',
 ])
 const paymentKind = z.enum(['PAY', 'SEND', 'REFUND'])
 const transactionKind = z.enum(['PAY', 'SEND', 'REFUND', 'RECEIVE'])
@@ -164,3 +171,56 @@ export type PayRequest = z.infer<typeof payRequestSchema>
 export type SendRequest = z.infer<typeof sendRequestSchema>
 export type ReceiveRequest = z.infer<typeof receiveRequestSchema>
 export type RefundRequest = z.infer<typeof refundRequestSchema>
+
+export {
+  approvalStateSchema,
+  exactAmountSchema,
+  policyDecisionSchema,
+  v2BalanceResponseSchema,
+  v2ErrorCodeSchema,
+  v2ErrorEnvelopeSchema,
+  v2AccountResponseSchema,
+  v2ApprovalResponseSchema,
+  v2CredentialResponseSchema,
+  v2CredentialScopeSchema,
+  v2CredentialIssuanceRequestSchema,
+  v2CredentialIssuanceResponseSchema,
+  v2FundingDestinationResponseSchema,
+  v2HistoryItemSchema,
+  v2HistoryResponseSchema,
+  v2PaymentCreateRequestSchema,
+  v2PaymentListResponseSchema,
+  v2PolicyResponseSchema,
+  v2PaymentResponseSchema,
+  v2PaymentStatusSchema,
+  v2RecipientDestinationSchema,
+  v2RecipientResponseSchema,
+  v2RecipientListResponseSchema,
+  v2ReceiveResponseSchema,
+  v2ReceiveListResponseSchema,
+} from './v2.js'
+export type {
+  V2BalanceResponse,
+  V2AccountResponse,
+  V2ApprovalResponse,
+  V2CredentialResponse,
+  V2CredentialIssuanceRequest,
+  V2CredentialIssuanceResponse,
+  V2ErrorCode,
+  V2ErrorEnvelope,
+  V2FundingDestinationResponse,
+  V2HistoryItem,
+  V2HistoryResponse,
+  V2PaymentCreateRequest,
+  V2PaymentListResponse,
+  V2PaymentResponse,
+  V2PaymentStatus,
+  V2PolicyResponse,
+  V2RecipientDestination,
+  V2RecipientResponse,
+  V2RecipientListResponse,
+  V2ReceiveResponse,
+  V2ReceiveListResponse,
+} from './v2.js'
+
+export * from './v2-http.js'

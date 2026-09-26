@@ -13,7 +13,8 @@ flowchart TB
   API --> Services[Account, recipient, payment, receive services]
   Services --> Core[Core money, lifecycle, and rail contracts]
   Services --> DB[(PostgreSQL / Prisma)]
-  Services --> Custody[Wallet secret cipher]
+  Services --> Provisioning[Wallet secret encryption for provisioning]
+  Outgoing --> Custody[Constrained custody boundary]
   Services --> Rail[Solana rail]
 
   Custody -->|account signer| Rail
@@ -32,7 +33,9 @@ flowchart TB
 
 The API authenticates administrators and Agent Accounts, validates HTTP input, and coordinates account, recipient, balance, payment, receive, and transaction services. It returns wire-format JSON from the shared contracts and adds an `x-request-id` response header.
 
-The server also starts periodic outgoing and incoming reconciliation work. HTTP handlers do not redefine the rail or database contracts.
+The dedicated API role does not sign settlement effects. The development-only
+`all` role may run the legacy-compatible worker loop in the same process.
+HTTP handlers do not redefine the rail or database contracts.
 
 ### Core — `packages/core`
 
@@ -40,7 +43,10 @@ Core defines normalized money, identifiers, payment states, routing and rail int
 
 ### Contracts — `packages/contracts`
 
-Shared Zod schemas define the agent-facing request and response shapes consumed by the API and SDK. Public money values are fixed two-decimal `USD` strings.
+Shared Zod schemas define the agent-facing request and response shapes consumed
+by the API and SDK. The canonical V2 surface uses exact decimal strings plus an
+explicit `denomination_id`; the retained V1 compatibility surface uses fixed
+two-decimal `USD` strings.
 
 ### Database — `packages/db`
 
@@ -63,6 +69,7 @@ sequenceDiagram
   participant A as Agent application
   participant API as Fastify API
   participant DB as PostgreSQL
+  participant W as Outgoing worker
   participant C as Custody
   participant S as Solana rail
   participant R as Solana RPC
@@ -70,11 +77,12 @@ sequenceDiagram
   A->>API: POST /v1/pay or /v1/send
   API->>DB: authenticate credential and resolve recipient
   API->>DB: create/replay idempotent payment and reserve funds
-  API->>C: decrypt managed account signer
-  C-->>API: account signer material
-  API->>S: prepare and sign transfer
-  S->>R: submit signed classic SPL transaction
-  API->>DB: persist attempt and observed outcome
+  API->>DB: persist intent and durable work item
+  W->>DB: claim and load durable attempt
+  W->>C: request constrained effect signing
+  C-->>W: signed effect
+  W->>S: submit signed classic SPL transaction
+  W->>DB: persist attempt and observed outcome
   API-->>A: payment with lifecycle status
   Note over A,R: HTTP success is not equivalent to chain confirmation
 ```
@@ -117,21 +125,27 @@ The platform fee payer is a different signer supplied through `SOLANA_FEE_PAYER_
 
 ## Data and State Boundaries
 
-| State | Location | Meaning |
-| --- | --- | --- |
-| Account identity and Solana public key | PostgreSQL | Off-chain account ownership and managed signer address |
-| Agent credential | Application receives plaintext once; PostgreSQL stores hash and prefix | Bearer authentication, rotation, and revocation |
-| Encrypted account signer | PostgreSQL | Custodial signing material protected by `WALLET_MASTER_KEY` |
-| Payment intent, attempts, idempotency, reservations | PostgreSQL | Durable workflow and recovery state |
-| Receive requests and reconciliation cursors | PostgreSQL | Expected incoming activity and scanner progress |
-| SPL token balances and transaction result | Solana | Settlement state observed through the configured RPC |
-| Platform fee-payer secret | Process environment | Network fee authority; not stored through the account repository |
+| State                                               | Location                                                               | Meaning                                                          |
+| --------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Account identity and Solana public key              | PostgreSQL                                                             | Off-chain account ownership and managed signer address           |
+| Agent credential                                    | Application receives plaintext once; PostgreSQL stores hash and prefix | Bearer authentication, rotation, and revocation                  |
+| Encrypted account signer                            | PostgreSQL                                                             | Custodial signing material protected by `WALLET_MASTER_KEY`      |
+| Payment intent, attempts, idempotency, reservations | PostgreSQL                                                             | Durable workflow and recovery state                              |
+| Receive requests and reconciliation cursors         | PostgreSQL                                                             | Expected incoming activity and scanner progress                  |
+| SPL token balances and transaction result           | Solana                                                                 | Settlement state observed through the configured RPC             |
+| Platform fee-payer secret                           | Process environment                                                    | Network fee authority; not stored through the account repository |
 
 Runtime metadata pins the configured rail version, cluster, settlement mint, and custody-key fingerprint. Startup validation prevents silently opening existing custody state with incompatible runtime configuration.
 
 ## Solana Settlement Rail
 
-The runtime exposes `USD` with two decimal places. The rail reads the configured mint's decimals and converts normalized amounts to mint atomic units before using `transferChecked`. Only the classic SPL Token program is accepted; Token-2022 is not the v1 settlement rail.
+The retained V1 runtime exposes `USD` with two decimal places. V2 keeps money
+exact at the logical-contract boundary and converts through an explicit
+denomination/economic-mapping/settlement-asset snapshot. The current configured
+route is still one classic SPL Token rail: it reads the settlement mint's
+decimals and converts the mapped amount to atomic units before using
+`transferChecked`. Only the classic SPL Token program is accepted; Token-2022
+is not the current settlement rail.
 
 An external recipient's `wallet_address` identifies its Solana owner/public key. Mux derives the associated token account for that owner and the configured settlement mint; the derived account must already exist because Mux does not sponsor token-account creation for arbitrary external recipients. A recipient tied to another managed account is checked against that account's canonical public key and may receive sponsored associated-token-account creation through the platform fee payer.
 
@@ -153,7 +167,10 @@ Before submission, the runtime persists payment and attempt state. If transport 
 
 - Administrators know `ADMIN_API_KEY` and can create accounts, inspect non-secret credential metadata, issue credentials, and revoke them.
 - An agent application knows only its one-time bearer credential and the normalized API surface. It never receives the managed signer secret.
-- The API process can access the database, `WALLET_MASTER_KEY`, the platform fee-payer secret, and decrypted account secrets while signing. Compromise of this boundary is a custody compromise.
+- A dedicated API process can access the database and provisioning encryption
+  material but does not load the platform fee-payer secret or decrypt existing
+  account signer secrets. The outgoing role owns settlement signing authority;
+  the development-only `all` role intentionally combines these boundaries.
 - PostgreSQL stores sensitive encrypted signer material plus all off-chain financial workflow state. Database access alone does not provide the wallet master key, but database integrity is required for safe orchestration.
 - The configured Solana cluster is the final settlement system. RPC responses are checked against the configured cluster and mint, but the operator chooses the RPC provider.
 - Mainnet is disabled unless both `SOLANA_CLUSTER=mainnet-beta` and `ALLOW_MAINNET=true` are present.

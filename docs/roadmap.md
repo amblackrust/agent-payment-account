@@ -4,12 +4,12 @@ Mux is developing one product: the Agent Payment Account. The current system is 
 
 The phases below describe product direction, not committed dates, releases, integrations, or partnerships. Only **Current Foundation** is implemented today.
 
-| Stage | Product reach |
-| --- | --- |
-| Current Foundation | Agent → stablecoin / Solana → recipient |
-| Machine Economy | Agent → APIs / digital services / agents |
-| Real-World Money | Agent → fiat funding / payouts / cards |
-| Universal Account | Agent → pay anyone, anywhere |
+| Stage              | Product reach                            |
+| ------------------ | ---------------------------------------- |
+| Current Foundation | Agent → stablecoin / Solana → recipient  |
+| Machine Economy    | Agent → APIs / digital services / agents |
+| Real-World Money   | Agent → fiat funding / payouts / cards   |
+| Universal Account  | Agent → pay anyone, anywhere             |
 
 ## Current Foundation
 

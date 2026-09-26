@@ -4,13 +4,115 @@ import {
   assertPaymentAttemptStatusTransition,
   assertPaymentStatusTransition,
   ConflictError,
+  DEFAULT_AGENT_CREDENTIAL_SCOPES,
   ExternalRailError,
   InsufficientFundsError,
+  InvalidStateError,
+  NotFoundError,
   RecipientResolutionError,
+  ValidationError,
 } from '@agent-payment/core'
 import { PrismaClient, type Prisma } from './generated/client/client.js'
+import { reservationAmountInUsdAtomic } from './reservation-amount.js'
+import { createV2DatabaseRepository, type V2DatabaseRepository } from './v2.js'
+import { createV2AdminRepository, type V2AdminRepository } from './v2-admin.js'
+import {
+  createV2OperationsRepository,
+  type V2OperationsRepository,
+} from './v2-operations.js'
+import { createTimelineEvent } from './timeline.js'
+import { enqueueWebhookEvent } from './webhook-events.js'
 
-export type AgentAccountStatus = 'ACTIVE' | 'DISABLED'
+const MAX_INCOMING_ISSUE_RETRIES = 8
+const TERMINAL_RESERVATION_PAYMENT_STATUSES = [
+  'CONFIRMED',
+  'REJECTED_BY_POLICY',
+  'REJECTED',
+  'PROVED_NO_EFFECT',
+  'FAILED',
+  'EXPIRED',
+] as const
+
+async function getOutstandingReservationAtomic(
+  client: PrismaClient | Prisma.TransactionClient,
+  ownerAccountId: string,
+  currency: string,
+): Promise<bigint> {
+  const reservations = await client.outgoingReservation.findMany({
+    where: {
+      ownerAccountId,
+      currency,
+      status: 'ACTIVE',
+      lifecycleState: 'HELD',
+      payment: { status: { notIn: [...TERMINAL_RESERVATION_PAYMENT_STATUSES] } },
+    },
+    select: {
+      amountAtomic: true,
+      payment: { select: { amountScale: true } },
+    },
+  })
+  return reservations.reduce(
+    (total, reservation) =>
+      total +
+      reservationAmountInUsdAtomic(
+        reservation.amountAtomic,
+        reservation.payment.amountScale,
+      ),
+    0n,
+  )
+}
+export { createV2DatabaseRepository } from './v2.js'
+export { createV2AdminRepository } from './v2-admin.js'
+export {
+  assertSafeWebhookAddress,
+  assertSafeWebhookEndpoint,
+  createV2OperationsRepository,
+} from './v2-operations.js'
+export { enqueueWebhookEvent } from './webhook-events.js'
+export type {
+  V2AccountRecord,
+  V2AdminRepository,
+  V2ApprovalAdminRecord,
+  V2ApprovedDestinationRecord as V2AdminApprovedDestinationRecord,
+  V2CredentialRecord,
+  V2CustodyKeyVersionRecord,
+  V2FundingDestinationRecord,
+  V2HistoryRecord,
+  V2ProvisionedAccount,
+  V2ReceiveRequestAdminRecord,
+  V2SpendPolicyAdminRecord,
+  V2SigningRequestRecord,
+} from './v2-admin.js'
+export type {
+  V2BackupRestoreVerificationRecord,
+  V2OperationalExceptionRecord,
+  V2OperationsRepository,
+  V2DomainHealthInput,
+  V2PlatformCostRecord,
+  V2TimelineRecord,
+  V2WebhookDeliveryClaim,
+  V2WebhookSubscriptionRecord,
+} from './v2-operations.js'
+export type {
+  V2ApprovedDestinationRecord,
+  V2DatabaseRepository,
+  V2DenominationRecord,
+  V2EconomicMappingRecord,
+  V2IdempotencyRecord,
+  V2PaymentAttemptSnapshot,
+  V2PaymentCreateInput,
+  V2PaymentCreateResult,
+  V2PolicyDecisionInput,
+  V2PaymentSnapshot,
+  V2SettlementAssetRecord,
+  V2PaymentView,
+  V2SpendContext,
+  V2SpendPolicyRecord,
+  V2WorkItemClaim,
+} from './v2.js'
+
+export type AgentAccountStatus =
+  'PROVISIONING' | 'ACTIVE' | 'DISABLED' | 'PROVISIONING_FAILED'
 
 export interface StoredAgentAccount {
   readonly id: string
@@ -36,6 +138,9 @@ export interface AuthenticatedAccount {
     readonly accountId: string
     readonly keyHash: string
     readonly keyPrefix: string
+    readonly status?: 'ACTIVE' | 'EXPIRED' | 'REVOKED' | 'ROTATING'
+    readonly scopes?: readonly string[]
+    readonly expiresAt?: Date | null
     readonly revokedAt: Date | null
     readonly lastUsedAt: Date | null
   }
@@ -51,6 +156,23 @@ export interface CreateAgentAccountInput {
   readonly credentialId: string
   readonly keyHash: string
   readonly keyPrefix: string
+  readonly scopes?: readonly string[]
+  readonly expiresAt?: Date
+  /**
+   * Optional initial receive request created in the same transaction as the
+   * account and its first credential. V1 provisioning supplies this value so
+   * a failed receive-request insert rolls back the whole provision.
+   */
+  readonly initialReceiveRequest?: {
+    readonly id: string
+    readonly currency: string
+    readonly reference: string
+    readonly amountAtomic?: bigint
+    readonly denominationId?: string
+    readonly amountScale?: number
+    readonly createdAt?: Date
+    readonly expiresAt?: Date
+  }
 }
 
 export interface AccountCustodyRecord {
@@ -75,6 +197,8 @@ export interface AccountRepository {
     readonly accountId: string
     readonly keyHash: string
     readonly keyPrefix: string
+    readonly scopes?: readonly string[]
+    readonly expiresAt?: Date
   }) => Promise<StoredApiCredential>
   readonly listAccountSummaries?: () => Promise<readonly AccountSummary[]>
   readonly findAccountSummary?: (accountId: string) => Promise<AccountSummary | null>
@@ -86,6 +210,9 @@ export interface StoredApiCredential {
   readonly keyPrefix: string
   readonly createdAt: Date
   readonly revokedAt: Date | null
+  readonly status?: 'ACTIVE' | 'EXPIRED' | 'REVOKED' | 'ROTATING'
+  readonly scopes?: readonly string[]
+  readonly expiresAt?: Date | null
 }
 
 export interface AccountSummary {
@@ -114,6 +241,10 @@ export interface RecipientDestinationRecord {
   readonly rail: string
   readonly type: string
   readonly walletAddress: string
+  readonly network?: string | null
+  readonly assetReference?: string | null
+  readonly status?: string
+  readonly version?: number
 }
 
 export interface RecipientRecord {
@@ -126,6 +257,8 @@ export interface RecipientRecord {
   readonly destinations: readonly RecipientDestinationRecord[]
   readonly createdAt: Date
   readonly updatedAt: Date
+  readonly archivedAt?: Date | null
+  readonly rowVersion?: number
 }
 
 export interface CreateRecipientInput {
@@ -139,6 +272,8 @@ export interface CreateRecipientInput {
     readonly rail: string
     readonly type: string
     readonly walletAddress: string
+    readonly network?: string
+    readonly assetReference?: string
   }
 }
 
@@ -153,7 +288,10 @@ export interface UpdateRecipientInput {
     readonly rail: string
     readonly type: string
     readonly walletAddress: string
+    readonly network?: string
+    readonly assetReference?: string
   }
+  readonly rowVersion?: number
 }
 
 export interface RecipientRepository {
@@ -202,7 +340,19 @@ export interface ReservationRepository {
 
 export type PaymentKind = 'PAY' | 'SEND' | 'REFUND'
 export type PaymentStatus =
-  'CREATED' | 'ROUTING' | 'SUBMITTED' | 'RECONCILING' | 'CONFIRMED' | 'FAILED'
+  | 'CREATED'
+  | 'ROUTING'
+  | 'AWAITING_APPROVAL'
+  | 'REJECTED_BY_POLICY'
+  | 'REJECTED'
+  | 'SUBMITTED'
+  | 'RECONCILING'
+  | 'CONFIRMED'
+  | 'PROVED_NO_EFFECT'
+  | 'REVIEW_REQUIRED'
+  | 'CLOSED_UNRESOLVED'
+  | 'FAILED'
+  | 'EXPIRED'
 export type PaymentAttemptStatus =
   | 'CREATED'
   | 'PREPARED'
@@ -242,6 +392,17 @@ export interface PaymentRecord {
   readonly nextRecoveryAt: Date | null
   readonly recoveryCount: number
   readonly stuckSince: Date | null
+  readonly denominationId?: string | null
+  readonly amountScale?: number | null
+  readonly routeId?: string | null
+  readonly settlementAssetId?: string | null
+  readonly destinationSnapshotJson?: string | null
+  readonly policyDecisionId?: string | null
+  readonly approvalId?: string | null
+  readonly executionState?: string
+  readonly settlementState?: string
+  readonly outcomeState?: string
+  readonly rowVersion?: number
 }
 
 export type ReceiveRequestStatus = 'OPEN' | 'PAID' | 'EXPIRED' | 'CANCELLED'
@@ -250,6 +411,8 @@ export interface ReceiveRequestRecord {
   readonly id: string
   readonly accountId: string
   readonly amountAtomic: bigint | null
+  readonly denominationId?: string | null
+  readonly amountScale?: number | null
   readonly currency: string
   readonly reference: string
   readonly status: ReceiveRequestStatus
@@ -288,12 +451,15 @@ export interface IncomingCursor {
   readonly rail: string
   readonly address: string
   readonly cursorSignature: string | null
+  readonly leaseExpiresAt?: Date | null
 }
 
 export interface CreateReceiveRequestInput {
   readonly id: string
   readonly accountId: string
   readonly amountAtomic?: bigint
+  readonly denominationId?: string
+  readonly amountScale?: number
   readonly currency: string
   readonly reference: string
   readonly createdAt?: Date
@@ -330,22 +496,59 @@ export interface ReceiveRepository {
     id: string,
   ): Promise<ReceiveRequestRecord | null>
   listReceiveRequests(accountId: string): Promise<readonly ReceiveRequestRecord[]>
+  readonly listReceiveRequestsPage?: (
+    accountId: string,
+    limit: number,
+    cursor?: { readonly createdAt: Date; readonly id: string },
+  ) => Promise<readonly ReceiveRequestRecord[]>
   matchIncomingPayment(input: IncomingMatchInput): Promise<string | null>
   expireOpenReceiveRequests(accountId: string, now: Date): Promise<void>
+  readonly cancelReceiveRequest?: (
+    accountId: string,
+    id: string,
+    now?: Date,
+  ) => Promise<ReceiveRequestRecord>
 }
 
 export interface IncomingPaymentRepository {
+  readonly reconcileUnmatchedManagedIncoming?: (limit: number) => Promise<number>
   listActiveAccountSettlements(): Promise<readonly ActiveAccountSettlement[]>
   getIncomingCursor(
     accountId: string,
     rail: string,
     address: string,
   ): Promise<IncomingCursor | null>
+  readonly claimIncomingPartition?: (input: {
+    readonly accountId: string
+    readonly rail: string
+    readonly address: string
+    readonly owner: string
+    readonly leaseSeconds: number
+    readonly now?: Date
+  }) => Promise<IncomingCursor | null>
+  readonly releaseIncomingPartition?: (input: {
+    readonly accountId: string
+    readonly rail: string
+    readonly address: string
+    readonly owner: string
+    readonly leaseExpiresAt?: Date
+  }) => Promise<void>
+  readonly renewIncomingPartition?: (input: {
+    readonly accountId: string
+    readonly rail: string
+    readonly address: string
+    readonly owner: string
+    readonly leaseSeconds: number
+    readonly now?: Date
+    readonly leaseExpiresAt?: Date
+  }) => Promise<void>
   saveIncomingCursor(input: {
     readonly accountId: string
     readonly rail: string
     readonly address: string
     readonly cursorSignature: string
+    readonly leaseOwner?: string
+    readonly leaseExpiresAt?: Date
   }): Promise<void>
   createIncomingPayment(
     input: CreateIncomingPaymentInput,
@@ -370,6 +573,13 @@ export interface IncomingPaymentRepository {
     limit: number,
     now?: Date,
   ) => Promise<readonly IncomingReconciliationIssueRecord[]>
+  readonly deferIncomingReconciliationIssue: (input: {
+    readonly issueId: string
+    readonly retryAt: Date
+    readonly retryCount: number
+    readonly retryCountBeforeClaim: number
+    readonly recoveryClaimed: boolean
+  }) => Promise<void>
   readonly resolveIncomingReconciliationIssue: (
     issueId: string,
     now?: Date,
@@ -377,6 +587,11 @@ export interface IncomingPaymentRepository {
   readonly updateIncomingReconciliationIssueReason: (
     issueId: string,
     reason: string,
+  ) => Promise<void>
+  readonly exhaustIncomingReconciliationIssue: (
+    issueId: string,
+    reason: string,
+    now?: Date,
   ) => Promise<void>
 }
 
@@ -387,6 +602,8 @@ export interface IncomingReconciliationIssueRecord {
   readonly signature: string
   readonly reason: string
   readonly retryCount: number
+  readonly retryCountBeforeClaim: number
+  readonly recoveryClaimed: boolean
 }
 
 export interface PaymentAttemptRecord {
@@ -552,10 +769,16 @@ export interface DatabaseClient
     ReservationRepository,
     ReceiveRepository,
     IncomingPaymentRepository {
+  readonly v2: V2DatabaseRepository
+  readonly v2Admin: V2AdminRepository
+  readonly v2Operations: V2OperationsRepository
   initializeRuntimeIdentity(
     input: RuntimeIdentity,
     validateLegacyCustody?: (custody: AccountCustodyRecord) => Promise<void>,
   ): Promise<void>
+  checkRuntimeIdentity(input: RuntimeIdentityCompatibility): Promise<void>
+  initializeRuntimeAuthority(authorityId: string): Promise<void>
+  getRuntimeMetadata(key: string): Promise<string | null>
   reserveFeeSponsorship(input: {
     readonly accountId: string
     readonly paymentId: string
@@ -571,11 +794,99 @@ export interface DatabaseClient
 }
 
 export interface RuntimeIdentity {
+  readonly environment?: string
   readonly rail: string
   readonly version: string
+  readonly railVersion?: string
   readonly cluster: string
   readonly settlementMint: string
-  readonly custodyKeyFingerprint: string
+  readonly feePayerIdentity?: string
+  readonly routeId?: string
+  readonly routeConfigVersion?: string
+  readonly settlementAssetId?: string
+  readonly settlementAssetVersion?: number
+  readonly economicMappingId?: string
+  readonly economicMappingVersion?: number
+  readonly routes?: readonly RuntimeRouteIdentity[]
+  readonly custodyKeyFingerprint?: string
+  readonly custodyBackendIdentity?: string
+  readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
+}
+
+export interface RuntimeIdentityCompatibility {
+  readonly environment?: string
+  readonly rail: string
+  readonly version: string
+  readonly railVersion?: string
+  readonly cluster: string
+  readonly settlementMint: string
+  readonly feePayerIdentity?: string
+  readonly routeId?: string
+  readonly routeConfigVersion?: string
+  readonly settlementAssetId?: string
+  readonly settlementAssetVersion?: number
+  readonly economicMappingId?: string
+  readonly economicMappingVersion?: number
+  readonly routes?: readonly RuntimeRouteIdentity[]
+  readonly custodyBackendIdentity?: string
+  readonly custodyBackendMode?: 'EXTERNAL' | 'LOCAL_TEST'
+}
+
+export interface RuntimeRouteIdentity {
+  readonly id: string
+  readonly railVersion: string
+  readonly configVersion: string
+  readonly settlementAssetId: string
+  readonly settlementAssetVersion: number
+  readonly economicMappingId: string
+  readonly economicMappingVersion: number
+}
+
+async function markIncomingReconciliationIssueExhausted(
+  transaction: Prisma.TransactionClient,
+  issueId: string,
+  reason: string,
+  now: Date,
+): Promise<void> {
+  const updated = await transaction.incomingReconciliationIssue.updateMany({
+    where: { id: issueId, status: 'PENDING' },
+    data: { status: 'EXHAUSTED', reason },
+  })
+  if (updated.count !== 1) return
+
+  const issue = await transaction.incomingReconciliationIssue.findUniqueOrThrow({
+    where: { id: issueId },
+  })
+  await transaction.operationalException.upsert({
+    where: { activeDedupeKey: `active:incoming-issue:${issue.id}` },
+    create: {
+      id: `opx_incoming_${randomBytes(16).toString('hex')}`,
+      accountId: issue.accountId,
+      resourceType: 'INCOMING_RECONCILIATION_ISSUE',
+      resourceId: issue.id,
+      dedupeKey: `incoming-issue:${issue.id}`,
+      activeDedupeKey: `active:incoming-issue:${issue.id}`,
+      reasonCode: 'INCOMING_ISSUE_RETRY_EXHAUSTED',
+      detailsJson: JSON.stringify({ signature: issue.signature, reason }),
+    },
+    update: {
+      updatedAt: now,
+      detailsJson: JSON.stringify({ signature: issue.signature, reason }),
+    },
+  })
+  await transaction.operationTimelineEvent.create({
+    data: {
+      id: `timeline_${randomBytes(16).toString('hex')}`,
+      accountId: issue.accountId,
+      resourceType: 'INCOMING_RECONCILIATION_ISSUE',
+      resourceId: issue.id,
+      eventType: 'INCOMING_ISSUE_EXHAUSTED',
+      actorType: 'SYSTEM',
+      source: 'INCOMING_RECONCILIATION',
+      occurredAt: now,
+      newStateJson: JSON.stringify({ status: 'EXHAUSTED', reason }),
+    },
+  })
 }
 
 async function matchIncomingPaymentInTransaction(
@@ -585,11 +896,41 @@ async function matchIncomingPaymentInTransaction(
   if (input.amountAtomic <= 0n) return null
   if (input.reference === null) return null
 
+  const incoming = await transaction.incomingPayment.findUnique({
+    where: { id: input.incomingPaymentId },
+    select: { signature: true },
+  })
+  if (incoming === null) return null
+  // Legacy incoming and receive amounts use cents, while V2 payments use the
+  // denomination scale. The exact transaction signature, account, and reference
+  // bind the payment; receive matching below still compares incoming amounts.
+  const managedPayment = await transaction.payment.findFirst({
+    where: {
+      status: 'CONFIRMED',
+      recipientManagedAccountId: input.accountId,
+      externalReference: input.reference,
+      attempts: { some: { railTransactionId: incoming.signature } },
+    },
+    select: { createdAt: true, confirmedAt: true },
+  })
+  // A resumed local validator can report a block time from before the wall-clock
+  // receive. The matching confirmed managed payment anchors the order in time.
+  const useManagedTime =
+    managedPayment?.confirmedAt !== null &&
+    managedPayment?.confirmedAt !== undefined &&
+    managedPayment.confirmedAt > input.confirmedAt
+  const matchConfirmedAt = useManagedTime
+    ? managedPayment.confirmedAt!
+    : input.confirmedAt
+  const latestReceiveCreation = useManagedTime
+    ? managedPayment.createdAt
+    : input.confirmedAt
+
   await transaction.receiveRequest.updateMany({
     where: {
       accountId: input.accountId,
       status: 'OPEN',
-      expiresAt: { lte: input.confirmedAt },
+      expiresAt: { lte: matchConfirmedAt },
     },
     data: { status: 'EXPIRED' },
   })
@@ -601,8 +942,8 @@ async function matchIncomingPaymentInTransaction(
       AND "reference" = ${input.reference}
       AND "status" IN ('OPEN', 'EXPIRED')
       AND "matched_incoming_payment_id" IS NULL
-      AND "created_at" <= ${input.confirmedAt}
-      AND ("expires_at" IS NULL OR "expires_at" > ${input.confirmedAt})
+      AND "created_at" <= ${latestReceiveCreation}
+      AND ("expires_at" IS NULL OR "expires_at" > ${matchConfirmedAt})
       AND ("amount_atomic" IS NULL OR "amount_atomic" = ${input.amountAtomic})
     ORDER BY "created_at" ASC, "id" ASC
     LIMIT 1
@@ -625,21 +966,35 @@ async function matchIncomingPaymentInTransaction(
     },
     data: {
       status: 'PAID',
-      paidAt: input.confirmedAt,
+      paidAt: matchConfirmedAt,
       matchedIncomingPaymentId: input.incomingPaymentId,
     },
   })
   if (requestResult.count !== 1) {
     throw new ConflictError('Receive request was claimed concurrently')
   }
+  const matchedIncoming = await transaction.incomingPayment.findUniqueOrThrow({
+    where: { id: input.incomingPaymentId },
+  })
+  const matchedRequest = await transaction.receiveRequest.findUniqueOrThrow({
+    where: { id: requestId },
+  })
+  await enqueueIncomingPaymentWebhookEvent(transaction, matchedIncoming, 'updated', 2)
+  await enqueueReceiveRequestWebhookEvent(transaction, matchedRequest, 'updated', 2)
   return requestId
 }
 
 export function createDatabaseClient(databaseUrl: string): DatabaseClient {
   const adapter = new PrismaPg({ connectionString: databaseUrl })
   const prisma = new PrismaClient({ adapter })
+  const v2 = createV2DatabaseRepository(prisma)
+  const v2Admin = createV2AdminRepository(prisma)
+  const v2Operations = createV2OperationsRepository(prisma)
 
   return {
+    v2,
+    v2Admin,
+    v2Operations,
     async createAgentAccount(input): Promise<StoredAgentAccount> {
       return prisma.$transaction(async (transaction) => {
         const account = await transaction.agentAccount.create({
@@ -652,13 +1007,70 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             encryptionAuthTag: input.encryptionAuthTag,
           },
         })
-        await transaction.apiCredential.create({
+        const credential = await transaction.apiCredential.create({
           data: {
             id: input.credentialId,
             accountId: account.id,
             keyHash: input.keyHash,
             keyPrefix: input.keyPrefix,
+            scopes: JSON.stringify(DEFAULT_AGENT_CREDENTIAL_SCOPES),
           },
+        })
+        if (input.initialReceiveRequest !== undefined) {
+          const receiveRequest = await transaction.receiveRequest.create({
+            data: {
+              id: input.initialReceiveRequest.id,
+              accountId: account.id,
+              ...(input.initialReceiveRequest.amountAtomic === undefined
+                ? {}
+                : { amountAtomic: input.initialReceiveRequest.amountAtomic }),
+              ...(input.initialReceiveRequest.denominationId === undefined
+                ? {}
+                : { denominationId: input.initialReceiveRequest.denominationId }),
+              ...(input.initialReceiveRequest.amountScale === undefined
+                ? {}
+                : { amountScale: input.initialReceiveRequest.amountScale }),
+              currency: input.initialReceiveRequest.currency,
+              reference: input.initialReceiveRequest.reference,
+              ...(input.initialReceiveRequest.createdAt === undefined
+                ? {}
+                : { createdAt: input.initialReceiveRequest.createdAt }),
+              ...(input.initialReceiveRequest.expiresAt === undefined
+                ? {}
+                : { expiresAt: input.initialReceiveRequest.expiresAt }),
+            },
+          })
+          await enqueueReceiveRequestWebhookEvent(
+            transaction,
+            receiveRequest,
+            'created',
+            1,
+          )
+        }
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: account.id,
+          resourceType: 'ACCOUNT',
+          resourceId: account.id,
+          eventType: 'ACCOUNT_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V1_ACCOUNT_PROVISIONING',
+          occurredAt: account.createdAt,
+          newStateJson: JSON.stringify({ status: account.status }),
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: account.id,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V1_ACCOUNT_PROVISIONING',
+          occurredAt: credential.createdAt,
+          newStateJson: JSON.stringify({
+            status: credential.status,
+            scopes: DEFAULT_AGENT_CREDENTIAL_SCOPES,
+          }),
         })
         return account
       })
@@ -671,6 +1083,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           accountId: true,
           keyHash: true,
           keyPrefix: true,
+          status: true,
+          scopes: true,
+          expiresAt: true,
           revokedAt: true,
           lastUsedAt: true,
           account: {
@@ -693,6 +1108,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           accountId: credential.accountId,
           keyHash: credential.keyHash,
           keyPrefix: credential.keyPrefix,
+          status: credential.status,
+          scopes: parseCredentialScopes(credential.scopes),
+          expiresAt: credential.expiresAt,
           revokedAt: credential.revokedAt,
           lastUsedAt: credential.lastUsedAt,
         },
@@ -726,20 +1144,64 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       })
     },
     async revokeCredential(accountId, credentialId): Promise<boolean> {
-      const result = await prisma.apiCredential.updateMany({
-        where: { id: credentialId, accountId, revokedAt: null },
-        data: { revokedAt: new Date() },
+      return prisma.$transaction(async (transaction) => {
+        const result = await transaction.apiCredential.updateMany({
+          where: { id: credentialId, accountId, revokedAt: null },
+          data: {
+            status: 'REVOKED',
+            revokedAt: new Date(),
+            rowVersion: { increment: 1 },
+          },
+        })
+        if (result.count !== 1) return false
+        const credential = await transaction.apiCredential.findUniqueOrThrow({
+          where: { id: credentialId },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: credential.id,
+          eventType: 'CREDENTIAL_REVOKED',
+          actorType: 'SYSTEM',
+          source: 'V1_CREDENTIAL_LIFECYCLE',
+          occurredAt: credential.revokedAt ?? new Date(),
+          oldStateJson: JSON.stringify({ status: 'ACTIVE' }),
+          newStateJson: JSON.stringify({ status: credential.status }),
+        })
+        return true
       })
-      return result.count === 1
     },
     async createApiCredential(input): Promise<StoredApiCredential> {
-      const credential = await prisma.apiCredential.create({
-        data: {
-          id: input.id,
-          accountId: input.accountId,
-          keyHash: input.keyHash,
-          keyPrefix: input.keyPrefix,
-        },
+      const credential = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.apiCredential.create({
+          data: {
+            id: input.id,
+            accountId: input.accountId,
+            keyHash: input.keyHash,
+            keyPrefix: input.keyPrefix,
+            ...(input.scopes === undefined
+              ? {}
+              : { scopes: JSON.stringify(input.scopes) }),
+            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: created.accountId,
+          resourceType: 'CREDENTIAL',
+          resourceId: created.id,
+          eventType: 'CREDENTIAL_CREATED',
+          actorType: 'SYSTEM',
+          source: 'V1_CREDENTIAL_ISSUANCE',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            status: created.status,
+            scopes: input.scopes ?? DEFAULT_AGENT_CREDENTIAL_SCOPES,
+            expires_at: created.expiresAt?.toISOString() ?? null,
+          }),
+        })
+        return created
       })
       return {
         id: credential.id,
@@ -747,6 +1209,9 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         keyPrefix: credential.keyPrefix,
         createdAt: credential.createdAt,
         revokedAt: credential.revokedAt,
+        status: credential.status,
+        scopes: parseCredentialScopes(credential.scopes),
+        expiresAt: credential.expiresAt,
       }
     },
     async listAccountSummaries() {
@@ -812,25 +1277,71 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       return account?.solanaPublicKey ?? null
     },
     async createRecipient(input): Promise<RecipientRecord> {
-      const recipient = await prisma.recipient.create({
-        data: {
-          id: input.id,
-          ownerAccountId: input.ownerAccountId,
-          displayName: input.displayName,
-          type: input.type,
-          ...(input.managedAccountId === undefined
-            ? {}
-            : { managedAccountId: input.managedAccountId }),
-          destinations: {
-            create: {
-              id: input.destination.id,
-              rail: input.destination.rail,
-              type: input.destination.type,
-              walletAddress: input.destination.walletAddress,
+      const recipient = await prisma.$transaction(async (transaction) => {
+        const created = await transaction.recipient.create({
+          data: {
+            id: input.id,
+            ownerAccountId: input.ownerAccountId,
+            displayName: input.displayName,
+            type: input.type,
+            ...(input.managedAccountId === undefined
+              ? {}
+              : { managedAccountId: input.managedAccountId }),
+            destinations: {
+              create: {
+                id: input.destination.id,
+                rail: input.destination.rail,
+                type: input.destination.type,
+                walletAddress: input.destination.walletAddress,
+                ...(input.destination.network === undefined
+                  ? {}
+                  : { network: input.destination.network }),
+                ...(input.destination.assetReference === undefined
+                  ? {}
+                  : { assetReference: input.destination.assetReference }),
+              },
             },
           },
-        },
-        include: { destinations: true, ownerAccount: { select: { status: true } } },
+          include: { destinations: true, ownerAccount: { select: { status: true } } },
+        })
+        await enqueueWebhookEvent(transaction, {
+          accountId: created.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: created.id,
+          resourceVersion: created.rowVersion,
+          eventType: 'recipient.created',
+          resource: {
+            id: created.id,
+            account_id: created.ownerAccountId,
+            display_name: created.displayName,
+            type: created.type,
+            managed_account_id: created.managedAccountId,
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: created.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: created.id,
+          eventType: 'RECIPIENT_CREATED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: created.ownerAccountId,
+          source: 'V2_RECIPIENTS',
+          occurredAt: created.createdAt,
+          newStateJson: JSON.stringify({
+            display_name: created.displayName,
+            type: created.type,
+            managed_account_id: created.managedAccountId,
+            destinations: created.destinations.map((destination) => ({
+              id: destination.id,
+              rail: destination.rail,
+              type: destination.type,
+              network: destination.network,
+              asset_reference: destination.assetReference,
+            })),
+          }),
+        })
+        return created
       })
       return toRecipientRecord(recipient)
     },
@@ -891,7 +1402,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           }
         }
         const result = await transaction.recipient.updateMany({
-          where: { id: input.id, ownerAccountId: input.ownerAccountId },
+          where: {
+            id: input.id,
+            ownerAccountId: input.ownerAccountId,
+            ...(input.rowVersion === undefined ? {} : { rowVersion: input.rowVersion }),
+          },
           data: {
             ...(input.displayName === undefined
               ? {}
@@ -900,6 +1415,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ...(input.managedAccountId === undefined
               ? {}
               : { managedAccountId: input.managedAccountId }),
+            ...(input.rowVersion === undefined ? {} : { rowVersion: { increment: 1 } }),
           },
         })
         if (result.count !== 1) {
@@ -912,6 +1428,12 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
               rail: input.destination.rail,
               type: input.destination.type,
               walletAddress: input.destination.walletAddress,
+              ...(input.destination.network === undefined
+                ? {}
+                : { network: input.destination.network }),
+              ...(input.destination.assetReference === undefined
+                ? {}
+                : { assetReference: input.destination.assetReference }),
             },
           })
           if (destinationResult.count !== 1) {
@@ -925,7 +1447,46 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             ownerAccount: { select: { status: true } },
           },
         })
-        return recipient === null ? null : toRecipientRecord(recipient)
+        if (recipient === null) return null
+        await enqueueWebhookEvent(transaction, {
+          accountId: recipient.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: recipient.id,
+          resourceVersion: recipient.rowVersion ?? 1,
+          eventType: 'recipient.updated',
+          resource: {
+            id: recipient.id,
+            account_id: recipient.ownerAccountId,
+            display_name: recipient.displayName,
+            type: recipient.type,
+            managed_account_id: recipient.managedAccountId,
+          },
+        })
+        await createTimelineEvent(transaction, {
+          id: `timeline_${randomBytes(16).toString('hex')}`,
+          accountId: recipient.ownerAccountId,
+          resourceType: 'RECIPIENT',
+          resourceId: recipient.id,
+          eventType: 'RECIPIENT_UPDATED',
+          actorType: 'AGENT_CREDENTIAL',
+          actorId: recipient.ownerAccountId,
+          source: 'V2_RECIPIENTS',
+          occurredAt: recipient.updatedAt,
+          newStateJson: JSON.stringify({
+            row_version: recipient.rowVersion,
+            display_name: recipient.displayName,
+            type: recipient.type,
+            managed_account_id: recipient.managedAccountId,
+            destinations: recipient.destinations.map((destination) => ({
+              id: destination.id,
+              rail: destination.rail,
+              type: destination.type,
+              network: destination.network,
+              asset_reference: destination.assetReference,
+            })),
+          }),
+        })
+        return toRecipientRecord(recipient)
       })
     },
     async createPaymentWithReservation(
@@ -957,11 +1518,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           return { payment: toPaymentRecord(existingPayment), created: false }
         }
 
-        const activeReservations = await transaction.outgoingReservation.aggregate({
-          where: { ownerAccountId: input.ownerAccountId, status: 'ACTIVE' },
-          _sum: { amountAtomic: true },
-        })
-        const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
+        const reservedAtomic = await getOutstandingReservationAtomic(
+          transaction,
+          input.ownerAccountId,
+          input.currency,
+        )
         if (input.amountAtomic > input.settledAtomic - reservedAtomic) {
           throw new InsufficientFundsError()
         }
@@ -1082,11 +1643,11 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
           _sum: { amountAtomic: true },
         })
         const refundedAtomic = refunds._sum.amountAtomic ?? 0n
-        const activeReservations = await transaction.outgoingReservation.aggregate({
-          where: { ownerAccountId: input.ownerAccountId, status: 'ACTIVE' },
-          _sum: { amountAtomic: true },
-        })
-        const reservedAtomic = activeReservations._sum.amountAtomic ?? 0n
+        const reservedAtomic = await getOutstandingReservationAtomic(
+          transaction,
+          input.ownerAccountId,
+          input.currency,
+        )
         if (input.amountAtomic > original.amountAtomic - refundedAtomic) {
           throw new ConflictError('Refund amount exceeds the original payment amount')
         }
@@ -1174,11 +1735,7 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       ownerAccountId,
       currency,
     ): Promise<bigint> {
-      const result = await prisma.outgoingReservation.aggregate({
-        where: { ownerAccountId, currency, status: 'ACTIVE' },
-        _sum: { amountAtomic: true },
-      })
-      return result._sum.amountAtomic ?? 0n
+      return getOutstandingReservationAtomic(prisma, ownerAccountId, currency)
     },
     async reserveFeeSponsorship(input): Promise<void> {
       const now = input.now ?? new Date()
@@ -1637,18 +2194,28 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     },
     async createReceiveRequest(input): Promise<ReceiveRequestRecord> {
       try {
-        const request = await prisma.receiveRequest.create({
-          data: {
-            id: input.id,
-            accountId: input.accountId,
-            ...(input.amountAtomic === undefined
-              ? {}
-              : { amountAtomic: input.amountAtomic }),
-            currency: input.currency,
-            reference: input.reference,
-            ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
-            ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
-          },
+        const request = await prisma.$transaction(async (transaction) => {
+          const created = await transaction.receiveRequest.create({
+            data: {
+              id: input.id,
+              accountId: input.accountId,
+              ...(input.amountAtomic === undefined
+                ? {}
+                : { amountAtomic: input.amountAtomic }),
+              ...(input.denominationId === undefined
+                ? {}
+                : { denominationId: input.denominationId }),
+              ...(input.amountScale === undefined
+                ? {}
+                : { amountScale: input.amountScale }),
+              currency: input.currency,
+              reference: input.reference,
+              ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
+              ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+            },
+          })
+          await enqueueReceiveRequestWebhookEvent(transaction, created, 'created', 1)
+          return created
         })
         return toReceiveRequestRecord(request)
       } catch (error) {
@@ -1667,15 +2234,72 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
     async listReceiveRequests(accountId) {
       const requests = await prisma.receiveRequest.findMany({
         where: { accountId },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      })
+      return requests.map(toReceiveRequestRecord)
+    },
+    async listReceiveRequestsPage(accountId, limit, cursor) {
+      const requests = await prisma.receiveRequest.findMany({
+        where: {
+          accountId,
+          ...(cursor === undefined
+            ? {}
+            : {
+                OR: [
+                  { createdAt: { lt: cursor.createdAt } },
+                  { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+                ],
+              }),
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
       })
       return requests.map(toReceiveRequestRecord)
     },
     async expireOpenReceiveRequests(accountId, now) {
-      await prisma.receiveRequest.updateMany({
-        where: { accountId, status: 'OPEN', expiresAt: { lte: now } },
-        data: { status: 'EXPIRED' },
+      await prisma.$transaction(async (transaction) => {
+        const expiring = await transaction.receiveRequest.findMany({
+          where: { accountId, status: 'OPEN', expiresAt: { lte: now } },
+          select: { id: true },
+        })
+        for (const request of expiring) {
+          const updated = await transaction.receiveRequest.updateMany({
+            where: { id: request.id, status: 'OPEN' },
+            data: { status: 'EXPIRED' },
+          })
+          if (updated.count !== 1) continue
+          await enqueueReceiveRequestWebhookEvent(
+            transaction,
+            await transaction.receiveRequest.findUniqueOrThrow({
+              where: { id: request.id },
+            }),
+            'expired',
+            2,
+          )
+        }
       })
+    },
+    async cancelReceiveRequest(accountId, id, now = new Date()) {
+      const request = await prisma.$transaction(async (transaction) => {
+        const result = await transaction.receiveRequest.updateMany({
+          where: { id, accountId, status: 'OPEN' },
+          data: { status: 'CANCELLED', updatedAt: now },
+        })
+        if (result.count !== 1) {
+          const current = await transaction.receiveRequest.findFirst({
+            where: { id, accountId },
+          })
+          if (current === null)
+            throw new ValidationError('Receive request was not found')
+          throw new ConflictError('Receive request is already terminal')
+        }
+        const updated = await transaction.receiveRequest.findUniqueOrThrow({
+          where: { id },
+        })
+        await enqueueReceiveRequestWebhookEvent(transaction, updated, 'cancelled', 2)
+        return updated
+      })
+      return toReceiveRequestRecord(request)
     },
     async matchIncomingPayment(input): Promise<string | null> {
       return prisma.$transaction((transaction) =>
@@ -1696,20 +2320,130 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
       const cursor = await prisma.indexerCheckpoint.findUnique({
         where: { accountId_rail_address: { accountId, rail, address } },
       })
-      return cursor === null ? null : cursor
+      return cursor === null
+        ? null
+        : {
+            accountId: cursor.accountId,
+            rail: cursor.rail,
+            address: cursor.address,
+            cursorSignature: cursor.cursorSignature,
+            leaseExpiresAt: cursor.leaseExpiresAt,
+          }
+    },
+    async claimIncomingPartition(input) {
+      if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
+        throw new Error('Incoming partition lease must be positive')
+      }
+      const now = input.now ?? new Date()
+      return prisma.$transaction(async (transaction) => {
+        await transaction.$executeRaw`
+          INSERT INTO "indexer_checkpoints"
+            ("id", "account_id", "rail", "address", "created_at", "updated_at")
+          VALUES
+            (${`idx_${randomBytes(16).toString('hex')}`}, ${input.accountId}, ${input.rail}, ${input.address}, ${now}, ${now})
+          ON CONFLICT ("account_id", "rail", "address") DO NOTHING
+        `
+        const rows = await transaction.$queryRaw<
+          Array<{
+            id: string
+            cursor_signature: string | null
+            lease_owner: string | null
+            lease_expires_at: Date | null
+          }>
+        >`
+          SELECT "id", "cursor_signature", "lease_owner", "lease_expires_at"
+          FROM "indexer_checkpoints"
+          WHERE "account_id" = ${input.accountId}
+            AND "rail" = ${input.rail}
+            AND "address" = ${input.address}
+          FOR UPDATE
+        `
+        const checkpoint = rows[0]
+        if (checkpoint === undefined) {
+          throw new Error('Incoming partition checkpoint disappeared')
+        }
+        if (
+          checkpoint.lease_owner !== null &&
+          checkpoint.lease_expires_at !== null &&
+          checkpoint.lease_expires_at > now &&
+          checkpoint.lease_owner !== input.owner
+        ) {
+          return null
+        }
+        const leaseExpiresAt = new Date(now.getTime() + input.leaseSeconds * 1_000)
+        await transaction.indexerCheckpoint.update({
+          where: { id: checkpoint.id },
+          data: {
+            leaseOwner: input.owner,
+            leaseExpiresAt,
+          },
+        })
+        return {
+          accountId: input.accountId,
+          rail: input.rail,
+          address: input.address,
+          cursorSignature: checkpoint.cursor_signature,
+          leaseExpiresAt,
+        }
+      })
+    },
+    async releaseIncomingPartition(input) {
+      await prisma.indexerCheckpoint.updateMany({
+        where: {
+          accountId: input.accountId,
+          rail: input.rail,
+          address: input.address,
+          leaseOwner: input.owner,
+          ...(input.leaseExpiresAt === undefined
+            ? { leaseExpiresAt: { gt: new Date() } }
+            : { leaseExpiresAt: input.leaseExpiresAt }),
+        },
+        data: { leaseOwner: null, leaseExpiresAt: null },
+      })
+    },
+    async renewIncomingPartition(input) {
+      if (!Number.isInteger(input.leaseSeconds) || input.leaseSeconds <= 0) {
+        throw new Error('Incoming partition lease must be positive')
+      }
+      const now = input.now ?? new Date()
+      const result = await prisma.indexerCheckpoint.updateMany({
+        where: {
+          accountId: input.accountId,
+          rail: input.rail,
+          address: input.address,
+          leaseOwner: input.owner,
+          leaseExpiresAt:
+            input.leaseExpiresAt === undefined ? { gt: now } : input.leaseExpiresAt,
+        },
+        data: {
+          leaseExpiresAt: new Date(now.getTime() + input.leaseSeconds * 1_000),
+        },
+      })
+      if (result.count !== 1) {
+        throw new Error('Incoming partition lease is no longer owned')
+      }
     },
     async saveIncomingCursor(input) {
-      await prisma.indexerCheckpoint.upsert({
-        where: {
-          accountId_rail_address: {
-            accountId: input.accountId,
-            rail: input.rail,
-            address: input.address,
-          },
-        },
-        create: { id: `idx_${randomBytes(16).toString('hex')}`, ...input },
-        update: { cursorSignature: input.cursorSignature },
+      const where = {
+        accountId: input.accountId,
+        rail: input.rail,
+        address: input.address,
+        ...(input.leaseOwner === undefined
+          ? {}
+          : {
+              leaseOwner: input.leaseOwner,
+              ...(input.leaseExpiresAt === undefined
+                ? { leaseExpiresAt: { gt: new Date() } }
+                : { leaseExpiresAt: input.leaseExpiresAt }),
+            }),
+      }
+      const result = await prisma.indexerCheckpoint.updateMany({
+        where,
+        data: { cursorSignature: input.cursorSignature },
       })
+      if (result.count !== 1) {
+        throw new Error('Incoming partition lease is no longer owned')
+      }
     },
     async recordIncomingReconciliationIssue(input): Promise<void> {
       const now = new Date()
@@ -1740,53 +2474,141 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         throw new Error('Incoming reconciliation issue batch limit must be 1 to 100')
       }
       return prisma.$transaction(async (transaction) => {
-        const issues = await transaction.$queryRaw<
-          {
-            id: string
-            account_id: string
-            account_public_key: string
-            signature: string
-            reason: string
-            retry_count: number
-          }[]
-        >`
-          SELECT issue.id,
-                 issue.account_id,
-                 account.solana_public_key AS account_public_key,
-                 issue.signature,
-                 issue.reason,
-                 issue.retry_count
-          FROM "incoming_reconciliation_issues" issue
-          JOIN "agent_accounts" account ON account.id = issue.account_id
-          WHERE issue.status = 'PENDING'
-            AND issue.next_retry_at <= ${now}
-          ORDER BY issue.next_retry_at ASC, issue.id ASC
-          LIMIT ${limit}
-          FOR UPDATE OF issue SKIP LOCKED
-        `
-        for (const issue of issues) {
-          const retryCount = issue.retry_count + 1
-          const backoffMilliseconds = Math.min(
-            5 * 60_000,
-            5_000 * 2 ** Math.min(retryCount - 1, 6),
-          )
-          await transaction.incomingReconciliationIssue.update({
-            where: { id: issue.id },
-            data: {
-              lastTriedAt: now,
-              nextRetryAt: new Date(now.getTime() + backoffMilliseconds),
+        const claims: IncomingReconciliationIssueRecord[] = []
+        while (claims.length < limit) {
+          const finalRows = await transaction.$queryRaw<
+            Array<{ id: string; reason: string }>
+          >`
+            SELECT issue.id, issue.reason
+            FROM "incoming_reconciliation_issues" issue
+            WHERE issue.status = 'PENDING'
+              AND issue.retry_count >= ${MAX_INCOMING_ISSUE_RETRIES + 1}
+              AND issue.recovery_count >= 1
+              AND issue.next_retry_at <= ${now}
+            ORDER BY issue.next_retry_at ASC, issue.id ASC
+            LIMIT 1
+            FOR UPDATE OF issue SKIP LOCKED
+          `
+          const finalRow = finalRows[0]
+          if (finalRow !== undefined) {
+            await markIncomingReconciliationIssueExhausted(
+              transaction,
+              finalRow.id,
+              finalRow.reason,
+              now,
+            )
+            continue
+          }
+
+          const issues = await transaction.$queryRaw<
+            {
+              id: string
+              account_id: string
+              account_public_key: string
+              signature: string
+              reason: string
+              retry_count: number
+            }[]
+          >`
+            SELECT issue.id,
+                   issue.account_id,
+                   account.solana_public_key AS account_public_key,
+                   issue.signature,
+                   issue.reason,
+                   issue.retry_count
+            FROM "incoming_reconciliation_issues" issue
+            JOIN "agent_accounts" account ON account.id = issue.account_id
+            WHERE issue.status = 'PENDING'
+              AND issue.next_retry_at <= ${now}
+              AND (
+                issue.retry_count < ${MAX_INCOMING_ISSUE_RETRIES + 1}
+                OR (
+                  issue.retry_count >= ${MAX_INCOMING_ISSUE_RETRIES + 1}
+                  AND issue.recovery_count < 1
+                )
+              )
+            ORDER BY issue.next_retry_at ASC, issue.id ASC
+            LIMIT ${limit - claims.length}
+            FOR UPDATE OF issue SKIP LOCKED
+          `
+          if (issues.length === 0) break
+
+          for (const issue of issues) {
+            const retryCount = Math.min(
+              issue.retry_count + 1,
+              MAX_INCOMING_ISSUE_RETRIES + 1,
+            )
+            const backoffMilliseconds = Math.min(
+              5 * 60_000,
+              5_000 * 2 ** Math.min(retryCount - 1, 6),
+            )
+            await transaction.incomingReconciliationIssue.update({
+              where: { id: issue.id },
+              data: {
+                lastTriedAt: now,
+                nextRetryAt: new Date(now.getTime() + backoffMilliseconds),
+                retryCount,
+                ...(issue.retry_count >= MAX_INCOMING_ISSUE_RETRIES
+                  ? { recoveryCount: { increment: 1 } }
+                  : {}),
+              },
+            })
+            claims.push({
+              id: issue.id,
+              accountId: issue.account_id,
+              accountPublicKey: issue.account_public_key,
+              signature: issue.signature,
+              reason: issue.reason,
               retryCount,
-            },
-          })
+              retryCountBeforeClaim: issue.retry_count,
+              recoveryClaimed: issue.retry_count >= MAX_INCOMING_ISSUE_RETRIES,
+            })
+          }
         }
-        return issues.map((issue) => ({
-          id: issue.id,
-          accountId: issue.account_id,
-          accountPublicKey: issue.account_public_key,
-          signature: issue.signature,
-          reason: issue.reason,
-          retryCount: issue.retry_count + 1,
-        }))
+        return claims
+      })
+    },
+    async deferIncomingReconciliationIssue(input) {
+      await prisma.$transaction(async (transaction) => {
+        const retryCountIncremented = input.retryCount > input.retryCountBeforeClaim
+        if (
+          !Number.isInteger(input.retryCount) ||
+          !Number.isInteger(input.retryCountBeforeClaim) ||
+          input.retryCountBeforeClaim < 0 ||
+          input.retryCountBeforeClaim > MAX_INCOMING_ISSUE_RETRIES + 1 ||
+          input.retryCount !==
+            Math.min(input.retryCountBeforeClaim + 1, MAX_INCOMING_ISSUE_RETRIES + 1) ||
+          input.recoveryClaimed !==
+            input.retryCountBeforeClaim >= MAX_INCOMING_ISSUE_RETRIES
+        ) {
+          throw new InvalidStateError('Incoming reconciliation claim is invalid')
+        }
+
+        const updated = await transaction.incomingReconciliationIssue.updateMany({
+          where: {
+            id: input.issueId,
+            status: 'PENDING',
+            retryCount: input.retryCount,
+            ...(input.recoveryClaimed ? { recoveryCount: { gte: 1 } } : {}),
+          },
+          data: {
+            nextRetryAt: input.retryAt,
+            ...(retryCountIncremented
+              ? { retryCount: input.retryCountBeforeClaim }
+              : {}),
+            ...(input.recoveryClaimed ? { recoveryCount: { decrement: 1 } } : {}),
+          },
+        })
+        if (updated.count === 1) return
+
+        const issue = await transaction.incomingReconciliationIssue.findUnique({
+          where: { id: input.issueId },
+          select: { id: true },
+        })
+        if (issue === null) {
+          throw new NotFoundError('Incoming reconciliation issue was not found')
+        }
+        throw new ConflictError('Incoming reconciliation issue changed concurrently')
       })
     },
     async resolveIncomingReconciliationIssue(issueId, now = new Date()) {
@@ -1801,9 +2623,67 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         data: { reason },
       })
     },
+    async exhaustIncomingReconciliationIssue(issueId, reason, now = new Date()) {
+      await prisma.$transaction(async (transaction) => {
+        await markIncomingReconciliationIssueExhausted(
+          transaction,
+          issueId,
+          reason,
+          now,
+        )
+      })
+    },
     async createIncomingPayment(input) {
-      return prisma.$transaction(async (transaction) => {
-        const existing = await transaction.incomingPayment.findUnique({
+      try {
+        return await prisma.$transaction(async (transaction) => {
+          const existing = await transaction.incomingPayment.findUnique({
+            where: {
+              accountId_signature: {
+                accountId: input.accountId,
+                signature: input.signature,
+              },
+            },
+          })
+          if (existing !== null) {
+            return { payment: toIncomingPaymentRecord(existing), created: false }
+          }
+          const incoming = await transaction.incomingPayment.create({
+            data: {
+              id: input.id,
+              accountId: input.accountId,
+              signature: input.signature,
+              amountAtomic: input.amountAtomic,
+              tokenAtomicUnits: input.tokenAtomicUnits ?? input.amountAtomic,
+              tokenDecimals: input.tokenDecimals ?? 2,
+              currency: input.currency,
+              ...(input.sourceAddress === undefined
+                ? {}
+                : { sourceAddress: input.sourceAddress }),
+              ...(input.reference === undefined ? {} : { reference: input.reference }),
+              tokenAccount: input.tokenAccount,
+              settlementMint: input.settlementMint,
+              confirmedAt: input.confirmedAt,
+            },
+          })
+          await enqueueIncomingPaymentWebhookEvent(transaction, incoming, 'created', 1)
+          await matchIncomingPaymentInTransaction(transaction, {
+            incomingPaymentId: incoming.id,
+            accountId: input.accountId,
+            amountAtomic: input.amountAtomic,
+            reference: input.reference ?? null,
+            confirmedAt: input.confirmedAt,
+          })
+          const createdPayment = await transaction.incomingPayment.findUniqueOrThrow({
+            where: { id: incoming.id },
+          })
+          return {
+            payment: toIncomingPaymentRecord(createdPayment),
+            created: true,
+          }
+        })
+      } catch (error) {
+        if (!isPrismaUniqueConstraintError(error)) throw error
+        const existing = await prisma.incomingPayment.findUnique({
           where: {
             accountId_signature: {
               accountId: input.accountId,
@@ -1811,42 +2691,61 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
             },
           },
         })
-        if (existing !== null) {
-          return { payment: toIncomingPaymentRecord(existing), created: false }
+        if (existing === null) throw error
+        return { payment: toIncomingPaymentRecord(existing), created: false }
+      }
+    },
+    async reconcileUnmatchedManagedIncoming(limit): Promise<number> {
+      return prisma.$transaction(async (transaction) => {
+        const candidates = await transaction.$queryRaw<
+          readonly {
+            id: string
+            account_id: string
+            amount_atomic: bigint
+            reference: string
+            confirmed_at: Date
+          }[]
+        >`
+          SELECT incoming.id, incoming.account_id, incoming.amount_atomic,
+                 incoming.reference, incoming.confirmed_at
+          FROM "incoming_payments" incoming
+          JOIN "receive_requests" receive
+            ON receive.account_id = incoming.account_id
+           AND receive.reference = incoming.reference
+          WHERE incoming.receive_request_id IS NULL
+            AND receive.status IN ('OPEN', 'EXPIRED')
+            AND receive.matched_incoming_payment_id IS NULL
+            AND (receive.amount_atomic IS NULL OR receive.amount_atomic = incoming.amount_atomic)
+            AND EXISTS (
+              SELECT 1
+              FROM "payment_attempts" attempt
+              JOIN "payments" payment ON payment.id = attempt.payment_id
+              WHERE attempt.rail_transaction_id = incoming.signature
+                AND payment.status = 'CONFIRMED'
+                AND payment.recipient_managed_account_id = incoming.account_id
+                AND payment.external_reference = incoming.reference
+                AND payment.created_at >= receive.created_at
+                AND payment.confirmed_at IS NOT NULL
+                AND (receive.expires_at IS NULL OR receive.expires_at > payment.confirmed_at)
+            )
+          ORDER BY incoming.created_at ASC
+          LIMIT ${limit}
+          FOR UPDATE OF incoming SKIP LOCKED
+        `
+        let matched = 0
+        for (const candidate of candidates) {
+          const requestId = await matchIncomingPaymentInTransaction(transaction, {
+            incomingPaymentId: candidate.id,
+            accountId: candidate.account_id,
+            amountAtomic: candidate.amount_atomic,
+            reference: candidate.reference,
+            confirmedAt: candidate.confirmed_at,
+          })
+          if (requestId !== null) {
+            matched += 1
+          }
         }
-        const incoming = await transaction.incomingPayment.create({
-          data: {
-            id: input.id,
-            accountId: input.accountId,
-            signature: input.signature,
-            amountAtomic: input.amountAtomic,
-            tokenAtomicUnits: input.tokenAtomicUnits ?? input.amountAtomic,
-            tokenDecimals: input.tokenDecimals ?? 2,
-            currency: input.currency,
-            ...(input.sourceAddress === undefined
-              ? {}
-              : { sourceAddress: input.sourceAddress }),
-            ...(input.reference === undefined ? {} : { reference: input.reference }),
-            tokenAccount: input.tokenAccount,
-            settlementMint: input.settlementMint,
-            confirmedAt: input.confirmedAt,
-          },
-        })
-        await matchIncomingPaymentInTransaction(transaction, {
-          incomingPaymentId: incoming.id,
-          accountId: input.accountId,
-          amountAtomic: input.amountAtomic,
-          reference: input.reference ?? null,
-          confirmedAt: input.confirmedAt,
-        })
-        return {
-          payment: toIncomingPaymentRecord(
-            await transaction.incomingPayment.findUniqueOrThrow({
-              where: { id: incoming.id },
-            }),
-          ),
-          created: true,
-        }
+        return matched
       })
     },
     async findIncomingPaymentForOwner(accountId, id) {
@@ -1937,6 +2836,81 @@ export function createDatabaseClient(databaseUrl: string): DatabaseClient {
         }
       })
     },
+    async checkRuntimeIdentity(input): Promise<void> {
+      const existing = await prisma.runtimeMetadata.findUnique({
+        where: { key: 'runtime_identity' },
+        select: { value: true },
+      })
+      if (existing === null) return
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(existing.value) as unknown
+      } catch {
+        throw new Error('Persisted runtime financial identity is invalid JSON')
+      }
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('Persisted runtime financial identity is invalid JSON')
+      }
+      const record = parsed as Record<string, unknown>
+      const expectedFields: ReadonlyArray<readonly [string, unknown]> = [
+        ['environment', input.environment],
+        ['rail', input.rail],
+        ['version', input.version],
+        ['railVersion', input.railVersion],
+        ['cluster', input.cluster],
+        ['settlementMint', input.settlementMint],
+        ['feePayerIdentity', input.feePayerIdentity],
+        ['routeId', input.routeId],
+        ['routeConfigVersion', input.routeConfigVersion],
+        ['settlementAssetId', input.settlementAssetId],
+        ['settlementAssetVersion', input.settlementAssetVersion],
+        ['economicMappingId', input.economicMappingId],
+        ['economicMappingVersion', input.economicMappingVersion],
+        ['routes', input.routes],
+        ['custodyBackendIdentity', input.custodyBackendIdentity],
+        ['custodyBackendMode', input.custodyBackendMode],
+      ]
+      if (
+        expectedFields.some(
+          ([field, expected]) =>
+            expected !== undefined &&
+            JSON.stringify(record[field]) !== JSON.stringify(expected),
+        )
+      ) {
+        throw new Error(
+          'Runtime financial identity mismatch; configured rail, cluster, settlement mint, or custody backend differs from the database',
+        )
+      }
+    },
+    async initializeRuntimeAuthority(authorityId): Promise<void> {
+      const normalized = authorityId.trim()
+      if (normalized.length === 0) {
+        throw new Error('Runtime authority ID must not be empty')
+      }
+      await prisma.$transaction(async (transaction) => {
+        await transaction.$queryRaw`
+          SELECT pg_advisory_xact_lock(764895321) IS NULL AS locked
+        `
+        const existing = await transaction.runtimeMetadata.findUnique({
+          where: { key: 'runtime_authority' },
+        })
+        if (existing === null) {
+          await transaction.runtimeMetadata.create({
+            data: { key: 'runtime_authority', value: normalized },
+          })
+          return
+        }
+        if (existing.value !== normalized) {
+          throw new Error(
+            'Runtime authority mismatch; restored copies require an explicit authority handoff',
+          )
+        }
+      })
+    },
+    async getRuntimeMetadata(key): Promise<string | null> {
+      const metadata = await prisma.runtimeMetadata.findUnique({ where: { key } })
+      return metadata?.value ?? null
+    },
     async disconnect(): Promise<void> {
       await prisma.$disconnect()
     },
@@ -1951,12 +2925,18 @@ function toRecipientRecord(recipient: {
   type: string
   createdAt: Date
   updatedAt: Date
+  archivedAt?: Date | null
+  rowVersion?: number
   ownerAccount: { status: AgentAccountStatus }
   destinations: readonly {
     id: string
     rail: string
     type: string
     walletAddress: string
+    network: string | null
+    assetReference: string | null
+    status: string
+    version: number
   }[]
 }): RecipientRecord {
   return {
@@ -1971,10 +2951,101 @@ function toRecipientRecord(recipient: {
       rail: destination.rail,
       type: destination.type,
       walletAddress: destination.walletAddress,
+      network: destination.network,
+      assetReference: destination.assetReference,
+      status: destination.status,
+      version: destination.version,
     })),
     createdAt: recipient.createdAt,
     updatedAt: recipient.updatedAt,
+    archivedAt: recipient.archivedAt ?? null,
+    rowVersion: recipient.rowVersion ?? 1,
   }
+}
+
+function parseCredentialScopes(value: string): readonly string[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value) as unknown
+  } catch {
+    throw new Error('Credential scopes are not valid JSON')
+  }
+  if (!Array.isArray(parsed) || parsed.some((scope) => typeof scope !== 'string')) {
+    throw new Error('Credential scopes are not a string array')
+  }
+  return parsed
+}
+
+async function enqueueReceiveRequestWebhookEvent(
+  transaction: Prisma.TransactionClient,
+  request: {
+    readonly id: string
+    readonly accountId: string
+    readonly amountAtomic: bigint | null
+    readonly denominationId: string | null
+    readonly reference: string
+    readonly status: string
+    readonly expiresAt: Date | null
+    readonly paidAt: Date | null
+    readonly matchedIncomingPaymentId: string | null
+  },
+  transition: 'created' | 'updated' | 'expired' | 'cancelled',
+  resourceVersion: number,
+): Promise<void> {
+  await enqueueWebhookEvent(transaction, {
+    accountId: request.accountId,
+    resourceType: 'RECEIVE_REQUEST',
+    resourceId: request.id,
+    resourceVersion,
+    eventType: `receive_request.${transition}`,
+    resource: {
+      id: request.id,
+      account_id: request.accountId,
+      amount_atomic: request.amountAtomic?.toString() ?? null,
+      denomination_id: request.denominationId,
+      reference: request.reference,
+      status: request.status,
+      expires_at: request.expiresAt?.toISOString() ?? null,
+      paid_at: request.paidAt?.toISOString() ?? null,
+      matched_incoming_payment_id: request.matchedIncomingPaymentId,
+    },
+  })
+}
+
+async function enqueueIncomingPaymentWebhookEvent(
+  transaction: Prisma.TransactionClient,
+  payment: {
+    readonly id: string
+    readonly accountId: string
+    readonly signature: string
+    readonly amountAtomic: bigint
+    readonly currency: string
+    readonly reference: string | null
+    readonly status: string
+    readonly confirmedAt: Date
+    readonly receiveRequestId: string | null
+  },
+  transition: 'created' | 'updated',
+  resourceVersion: number,
+): Promise<void> {
+  await enqueueWebhookEvent(transaction, {
+    accountId: payment.accountId,
+    resourceType: 'INCOMING_PAYMENT',
+    resourceId: payment.id,
+    resourceVersion,
+    eventType: `incoming.${transition}`,
+    resource: {
+      id: payment.id,
+      account_id: payment.accountId,
+      signature: payment.signature,
+      amount_atomic: payment.amountAtomic.toString(),
+      currency: payment.currency,
+      reference: payment.reference,
+      status: payment.status,
+      confirmed_at: payment.confirmedAt.toISOString(),
+      receive_request_id: payment.receiveRequestId,
+    },
+  })
 }
 
 function toPaymentRecord(payment: {
@@ -2014,6 +3085,8 @@ function toReceiveRequestRecord(request: {
   id: string
   accountId: string
   amountAtomic: bigint | null
+  denominationId?: string | null
+  amountScale?: number | null
   currency: string
   reference: string
   status: ReceiveRequestStatus

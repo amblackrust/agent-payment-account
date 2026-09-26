@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   assertPaymentStatusTransition,
   assertPaymentAttemptStatusTransition,
+  assertAttemptProgression,
   canTransitionPaymentAttemptStatus,
   canTransitionPaymentStatus,
   ConflictError,
@@ -35,5 +36,9 @@ describe('domain contracts', () => {
     expect(() => assertPaymentAttemptStatusTransition('FAILED', 'SUBMITTED')).toThrow(
       ConflictError,
     )
+  })
+
+  it('allows authoritative confirmation before a submitted observation is persisted', () => {
+    expect(() => assertAttemptProgression('NOT_STARTED', 'CONFIRMED')).not.toThrow()
   })
 })
