@@ -1,8 +1,14 @@
-# Mux
+<div align="center">
 
-Mux is a custodial payment runtime for AI-agent applications: an HTTP API and TypeScript SDK for programmable accounts, policy-controlled payments, and durable Solana settlement.
+# MUX
 
-[Quick start](#quick-start) · [Architecture](#architecture) · [API reference](docs/api.md) · [Development](#local-development)
+**A custodial payment runtime for AI agents.** Programmable accounts, policy-controlled payments, and durable settlement on Solana.
+
+🏆 [Winner · Solana Create Workshop 2026](https://superteam.fun/earn/listing/superteam-kz-workshop)
+
+[Quick start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [SDK](#sdk-usage) · [Development](#local-development) · [Documentation](#documentation)
+
+</div>
 
 ## Quick Start
 
