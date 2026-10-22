@@ -4,7 +4,7 @@
 
 **A custodial payment runtime for AI agents.** Programmable accounts, policy-controlled payments, and durable settlement on Solana.
 
-🏆 [Winner · Solana Create Workshop 2026](https://yk.kz/news/obshhestvo/student-iz-ust-kamenogorska-sozdal-finansovyij-akkaunt-dlya-ai-agentov-449443.html)
+🏆 [Winner · Solana Create Workshop 2026](https://superteam.fun/earn/listing/superteam-kz-workshop)
 
 [Quick start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [SDK](#sdk-usage) · [Development](#local-development) · [Documentation](#documentation)
 
